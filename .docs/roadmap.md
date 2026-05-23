@@ -1,0 +1,255 @@
+# Tutankhamun v1 — implementation checklist
+
+Trackable list of features to implement for v1. Check items off as
+they ship. Each item points at the design section in
+[`tutankhamun.md`](tutankhamun.md) for context.
+
+Not prioritized — order of implementation is an engineering
+decision. Items within an area are roughly in dependency order.
+
+For v2 / v3 features and explicit non-goals, see the design doc
+directly.
+
+---
+
+## Project bootstrap
+
+- [ ] Cargo workspace structure (`tutankhamun-server`,
+      `tutankhamun-client`, shared crates)
+- [ ] Layered config: CLI (`clap`) + env + file + defaults
+      (`figment` or similar) — §1.3
+- [ ] Graceful shutdown — SIGTERM → drain → deregister → exit, with
+      configurable timeout — §1.3
+- [ ] Ops HTTP server (default port 8080) with `/healthz`,
+      `/readyz` — §1.3
+- [ ] `tokio` runtime configuration in `main()` (worker thread
+      count, etc.) — §2.3
+- [ ] `rayon` thread pool configuration as a `OnceLock` — §2.3
+- [ ] Async-to-Rayon dispatch helper (oneshot channel + Tokio
+      future) — §2.3
+
+## Storage backends
+
+- [ ] `object_store` integration with all backends enabled (S3,
+      S3-compatible, GCS, Azure Blob, local filesystem, HTTP,
+      in-memory) — §1.4
+- [ ] Credential chain wiring (env, instance metadata, IRSA,
+      Workload Identity, SSO) — no hardcoded credentials — §1.4
+- [ ] Local hot-storage cache — directory creation, XDG defaults
+      via `directories` crate — §1.5
+- [ ] Cache size enforcement (`--cache-size` accepts `100GB` /
+      `50%` / etc.) with 10 GB default — §1.5
+- [ ] Cache 5 %-free-space floor with `--cache-min-free-pct`
+      override — §1.5
+- [ ] LRU eviction — §1.5
+- [ ] `--pin-datasets` always-keep flag — §1.5
+- [ ] Persistent cache across restarts (scan cache dir, register
+      existing files) — §1.5
+- [ ] Content-hash validation on shard load — §1.5
+- [ ] Configurable hot-set pre-warm (`--prewarm`) — §1.5
+
+## Engine — storage format (shards)
+
+- [ ] Shard directory layout (`metadata.json`, `metrics.arrow`,
+      `postings/<field>.fst`, `postings/<field>.posting`) — §2.1
+- [ ] `metadata.json` schema (Arrow schema, numDocs, time range,
+      format version, content hashes) — §2.1
+- [ ] Forward column writer — uncompressed single-batch Arrow IPC
+      via `arrow-rs` — §2.1
+- [ ] Forward column reader — mmap via `memmap2` + zero-copy
+      `&[i64]` cast via `bytemuck` — §2.1
+- [ ] Inverted index writer — `roaring` bitmaps per term + `fst`
+      term dictionary — §2.1
+- [ ] Inverted index reader — FST range scan + Roaring bitmap
+      iteration — §2.1
+- [ ] Optional Parquet export of forward columns — §2.1
+
+## Engine — abstractions
+
+- [ ] `Shard` trait — `forward_column()`, `inverted_index()`,
+      `time_range()`, `num_docs()`, `schema()` — §2.1, §3.3 v1 disciplines
+- [ ] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
+- [ ] `ShardSource` trait — server-side abstraction over where
+      shards come from — §3.3 v1 disciplines
+- [ ] Object-storage `ShardSource` implementation — §3.3 v1
+- [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
+- [ ] K8s DNS `ShardLocator` implementation — §1.3
+- [ ] Static-file `ShardLocator` implementation — §1.3
+- [ ] Shard manager — composes shards from multiple sources;
+      handles registration / eviction — §3.3 v1
+- [ ] Time-range query pruning (skip shards outside requested
+      time range) — §3.3 v1 disciplines
+
+## Engine — memory model
+
+- [ ] `MemoryBudget` global struct with `AtomicU64` charge counter
+      — §2.2
+- [ ] `MemoryReservation` RAII guard (drop returns bytes) — §2.2
+- [ ] `SessionMemoryHandle` — per-session sub-budget with cap — §2.2
+- [ ] Hard claim-or-fail allocation API (`reserve(n) -> Result<...,
+      BudgetExceeded>`) — §2.2
+- [ ] Admission control in `OpenSession` handler — §2.2
+- [ ] Per-session cap (default 20 % of global, configurable) — §2.2
+- [ ] mmap accounting via forward-column file sizes on shard open
+      — §2.2
+
+## Engine — group lookup
+
+- [ ] `GroupLookup` enum with backing variants — §2.5
+- [ ] `ConstantGroupLookup` — §2.5
+- [ ] `BitSetGroupLookup` — §2.5
+- [ ] `ByteGroupLookup` — §2.5
+- [ ] `U16GroupLookup` — §2.5
+- [ ] `U32GroupLookup` — §2.5
+- [ ] In-place upgrade between backings when cardinality crosses
+      thresholds — §2.5
+- [ ] `next_group_callback(doc_ids, &mut BitTree)` dispatch — §2.5
+- [ ] Memory cost reporting to `SessionMemoryHandle` — §2.5
+
+## Engine — FTGS
+
+- [ ] Four-level cursor (`next_field` / `next_term` / `next_group`
+      / `group_stats`) — §2.6
+- [ ] Critical loop: doc-ID batch → group lookup callback →
+      stat accumulation into `term_grp_stats[stat][group]` — §2.6
+- [ ] Ordering-invariant enforcement (terms sorted, groups
+      ascending, fields in declaration order) — §2.6
+- [ ] Per-shard FTGS execution (single-threaded per shard, run
+      via Rayon) — §2.6, §2.3
+- [ ] Shard-fan-out merge (within a daemon) — §2.6
+- [ ] `GSVector`-equivalent two-level bitmap for merge — §2.6
+- [ ] Arrow record-batch output (1024 / 4096 row default
+      batching) — §2.6
+- [ ] Same merge code reused at client layer (cross-daemon) — §2.6
+
+## Engine — sessions
+
+- [ ] Session struct (group lookup, stat stack, dynamic metrics,
+      shard handles, memory handle) — §2.4
+- [ ] `OpenSession` handler — admission check, shard set
+      selection by time range, token issuance — §2.4
+- [ ] `CloseSession` handler — explicit teardown — §2.4
+- [ ] Idle timeout reaper (default 30 min, configurable) — §2.4
+- [ ] Hard maximum age reaper (default 4 h, configurable) — §2.4
+- [ ] `SessionLost` error on daemon-crashed-mid-session — §2.4
+- [ ] Opaque token format (don't leak internals) — §2.4
+- [ ] Stat stack — `PushStat`, `PopStat`, `GetNumStats` — §2.6
+- [ ] Dynamic metric allocation + update — §2.6
+- [ ] Regroup operations (filter, bucket, query-based, regex,
+      random, intersect, etc. — full Imhotep parity) — §2.6
+
+## Wire / protocol
+
+- [ ] `tonic` gRPC server setup over HTTP/2 — §1.2
+- [ ] `tutankhamun.v1.SessionControl` protobuf definitions
+      (`OpenSession`, `CloseSession`, `Regroup`, `PushStat`,
+      `PopStat`, `MetricRegroup`, `GetStatus`, etc.) — §1.2
+- [ ] `SessionControl` service implementation — §1.2
+- [ ] `arrow.flight.protocol.FlightService` registration — §1.2
+- [ ] `DoGet(Ticket)` for FTGS result streaming as Arrow record
+      batches — §1.2
+- [ ] FlightSQL service implementation — §3.2
+- [ ] DataFusion embedded as a dependency — §3.2
+- [ ] Tutankhamun `TableProvider` implementation — §3.2
+- [ ] Filter / projection / aggregation pushdown from DataFusion
+      → Tutankhamun scan — §3.2
+- [ ] Session-aware SQL execution — DataFusion planner reuses
+      session state when new query's filter refines previous — §3.2
+- [ ] Session-affinity metadata header
+      (`x-tutankhamun-session-id`) published in gRPC responses —
+      §2.4
+
+## Routing
+
+- [ ] Client library tracks `session_token → daemon_address` map
+      (default mode) — §2.4
+- [ ] Client library proxy mode (opt-in via config) — sends all
+      session traffic to a proxy address, includes session ID
+      header — §2.4
+
+## Ingest
+
+- [ ] Batch ingest pipeline — Rust port of TSV converter — §3.3 v1
+- [ ] Output Tutankhamun-format shards (Arrow IPC + Roaring +
+      FST) — §3.3 v1
+- [ ] Upload to object storage via `object_store` — §3.3 v1
+- [ ] Daemon writable local state directory (configured via
+      `--state-dir`) — for cache in v1; for WAL in v2 — §3.3 v1
+- [ ] `flamdex-to-tutankhamun` migration tool — read old Imhotep
+      Flamdex shards, write in new format — §2.1
+
+## Query language — native Python client
+
+- [ ] `tutankhamun` PyPI package skeleton — §3.2
+- [ ] Connection / session classes (`tk.connect(...).session(...)`)
+      — §3.2
+- [ ] Fluent API (`.filter()`, `.group_by()`, `.select()`,
+      `.fetch()`) — §3.2
+- [ ] Lazy execution (composes SQL fragments until `.fetch()`) —
+      §3.2
+- [ ] Session token management — §3.2
+- [ ] Dynamic metric definition (`session.define(name, expr)`) —
+      §3.2
+- [ ] Result conversion: `to_arrow()`, `to_pandas()`,
+      `to_polars()`, `to_duckdb()` — §3.2
+- [ ] Context manager support (`with session: ...`) — §3.2
+- [ ] Decision: build on `ibis` or roll our own — §3.2
+
+## Approximate aggregations
+
+- [ ] Pick crate strategy — `datasketches-rs` OR
+      `hyperloglogplus` + `tdigest` + custom theta — §3.1
+- [ ] `approx_count_distinct(field, [precision])` (HLL) — §3.1
+- [ ] `approx_percentile(field, p, [compression])` (t-digest) —
+      §3.1
+- [ ] `approx_top_k(field, k, [capacity])` (Count-Min + heavy
+      hitters) — §3.1
+- [ ] `theta(field, [nominal_entries])` returning Arrow `Binary`
+      — §3.1
+- [ ] `theta_intersect(a, b)` — §3.1
+- [ ] Sketch merge in the FTGS merge path (sketches are
+      mergeable by construction) — §3.1
+- [ ] Sketches as Arrow record-batch columns (int64 for scalars,
+      `Binary` for raw thetas) — §3.1
+
+## Observability
+
+- [ ] Prometheus `/metrics` endpoint on the ops port — §3.4
+- [ ] Standard metrics (request rates, latency histograms, pool
+      queue depths, memory pool, session counts, shard cache
+      hit/miss, mmap'd bytes, error counts) — §3.4
+- [ ] OpenTelemetry tracing setup (OTLP exporter, configurable
+      endpoint) — §3.4
+- [ ] Trace per query with span attributes (claimed user,
+      dataset, time range, memory claimed, rows scanned /
+      returned, error type) — §3.4
+- [ ] Sub-spans for parse / plan / scan-per-shard / FTGS /
+      merge / serialize — §3.4
+- [ ] Structured JSON logging to stdout, tagged with trace ID —
+      §3.4
+
+## Web UI
+
+- [ ] `/status` page on the ops port — §3.5
+- [ ] Daemon health + build version display — §3.5
+- [ ] Loaded shards table (dataset, time range, size on disk,
+      size mmap'd) — §3.5
+- [ ] Active sessions table (count, oldest age, total memory) —
+      §3.5
+- [ ] Memory pool usage breakdown — §3.5
+- [ ] Recent queries ring buffer (last ~50) — §3.5
+- [ ] Pointers to `/metrics` and OTLP endpoints — §3.5
+
+## Auth — v1 disciplines (so v2 plugs in cleanly)
+
+Not auth itself — those are v2. These are the disciplines that
+v1 must respect so v2 is a localized change.
+
+- [ ] `username` field on requests is `Option<String>` with
+      "claimed identity, not verified" comment; never hardcoded
+      — §1.6
+- [ ] gRPC interceptor structure ready for an auth interceptor
+      to be added in v2 — §1.6
+- [ ] `Identity` type as a placeholder used by session lifecycle
+      / admission control (v1's Identity = claimed username; v2
+      makes it verified) — §1.6
