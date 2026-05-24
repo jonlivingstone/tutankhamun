@@ -49,6 +49,14 @@ serde = { version = "1", features = ["derive"] }
 # OS path conventions (XDG / macOS / Windows)
 directories = "5"
 
+# Object storage (S3 / GCS / Azure / S3-compatible / local / HTTP / in-memory)
+object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
+url = "2"
+futures = "0.3"
+
+# Dev-only
+tempfile = "3"
+
 # Internal crates
 tutankhamun-server = { path = "crates/tutankhamun-server" }
 tutankhamun-client = { path = "crates/tutankhamun-client" }

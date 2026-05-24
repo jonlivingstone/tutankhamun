@@ -26,6 +26,13 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 directories = { workspace = true }
+object_store = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }
 
 [lints.rust]
 unsafe_code = "warn"

@@ -6,3 +6,4 @@ pub mod config;
 pub mod ops_http;
 pub mod runtime;
 pub mod shutdown;
+pub mod storage;

@@ -1,17 +1,19 @@
 //! Tutankhamun (`t9n`) daemon entry point.
 //!
-//! Single binary with subcommands. Currently only `t9n serve` is implemented;
-//! other subcommands land as the relevant subsystems do.
+//! Single binary with subcommands. `t9n serve` runs the daemon; `t9n storage`
+//! groups operator commands for the storage backend.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tracing::{error, info};
 
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shutdown::{self, ShutdownHandle};
+use tutankhamun_server::storage::{self, StorageRegistry};
 
 #[derive(Parser, Debug)]
 #[command(name = "t9n", version, about = "Tutankhamun (t9n) — analytics engine")]
@@ -24,6 +26,33 @@ struct Cli {
 enum Command {
     /// Start the daemon.
     Serve(ServeArgs),
+    /// Storage backend operations (admin / verification).
+    Storage(StorageArgs),
+}
+
+#[derive(Args, Debug)]
+struct StorageArgs {
+    #[command(subcommand)]
+    command: StorageCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum StorageCommand {
+    /// Verify that a storage URL is reachable by listing a prefix.
+    Check {
+        /// Storage backend URL (e.g. `s3://bucket/prefix`,
+        /// `file:///var/data`). Defaults to `TUT_STORAGE_URL`.
+        #[arg(
+            long,
+            env = env_vars::STORAGE_URL,
+            help = "Storage backend URL (e.g. s3://bucket/prefix, file:///var/data). \
+                    Defaults to TUT_STORAGE_URL."
+        )]
+        url: String,
+        /// Prefix to list under (default: backend root).
+        #[arg(long)]
+        prefix: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -33,6 +62,7 @@ fn main() -> anyhow::Result<()> {
 
     match &cli.command {
         Command::Serve(args) => run_serve(args),
+        Command::Storage(args) => run_storage(args),
     }
 }
 
@@ -54,11 +84,12 @@ fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
 }
 
 async fn serve(config: Config) -> anyhow::Result<()> {
+    let storage = Arc::new(StorageRegistry::from_url(&config.storage_url)?);
+    info!(storage_url = %config.storage_url, "storage backend ready");
+
     let shutdown = ShutdownHandle::new();
     let ops_state = OpsState::new();
 
-    // Bind synchronously-with-async so we know the listener is up before
-    // marking ready. The serve() future then runs for the daemon's lifetime.
     let ops_addr = config.ops_addr.parse()?;
     let ops_listener = ops_http::bind(ops_addr).await?;
     let ops_task = tokio::spawn({
@@ -71,8 +102,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         }
     });
 
-    // TODO: gRPC data-plane bind goes here. Once it lands, gate mark_ready
-    // on both bindings succeeding.
+    // `storage` is held here so subsystems that need it can borrow a clone
+    // when the data plane lands.
+    let _storage = storage;
+
     ops_state.mark_ready();
     info!(
         ops_addr = %config.ops_addr,
@@ -94,6 +127,22 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+fn run_storage(args: &StorageArgs) -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    match &args.command {
+        StorageCommand::Check { url, prefix } => {
+            runtime.block_on(run_storage_check(url, prefix.as_deref()))
+        }
+    }
+}
+
+async fn run_storage_check(url: &str, prefix: Option<&str>) -> anyhow::Result<()> {
+    let registry = StorageRegistry::from_url(url)?;
+    storage::check(&*registry.store(), prefix).await.map(|_| ())
 }
 
 fn init_tracing() {

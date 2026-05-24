@@ -61,16 +61,22 @@ pub async fn bind(addr: SocketAddr) -> anyhow::Result<TcpListener> {
     Ok(listener)
 }
 
+/// Build the ops HTTP router. Factored out so tests can exercise the
+/// routes via `tower::ServiceExt::oneshot` without binding a port.
+fn router(state: OpsState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .with_state(state)
+}
+
 /// Serve until `shutdown` fires.
 pub async fn serve(
     listener: TcpListener,
     state: OpsState,
     shutdown: ShutdownHandle,
 ) -> anyhow::Result<()> {
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .with_state(state);
+    let app = router(state);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -91,5 +97,56 @@ async fn readyz(State(state): State<OpsState>) -> impl IntoResponse {
         (StatusCode::OK, "ready")
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn req(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("valid request")
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_ok_regardless_of_readiness() {
+        let state = OpsState::new();
+        let response = router(state.clone())
+            .oneshot(req("/healthz"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state.mark_ready();
+        let response = router(state).oneshot(req("/healthz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readyz_starts_not_ready() {
+        let response = router(OpsState::new())
+            .oneshot(req("/readyz"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn readyz_reflects_mark_ready_toggles() {
+        let state = OpsState::new();
+
+        state.mark_ready();
+        let response = router(state.clone()).oneshot(req("/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        state.mark_not_ready();
+        let response = router(state).oneshot(req("/readyz")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }
