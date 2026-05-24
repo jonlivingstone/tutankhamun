@@ -14,18 +14,18 @@ directly.
 
 ## Project bootstrap
 
-- [ ] Cargo workspace structure (`tutankhamun-server`,
+- [x] Cargo workspace structure (`tutankhamun-server`,
       `tutankhamun-client`, shared crates)
-- [ ] Layered config: CLI (`clap`) + env + file + defaults
+- [x] Layered config: CLI (`clap`) + env + file + defaults
       (`figment` or similar) — §1.3
-- [ ] Graceful shutdown — SIGTERM → drain → deregister → exit, with
+- [x] Graceful shutdown — SIGTERM → drain → deregister → exit, with
       configurable timeout — §1.3
-- [ ] Ops HTTP server (default port 8080) with `/healthz`,
+- [x] Ops HTTP server (default port 8080) with `/healthz`,
       `/readyz` — §1.3
-- [ ] `tokio` runtime configuration in `main()` (worker thread
+- [x] `tokio` runtime configuration in `main()` (worker thread
       count, etc.) — §2.3
-- [ ] `rayon` thread pool configuration as a `OnceLock` — §2.3
-- [ ] Async-to-Rayon dispatch helper (oneshot channel + Tokio
+- [x] `rayon` thread pool configuration as a `OnceLock` — §2.3
+- [x] Async-to-Rayon dispatch helper (oneshot channel + Tokio
       future) — §2.3
 
 ## Storage backends
