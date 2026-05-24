@@ -30,10 +30,10 @@ directly.
 
 ## Storage backends
 
-- [ ] `object_store` integration with all backends enabled (S3,
+- [x] `object_store` integration with all backends enabled (S3,
       S3-compatible, GCS, Azure Blob, local filesystem, HTTP,
       in-memory) — §1.4
-- [ ] Credential chain wiring (env, instance metadata, IRSA,
+- [x] Credential chain wiring (env, instance metadata, IRSA,
       Workload Identity, SSO) — no hardcoded credentials — §1.4
 - [ ] Local hot-storage cache — directory creation, XDG defaults
       via `directories` crate — §1.5
@@ -54,9 +54,9 @@ directly.
       `postings/<field>.fst`, `postings/<field>.posting`) — §2.1
 - [ ] `metadata.json` schema (Arrow schema, numDocs, time range,
       format version, content hashes) — §2.1
-- [ ] Forward column writer — uncompressed single-batch Arrow IPC
+- [x] Forward column writer — uncompressed single-batch Arrow IPC
       via `arrow-rs` — §2.1
-- [ ] Forward column reader — mmap via `memmap2` + zero-copy
+- [x] Forward column reader — mmap via `memmap2` + zero-copy
       `&[i64]` cast via `bytemuck` — §2.1
 - [ ] Inverted index writer — `roaring` bitmaps per term + `fst`
       term dictionary — §2.1
@@ -66,9 +66,9 @@ directly.
 
 ## Engine — abstractions
 
-- [ ] `Shard` trait — `forward_column()`, `inverted_index()`,
+- [x] `Shard` trait — `forward_column()`, `inverted_index()`,
       `time_range()`, `num_docs()`, `schema()` — §2.1, §3.3 v1 disciplines
-- [ ] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
+- [x] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
 - [ ] `ShardSource` trait — server-side abstraction over where
       shards come from — §3.3 v1 disciplines
 - [ ] Object-storage `ShardSource` implementation — §3.3 v1
