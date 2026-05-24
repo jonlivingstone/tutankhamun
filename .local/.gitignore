@@ -1,0 +1,7 @@
+# Local playground state — never committed.
+data/
+storage/
+cache/
+state/
+*.log
+*.partial

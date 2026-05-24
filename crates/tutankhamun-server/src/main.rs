@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::ops_http::{self, OpsState};
@@ -102,10 +102,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         }
     });
 
-    // `storage` is held here so subsystems that need it can borrow a clone
-    // when the data plane lands.
-    let _storage = storage;
-
     ops_state.mark_ready();
     info!(
         ops_addr = %config.ops_addr,
@@ -113,7 +109,21 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         "daemon ready"
     );
 
+    // Run the storage scan as a background task so it doesn't block reaching
+    // the signal handler — a slow LIST against a large S3 bucket would
+    // otherwise widen the window in which SIGTERM bypasses the graceful
+    // drain. The scan is informational; aborting it mid-flight on shutdown
+    // is safe.
+    let scan_task = tokio::spawn({
+        let storage = Arc::clone(&storage);
+        async move {
+            log_storage_scan(&*storage.store()).await;
+        }
+    });
+
     shutdown::wait_for_signal().await;
+
+    scan_task.abort();
 
     info!("shutdown requested; draining");
     ops_state.mark_not_ready();
@@ -143,6 +153,29 @@ fn run_storage(args: &StorageArgs) -> anyhow::Result<()> {
 async fn run_storage_check(url: &str, prefix: Option<&str>) -> anyhow::Result<()> {
     let registry = StorageRegistry::from_url(url)?;
     storage::check(&*registry.store(), prefix).await.map(|_| ())
+}
+
+async fn log_storage_scan(store: &dyn object_store::ObjectStore) {
+    match storage::summarize(store).await {
+        Ok(stats) => {
+            if stats.is_empty() {
+                info!("storage scan complete: empty backend");
+                return;
+            }
+            for s in &stats {
+                info!(prefix = %s.prefix, objects = s.objects, bytes = s.bytes, "dataset");
+            }
+            let total_objects: usize = stats.iter().map(|s| s.objects).sum();
+            let total_bytes: usize = stats.iter().map(|s| s.bytes).sum();
+            info!(
+                prefixes = stats.len(),
+                total_objects, total_bytes, "storage scan complete"
+            );
+        }
+        Err(e) => {
+            warn!(error = ?e, "storage scan failed; daemon will continue");
+        }
+    }
 }
 
 fn init_tracing() {

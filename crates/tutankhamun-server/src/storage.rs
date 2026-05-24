@@ -51,6 +51,47 @@ impl StorageRegistry {
     }
 }
 
+/// Per-prefix counts produced by [`summarize`].
+#[derive(Debug)]
+pub struct PrefixStats {
+    /// Top-level prefix (e.g. `"nyc_taxi/"`). The sentinel `"(root)"`
+    /// is used for objects that sit directly at the backend root.
+    pub prefix: String,
+    pub objects: usize,
+    pub bytes: usize,
+}
+
+/// One-level-deep scan of `store`, returning per-prefix counts suitable
+/// for logging at daemon startup. Issues one `list_with_delimiter` at the
+/// root plus one per top-level prefix (the per-prefix calls run in
+/// parallel); does not recurse further.
+pub async fn summarize(store: &dyn ObjectStore) -> anyhow::Result<Vec<PrefixStats>> {
+    let root = store.list_with_delimiter(None).await?;
+    let mut stats = Vec::with_capacity(root.common_prefixes.len() + 1);
+
+    if !root.objects.is_empty() {
+        let bytes: usize = root.objects.iter().map(|o| o.size).sum();
+        stats.push(PrefixStats {
+            prefix: "(root)".to_string(),
+            objects: root.objects.len(),
+            bytes,
+        });
+    }
+
+    let sub_futs = root.common_prefixes.iter().map(|prefix| async move {
+        let sub = store.list_with_delimiter(Some(prefix)).await?;
+        let bytes: usize = sub.objects.iter().map(|o| o.size).sum();
+        Ok::<_, anyhow::Error>(PrefixStats {
+            prefix: prefix.to_string(),
+            objects: sub.objects.len(),
+            bytes,
+        })
+    });
+    stats.extend(futures::future::try_join_all(sub_futs).await?);
+
+    Ok(stats)
+}
+
 /// One-shot connectivity check: list objects under `prefix` (or the
 /// backend root if `None`), printing a small summary. Returns the number
 /// of objects observed.
@@ -154,6 +195,52 @@ mod tests {
         let registry = StorageRegistry::from_url("memory:///").expect("registry");
         let count = check(&*registry.store(), None).await.expect("check");
         assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn summarize_empty_backend_is_empty() {
+        let registry = StorageRegistry::from_url("memory:///").expect("registry");
+        let stats = summarize(&*registry.store()).await.expect("summarize");
+        assert!(stats.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summarize_root_level_objects_get_root_sentinel() {
+        let registry = StorageRegistry::from_url("memory:///").expect("registry");
+        let store = registry.store();
+        put(&*store, "a.txt", b"xx").await;
+        put(&*store, "b.txt", b"yyy").await;
+
+        let stats = summarize(&*store).await.expect("summarize");
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].prefix, "(root)");
+        assert_eq!(stats[0].objects, 2);
+        assert_eq!(stats[0].bytes, 5);
+    }
+
+    #[tokio::test]
+    async fn summarize_groups_by_top_level_prefix() {
+        let registry = StorageRegistry::from_url("memory:///").expect("registry");
+        let store = registry.store();
+        put(&*store, "nyc_taxi/a.parquet", b"AAAA").await;
+        put(&*store, "nyc_taxi/b.parquet", b"BBBB").await;
+        put(&*store, "binance/c.csv", b"CCCCCC").await;
+        // A root-level file too, to verify the sentinel coexists with prefixes.
+        put(&*store, "manifest.json", b"M").await;
+
+        let mut stats = summarize(&*store).await.expect("summarize");
+        stats.sort_by(|a, b| a.prefix.cmp(&b.prefix));
+
+        assert_eq!(stats.len(), 3);
+        assert_eq!(stats[0].prefix, "(root)");
+        assert_eq!(stats[0].objects, 1);
+        assert_eq!(stats[0].bytes, 1);
+        assert_eq!(stats[1].prefix, "binance");
+        assert_eq!(stats[1].objects, 1);
+        assert_eq!(stats[1].bytes, 6);
+        assert_eq!(stats[2].prefix, "nyc_taxi");
+        assert_eq!(stats[2].objects, 2);
+        assert_eq!(stats[2].bytes, 8);
     }
 
     #[tokio::test]
