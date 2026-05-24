@@ -3,6 +3,8 @@
 //! Single binary with subcommands. `t9n serve` runs the daemon; `t9n storage`
 //! groups operator commands for the storage backend.
 
+use std::io;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,6 +14,7 @@ use tracing::{error, info, warn};
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
+use tutankhamun_server::shard;
 use tutankhamun_server::shutdown::{self, ShutdownHandle};
 use tutankhamun_server::storage::{self, StorageRegistry};
 
@@ -28,12 +31,29 @@ enum Command {
     Serve(ServeArgs),
     /// Storage backend operations (admin / verification).
     Storage(StorageArgs),
+    /// Shard inspection / maintenance.
+    Shard(ShardArgs),
 }
 
 #[derive(Args, Debug)]
 struct StorageArgs {
     #[command(subcommand)]
     command: StorageCommand,
+}
+
+#[derive(Args, Debug)]
+struct ShardArgs {
+    #[command(subcommand)]
+    command: ShardCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum ShardCommand {
+    /// Print a shard's metadata and schema.
+    Inspect {
+        /// Path to the shard directory (containing metadata.json + metrics.arrow).
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -63,6 +83,7 @@ fn main() -> anyhow::Result<()> {
     match &cli.command {
         Command::Serve(args) => run_serve(args),
         Command::Storage(args) => run_storage(args),
+        Command::Shard(args) => run_shard(args),
     }
 }
 
@@ -153,6 +174,16 @@ fn run_storage(args: &StorageArgs) -> anyhow::Result<()> {
 async fn run_storage_check(url: &str, prefix: Option<&str>) -> anyhow::Result<()> {
     let registry = StorageRegistry::from_url(url)?;
     storage::check(&*registry.store(), prefix).await.map(|_| ())
+}
+
+fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
+    match &args.command {
+        ShardCommand::Inspect { path } => {
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            shard::inspect(path, &mut out)
+        }
+    }
 }
 
 async fn log_storage_scan(store: &dyn object_store::ObjectStore) {

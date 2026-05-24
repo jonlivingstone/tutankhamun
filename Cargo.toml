@@ -54,6 +54,12 @@ object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
 url = "2"
 futures = "0.3"
 
+# Columnar storage format (shard forward columns)
+arrow = { version = "56", default-features = false, features = ["ipc"] }
+
+# Time / date formatting (Unix epoch → ISO 8601 for inspect output, etc.)
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 # Dev-only
 tempfile = "3"
 
