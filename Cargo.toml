@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/tutankhamun-server",
+    "crates/tutankhamun-client",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/jonlivingstone/tutankhamun"
+authors = ["Tutankhamun contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "signal",
+    "sync",
+    "macros",
+] }
+
+# CLI + config
+clap = { version = "4", features = ["derive", "env"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+
+# Web (ops port)
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+
+# CPU pool
+rayon = "1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+
+# OS path conventions (XDG / macOS / Windows)
+directories = "5"
+
+# Internal crates
+tutankhamun-server = { path = "crates/tutankhamun-server" }
+tutankhamun-client = { path = "crates/tutankhamun-client" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.dev]
+debug = "line-tables-only"

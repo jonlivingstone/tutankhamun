@@ -1,0 +1,42 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug t9n serve",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=t9n",
+                    "--package=tutankhamun-server"
+                ],
+                "filter": { "name": "t9n", "kind": "bin" }
+            },
+            "args": [
+                "serve",
+                "--ops-addr", "127.0.0.1:8080"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests (tutankhamun-server)",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=tutankhamun-server"
+                ],
+                "filter": { "name": "tutankhamun_server", "kind": "lib" }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

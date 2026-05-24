@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+/.idea
+/.vscode/settings.json
+/.vscode/*.code-workspace
+*.swp
+*.swo
+
+# OS
+.DS_Store
