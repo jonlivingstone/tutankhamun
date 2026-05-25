@@ -156,6 +156,55 @@ impl ShardManager {
     }
 }
 
+/// Fan out [`shard::query_shard`] across every shard discovered under
+/// `root` (a local directory) and write a human-readable aggregate to
+/// `out`. Used by the top-level `t9n query` CLI verb.
+///
+/// Discovery uses [`ObjectStoreShardSource`] backed by a local-filesystem
+/// `object_store` rooted at `root`; remote backends are not yet supported
+/// (that needs the local hot-storage cache).
+pub async fn query_dataset(
+    root: &std::path::Path,
+    filter: Option<(&str, &str)>,
+    metric: &str,
+    out: &mut dyn std::io::Write,
+) -> Result<()> {
+    use anyhow::Context as _;
+
+    let root =
+        std::fs::canonicalize(root).with_context(|| format!("resolve {}", root.display()))?;
+    if !root.is_dir() {
+        anyhow::bail!("{} is not a directory", root.display());
+    }
+    let url = url::Url::from_directory_path(&root)
+        .map_err(|()| anyhow::anyhow!("{} is not a valid directory path", root.display()))?;
+    let registry = crate::storage::StorageRegistry::from_url(url.as_str())?;
+
+    let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(registry.store()));
+    let summaries = source.discover().await?;
+
+    if summaries.is_empty() {
+        writeln!(out, "dataset:  {}", root.display())?;
+        writeln!(out, "no shards found")?;
+        return Ok(());
+    }
+
+    let mut total = crate::shard::QueryResult::default();
+    for summary in &summaries {
+        let shard_path = root.join(summary.location.as_ref());
+        let r = crate::shard::query_shard(&shard_path, filter, metric)
+            .with_context(|| format!("query {}", shard_path.display()))?;
+        total.num_docs += r.num_docs;
+        total.matched += r.matched;
+        total.sum += r.sum;
+    }
+
+    writeln!(out, "dataset:  {}", root.display())?;
+    writeln!(out, "shards:   {} scanned", summaries.len())?;
+    crate::shard::write_query_summary(out, filter, metric, &total)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +426,122 @@ mod tests {
 
         let spanning = manager.shards_in_time_range(150, 550);
         assert_eq!(spanning.len(), 3);
+    }
+
+    use std::collections::BTreeMap;
+
+    use crate::shard::DiskShardWriter;
+    use roaring::RoaringBitmap;
+
+    fn write_query_shard(
+        dir: &std::path::Path,
+        clicks: Vec<i64>,
+        us_docs: &[u32],
+        de_docs: &[u32],
+    ) {
+        let mut postings: BTreeMap<String, RoaringBitmap> = BTreeMap::new();
+        if !us_docs.is_empty() {
+            postings.insert("us".to_string(), us_docs.iter().copied().collect());
+        }
+        if !de_docs.is_empty() {
+            postings.insert("de".to_string(), de_docs.iter().copied().collect());
+        }
+        let mut w = DiskShardWriter::new(dir, (0, 0)).expect("new writer");
+        w.add_metric("clicks", clicks).expect("add_metric");
+        if !postings.is_empty() {
+            w.add_string_field("country", postings)
+                .expect("add_string_field");
+        }
+        w.finalize().expect("finalize");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_aggregates_across_shards() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_query_shard(
+            &tmp.path().join("dataset/shard-000"),
+            vec![10, 20, 30],
+            &[0, 2],
+            &[1],
+        );
+        write_query_shard(
+            &tmp.path().join("dataset/shard-001"),
+            vec![100, 200, 300, 400],
+            &[0, 3],
+            &[1, 2],
+        );
+
+        // Filtered sum: us docs in shard-000 = 10+30 = 40, in shard-001 = 100+400 = 500.
+        let mut buf = Vec::new();
+        query_dataset(tmp.path(), Some(("country", "us")), "clicks", &mut buf)
+            .await
+            .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("shards:   2 scanned"), "{out}");
+        assert!(out.contains("matched:  4 / 7 docs"), "{out}");
+        assert!(out.contains("clicks:   sum = 540"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_no_filter_sums_every_doc() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_query_shard(&tmp.path().join("a/shard-000"), vec![1, 2, 3], &[0], &[]);
+        write_query_shard(
+            &tmp.path().join("b/shard-001"),
+            vec![10, 20, 30, 40],
+            &[0],
+            &[],
+        );
+
+        let mut buf = Vec::new();
+        query_dataset(tmp.path(), None, "clicks", &mut buf)
+            .await
+            .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("shards:   2 scanned"), "{out}");
+        assert!(out.contains("matched:  all 7 docs"), "{out}");
+        assert!(out.contains("clicks:   sum = 106"), "{out}");
+        assert!(!out.contains("filter:"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_empty_dir_reports_no_shards() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let mut buf = Vec::new();
+        query_dataset(tmp.path(), None, "clicks", &mut buf)
+            .await
+            .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("no shards found"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_rejects_file_argument() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let file_path = tmp.path().join("not-a-directory.txt");
+        std::fs::write(&file_path, b"hello").expect("write");
+
+        let mut buf = Vec::new();
+        let err = query_dataset(&file_path, None, "clicks", &mut buf)
+            .await
+            .expect_err("expected file-not-directory rejection");
+        let msg = err.to_string();
+        assert!(msg.contains("not a directory"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_surfaces_per_shard_error_with_path() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_query_shard(&tmp.path().join("ok/shard-000"), vec![1, 2, 3], &[0], &[]);
+
+        let mut buf = Vec::new();
+        let err = query_dataset(tmp.path(), None, "no_such_metric", &mut buf)
+            .await
+            .expect_err("expected error from missing metric in one of the shards");
+        // `{:#}` renders the full anyhow chain (with_context wraps the
+        // inner error, so the top-level Display only shows "query …").
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no_such_metric"), "{msg}");
+        assert!(msg.contains("shard-000"), "{msg}");
     }
 }

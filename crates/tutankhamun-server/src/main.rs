@@ -16,7 +16,7 @@ use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard;
 use tutankhamun_server::shard_source::{
-    ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
+    self, ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
 };
 use tutankhamun_server::shutdown::{self, ShutdownHandle};
 use tutankhamun_server::storage::{self, StorageRegistry};
@@ -36,6 +36,20 @@ enum Command {
     Storage(StorageArgs),
     /// Shard inspection / maintenance.
     Shard(ShardArgs),
+    /// Sum a metric column across every shard discovered under a
+    /// local directory, optionally restricted by a string-field term.
+    Query {
+        /// Local directory containing one or more shards (anywhere
+        /// underneath). Remote storage backends are not yet supported.
+        dir: PathBuf,
+        /// Metric column to sum.
+        #[arg(long)]
+        metric: String,
+        /// Optional `<field>=<term>` restriction (applied to every
+        /// shard).
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -111,7 +125,22 @@ fn main() -> anyhow::Result<()> {
         Command::Serve(args) => run_serve(args),
         Command::Storage(args) => run_storage(args),
         Command::Shard(args) => run_shard(args),
+        Command::Query {
+            dir,
+            metric,
+            filter,
+        } => run_query(dir, metric, filter.as_deref()),
     }
+}
+
+fn run_query(dir: &std::path::Path, metric: &str, filter: Option<&str>) -> anyhow::Result<()> {
+    let parsed = filter.map(parse_filter).transpose()?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    runtime.block_on(shard_source::query_dataset(dir, parsed, metric, &mut out))
 }
 
 fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
