@@ -6,5 +6,6 @@ pub mod config;
 pub mod ops_http;
 pub mod runtime;
 pub mod shard;
+pub mod shard_source;
 pub mod shutdown;
 pub mod storage;

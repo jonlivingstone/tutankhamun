@@ -53,6 +53,7 @@ directories = "5"
 object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
 url = "2"
 futures = "0.3"
+async-trait = "0.1"
 
 # Columnar storage format (shard forward columns)
 arrow = { version = "56", default-features = false, features = ["ipc"] }

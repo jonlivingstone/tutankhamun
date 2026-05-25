@@ -38,7 +38,7 @@ const METRICS_TMP: &str = ".metrics.arrow.tmp";
 
 /// Shard format version this build writes and refuses to read anything
 /// other than.
-const FORMAT_VERSION: u32 = 1;
+pub(crate) const FORMAT_VERSION: u32 = 1;
 
 /// Shard-level metadata persisted as `metadata.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -48,6 +48,22 @@ pub struct Metadata {
     pub time_range_start: i64,
     pub time_range_end: i64,
     pub fields: Vec<FieldSchema>,
+}
+
+impl Metadata {
+    /// Reject corrupt metadata. Currently checks that the time range
+    /// satisfies `start <= end`; a degenerate range silently breaks
+    /// time-range pruning later on, so we'd rather fail fast on read.
+    pub fn validate(&self) -> Result<()> {
+        if self.time_range_start > self.time_range_end {
+            bail!(
+                "invalid time range: start ({}) > end ({})",
+                self.time_range_start,
+                self.time_range_end
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +124,9 @@ impl DiskShard {
             .with_context(|| format!("read {}", metadata_path.display()))?;
         let metadata: Metadata = serde_json::from_slice(&metadata_bytes)
             .with_context(|| format!("parse {}", metadata_path.display()))?;
+        metadata
+            .validate()
+            .with_context(|| format!("validate {}", metadata_path.display()))?;
 
         if metadata.format_version != FORMAT_VERSION {
             bail!(
@@ -463,6 +482,29 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("field name mismatch") || msg.contains("ghost"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn disk_shard_rejects_degenerate_time_range() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_shard(tmp.path(), (0, 0), vec![("x", vec![1, 2, 3])]);
+
+        // Doctor metadata.json to invert the time range.
+        let metadata_path = tmp.path().join(METADATA_FILE);
+        let mut metadata: Metadata =
+            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
+        metadata.time_range_start = 200;
+        metadata.time_range_end = 100;
+        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+
+        let err = DiskShard::open(tmp.path())
+            .err()
+            .expect("expected degenerate-range error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("validate") || msg.to_lowercase().contains("time range"),
             "got: {msg}"
         );
     }

@@ -30,6 +30,7 @@ directories = { workspace = true }
 object_store = { workspace = true }
 url = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 arrow = { workspace = true }
 chrono = { workspace = true }
 

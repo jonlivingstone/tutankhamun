@@ -69,15 +69,15 @@ directly.
 - [x] `Shard` trait — `forward_column()`, `inverted_index()`,
       `time_range()`, `num_docs()`, `schema()` — §2.1, §3.3 v1 disciplines
 - [x] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
-- [ ] `ShardSource` trait — server-side abstraction over where
+- [x] `ShardSource` trait — server-side abstraction over where
       shards come from — §3.3 v1 disciplines
-- [ ] Object-storage `ShardSource` implementation — §3.3 v1
+- [x] Object-storage `ShardSource` implementation — §3.3 v1
 - [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
 - [ ] K8s DNS `ShardLocator` implementation — §1.3
 - [ ] Static-file `ShardLocator` implementation — §1.3
 - [ ] Shard manager — composes shards from multiple sources;
       handles registration / eviction — §3.3 v1
-- [ ] Time-range query pruning (skip shards outside requested
+- [x] Time-range query pruning (skip shards outside requested
       time range) — §3.3 v1 disciplines
 
 ## Engine — memory model

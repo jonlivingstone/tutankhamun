@@ -15,6 +15,9 @@ use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard;
+use tutankhamun_server::shard_source::{
+    ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
+};
 use tutankhamun_server::shutdown::{self, ShutdownHandle};
 use tutankhamun_server::storage::{self, StorageRegistry};
 
@@ -53,6 +56,18 @@ enum ShardCommand {
     Inspect {
         /// Path to the shard directory (containing metadata.json + metrics.arrow).
         path: PathBuf,
+    },
+    /// List every shard discovered at a storage URL.
+    List {
+        /// Storage backend URL (e.g. `s3://bucket/prefix`,
+        /// `file:///var/data`). Defaults to `TUT_STORAGE_URL`.
+        #[arg(
+            long,
+            env = env_vars::STORAGE_URL,
+            help = "Storage backend URL (e.g. s3://bucket/prefix, file:///var/data). \
+                    Defaults to TUT_STORAGE_URL."
+        )]
+        url: String,
     },
 }
 
@@ -130,15 +145,22 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         "daemon ready"
     );
 
-    // Run the storage scan as a background task so it doesn't block reaching
+    // Run the startup scans as a background task so they don't block reaching
     // the signal handler — a slow LIST against a large S3 bucket would
     // otherwise widen the window in which SIGTERM bypasses the graceful
-    // drain. The scan is informational; aborting it mid-flight on shutdown
+    // drain. The scans are informational; aborting mid-flight on shutdown
     // is safe.
     let scan_task = tokio::spawn({
         let storage = Arc::clone(&storage);
         async move {
-            log_storage_scan(&*storage.store()).await;
+            // Both scans hit the same backend independently; running them
+            // concurrently bounds startup-scan wall-clock by the slower one
+            // rather than their sum.
+            let store = storage.store();
+            tokio::join!(
+                log_storage_scan(&*store),
+                log_shard_scan(Arc::clone(&store)),
+            );
         }
     });
 
@@ -183,7 +205,74 @@ fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
             let mut out = stdout.lock();
             shard::inspect(path, &mut out)
         }
+        ShardCommand::List { url } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(run_shard_list(url))
+        }
     }
+}
+
+async fn run_shard_list(url: &str) -> anyhow::Result<()> {
+    let registry = StorageRegistry::from_url(url)?;
+    let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(registry.store()));
+    let mut manager = ShardManager::new(source);
+    manager.refresh().await?;
+
+    let shards = manager.all_shards();
+    if shards.is_empty() {
+        println!("no shards discovered at {url}");
+        return Ok(());
+    }
+
+    let widest_loc = shards
+        .iter()
+        .map(|s| s.location.as_ref().len())
+        .max()
+        .unwrap_or(0);
+    for s in shards {
+        println!(
+            "{:<width$}  {:>10} docs  {} .. {}",
+            s.location.as_ref(),
+            s.metadata.num_docs,
+            s.metadata.time_range_start,
+            s.metadata.time_range_end,
+            width = widest_loc,
+        );
+    }
+    println!("---");
+    let total: u64 = shards.iter().map(|s| s.metadata.num_docs).sum();
+    let word = if shards.len() == 1 { "shard" } else { "shards" };
+    println!("{} {word}, {total} total docs", shards.len());
+    Ok(())
+}
+
+async fn log_shard_scan(store: Arc<dyn object_store::ObjectStore>) {
+    let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(store));
+    let mut manager = ShardManager::new(source);
+    match manager.refresh().await {
+        Ok(()) => log_shards(manager.all_shards()),
+        Err(e) => warn!(error = ?e, "shard scan failed; daemon will continue"),
+    }
+}
+
+fn log_shards(shards: &[ShardSummary]) {
+    if shards.is_empty() {
+        info!("shard scan complete: no shards discovered");
+        return;
+    }
+    for s in shards {
+        info!(
+            location = %s.location.as_ref(),
+            num_docs = s.metadata.num_docs,
+            time_range_start = s.metadata.time_range_start,
+            time_range_end = s.metadata.time_range_end,
+            "shard"
+        );
+    }
+    let total_docs: u64 = shards.iter().map(|s| s.metadata.num_docs).sum();
+    info!(shards = shards.len(), total_docs, "shard scan complete");
 }
 
 async fn log_storage_scan(store: &dyn object_store::ObjectStore) {
