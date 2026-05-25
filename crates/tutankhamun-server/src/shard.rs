@@ -679,5 +679,77 @@ fn format_timestamp(secs: i64) -> String {
         .map_or_else(|| "(out of range)".to_string(), |t| t.to_rfc3339())
 }
 
+/// Open the shard at `path`, optionally restrict to docs matching
+/// `filter = Some((field, term))`, sum the named metric over the
+/// resulting doc set, and write a human-readable summary to `out`.
+/// Used by the `t9n shard query` CLI subcommand.
+///
+/// Accumulates into `i128` so the result is overflow-free for any
+/// realistic shard.
+pub fn query(
+    path: &Path,
+    filter: Option<(&str, &str)>,
+    metric: &str,
+    out: &mut dyn io::Write,
+) -> Result<()> {
+    let shard = DiskShard::open(path)?;
+    let metadata = shard.metadata();
+
+    require_field(metadata, metric, FieldKind::Metric)?;
+    let col = shard
+        .forward_column(metric)
+        .expect("metric field kind validated above");
+
+    let (matched, sum, filter_line) = if let Some((field, term)) = filter {
+        require_field(metadata, field, FieldKind::String)?;
+        let idx = shard
+            .inverted_index(field)
+            .expect("string field kind validated above");
+        let (matched, sum) = idx.lookup(term).map_or((0, 0), |bm| {
+            let m = bm.len();
+            let s: i128 = bm.iter().map(|doc| i128::from(col[doc as usize])).sum();
+            (m, s)
+        });
+        (matched, sum, Some(format!("{field} = {term:?}")))
+    } else {
+        let sum: i128 = col.iter().copied().map(i128::from).sum();
+        (metadata.num_docs, sum, None)
+    };
+
+    writeln!(out, "shard:    {}", path.display())?;
+    if let Some(line) = filter_line {
+        writeln!(out, "filter:   {line}")?;
+        writeln!(out, "matched:  {matched} / {} docs", metadata.num_docs)?;
+    } else {
+        writeln!(out, "matched:  all {} docs", metadata.num_docs)?;
+    }
+    writeln!(out, "{metric}:   sum = {sum}")?;
+    Ok(())
+}
+
+/// Verify that `name` is declared in `metadata.fields` and has the
+/// expected `FieldKind`. Returns the matching `FieldSchema` on success;
+/// produces a uniform error message on either missing-field or
+/// wrong-kind failures so callers can rely on consistent CLI output.
+fn require_field<'a>(
+    metadata: &'a Metadata,
+    name: &str,
+    want: FieldKind,
+) -> Result<&'a FieldSchema> {
+    let field = metadata
+        .fields
+        .iter()
+        .find(|f| f.name == name)
+        .ok_or_else(|| anyhow::anyhow!("field {name:?} not found in shard"))?;
+    if field.kind != want {
+        bail!(
+            "field {name:?} is a {:?} field, not a {:?}",
+            field.kind,
+            want
+        );
+    }
+    Ok(field)
+}
+
 #[cfg(test)]
 mod tests;

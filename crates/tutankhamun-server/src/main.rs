@@ -69,6 +69,18 @@ enum ShardCommand {
         )]
         url: String,
     },
+    /// Sum a metric column over the docs in a shard, optionally
+    /// restricted to those matching a single string-field term.
+    Query {
+        /// Path to the shard directory.
+        path: PathBuf,
+        /// Metric column to sum.
+        #[arg(long)]
+        metric: String,
+        /// Optional `<field>=<term>` restriction.
+        #[arg(long)]
+        filter: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -211,7 +223,29 @@ fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
                 .build()?;
             runtime.block_on(run_shard_list(url))
         }
+        ShardCommand::Query {
+            path,
+            metric,
+            filter,
+        } => {
+            let parsed = filter.as_deref().map(parse_filter).transpose()?;
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            shard::query(path, parsed, metric, &mut out)
+        }
     }
+}
+
+/// Splits at the first `=`. Terms may contain further `=` characters.
+/// Both halves must be non-empty.
+fn parse_filter(s: &str) -> anyhow::Result<(&str, &str)> {
+    let (field, term) = s
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("filter must be `<field>=<term>` (got {s:?})"))?;
+    if field.is_empty() || term.is_empty() {
+        anyhow::bail!("filter must be `<field>=<term>` with both sides non-empty (got {s:?})");
+    }
+    Ok((field, term))
 }
 
 async fn run_shard_list(url: &str) -> anyhow::Result<()> {

@@ -342,6 +342,115 @@ fn finalize_derives_num_docs_from_string_bitmaps_when_no_metrics() {
     assert_eq!(shard.num_docs(), 8);
 }
 
+fn write_query_fixture(dir: &Path) {
+    // 5 docs: clicks = [10, 20, 30, 40, 50], country: us=[0,2,4], de=[1,3].
+    let mut postings = BTreeMap::new();
+    postings.insert("de".to_string(), bitmap([1, 3]));
+    postings.insert("us".to_string(), bitmap([0, 2, 4]));
+    let mut w = DiskShardWriter::new(dir, (0, 0)).expect("new");
+    w.add_metric("clicks", vec![10, 20, 30, 40, 50])
+        .expect("add_metric");
+    w.add_string_field("country", postings)
+        .expect("add_string_field");
+    w.finalize().expect("finalize");
+}
+
+#[test]
+fn query_sums_metric_filtered_by_term() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    query(tmp.path(), Some(("country", "us")), "clicks", &mut buf).expect("query us");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("matched:  3 / 5 docs"), "{out}");
+    assert!(out.contains("clicks:   sum = 90"), "{out}");
+
+    let mut buf = Vec::new();
+    query(tmp.path(), Some(("country", "de")), "clicks", &mut buf).expect("query de");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("matched:  2 / 5 docs"), "{out}");
+    assert!(out.contains("clicks:   sum = 60"), "{out}");
+}
+
+#[test]
+fn query_no_filter_sums_all_docs() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    query(tmp.path(), None, "clicks", &mut buf).expect("query");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("matched:  all 5 docs"), "{out}");
+    assert!(out.contains("clicks:   sum = 150"), "{out}");
+    assert!(!out.contains("filter:"), "{out}");
+}
+
+#[test]
+fn query_missing_filter_term_is_zero() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    query(tmp.path(), Some(("country", "fr")), "clicks", &mut buf).expect("query fr");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("matched:  0 / 5 docs"), "{out}");
+    assert!(out.contains("clicks:   sum = 0"), "{out}");
+}
+
+#[test]
+fn query_rejects_unknown_metric() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    let err = query(tmp.path(), None, "no_such_metric", &mut buf)
+        .expect_err("expected unknown-metric error");
+    let msg = err.to_string();
+    assert!(msg.contains("no_such_metric"), "{msg}");
+}
+
+#[test]
+fn query_rejects_string_field_as_metric() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    let err = query(tmp.path(), None, "country", &mut buf).expect_err("expected wrong-kind error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("country") && msg.to_lowercase().contains("not a metric"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn query_rejects_unknown_filter_field() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    let err = query(tmp.path(), Some(("cuontry", "us")), "clicks", &mut buf)
+        .expect_err("expected unknown-field error");
+    let msg = err.to_string();
+    assert!(msg.contains("cuontry"), "{msg}");
+}
+
+#[test]
+fn query_rejects_metric_field_as_filter() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_query_fixture(tmp.path());
+
+    let mut buf = Vec::new();
+    let err = query(tmp.path(), Some(("clicks", "10")), "clicks", &mut buf)
+        .expect_err("expected wrong-kind error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clicks") && msg.to_lowercase().contains("not a string"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn inspect_prints_string_field_term_count() {
     let tmp = tempfile::tempdir().expect("tmpdir");
