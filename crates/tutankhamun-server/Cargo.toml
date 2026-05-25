@@ -33,6 +33,9 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 arrow = { workspace = true }
 chrono = { workspace = true }
+roaring = { workspace = true }
+fst = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

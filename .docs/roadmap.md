@@ -50,7 +50,7 @@ directly.
 
 ## Engine — storage format (shards)
 
-- [ ] Shard directory layout (`metadata.json`, `metrics.arrow`,
+- [x] Shard directory layout (`metadata.json`, `metrics.arrow`,
       `postings/<field>.fst`, `postings/<field>.posting`) — §2.1
 - [ ] `metadata.json` schema (Arrow schema, numDocs, time range,
       format version, content hashes) — §2.1
@@ -58,9 +58,9 @@ directly.
       via `arrow-rs` — §2.1
 - [x] Forward column reader — mmap via `memmap2` + zero-copy
       `&[i64]` cast via `bytemuck` — §2.1
-- [ ] Inverted index writer — `roaring` bitmaps per term + `fst`
+- [x] Inverted index writer — `roaring` bitmaps per term + `fst`
       term dictionary — §2.1
-- [ ] Inverted index reader — FST range scan + Roaring bitmap
+- [x] Inverted index reader — FST range scan + Roaring bitmap
       iteration — §2.1
 - [ ] Optional Parquet export of forward columns — §2.1
 

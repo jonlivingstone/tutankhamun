@@ -7,19 +7,29 @@
 //! - `metrics.arrow` — single uncompressed Arrow IPC record batch, one
 //!   `Int64Array` column per metric field. The forward-column hot path
 //!   (FTGS) reads metric values from this file.
+//! - `postings/<field>.fst` + `postings/<field>.posting` — one pair per
+//!   string field. The FST is a sorted term dictionary mapping each
+//!   term to a byte offset into the posting file. The posting file is
+//!   a concatenation of serialized roaring bitmaps — the wire format
+//!   is self-bounded, so no length prefix is needed.
 //!
-//! Inverted-index files (`postings/<field>.fst` + `<field>.posting`)
-//! are a separate layer not implemented here.
-//!
-//! # The "one batch, uncompressed" invariant
+//! # The "one batch, uncompressed" invariant (forward columns)
 //!
 //! [`DiskShardWriter`] always emits a single record batch with no
 //! compression. [`DiskShard::open`] rejects files that violate this
 //! invariant. Cold-tier compressed shards are a future addition that
 //! goes through a different reader.
+//!
+//! # The "files are immutable post-rename" invariant (inverted index)
+//!
+//! Postings files are mmap'd. Callers must not mutate any file inside
+//! a shard directory after it has been finalized; doing so undefines
+//! the behavior of any concurrently-open [`DiskShard`].
 
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,12 +39,16 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
 use chrono::DateTime;
+use fst::{IntoStreamer, Streamer};
+use memmap2::Mmap;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
 const METADATA_FILE: &str = "metadata.json";
 const METRICS_FILE: &str = "metrics.arrow";
-const METADATA_TMP: &str = ".metadata.json.tmp";
-const METRICS_TMP: &str = ".metrics.arrow.tmp";
+const POSTINGS_DIR: &str = "postings";
+const POSTING_EXT: &str = "posting";
+const FST_EXT: &str = "fst";
 
 /// Shard format version this build writes and refuses to read anything
 /// other than.
@@ -72,13 +86,15 @@ pub struct FieldSchema {
     pub kind: FieldKind,
 }
 
-/// Field type within a shard. Only `Metric` (an `int64` forward column)
-/// is implemented; `Int` and `String` (which require the inverted-index
-/// layer) come later.
+/// Field type within a shard. `Metric` is an int64 forward column;
+/// `String` is an inverted index over UTF-8 terms with no forward
+/// column. `Int` (forward column + inverted index over the numeric
+/// values) is not yet implemented.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldKind {
     Metric,
+    String,
 }
 
 /// Read-only access to a shard's contents.
@@ -99,23 +115,124 @@ pub trait Shard: Send + Sync {
     /// Borrow a metric column by field name, or `None` if no such
     /// column exists.
     fn forward_column(&self, name: &str) -> Option<&[i64]>;
+
+    /// Borrow the inverted index for a string field, or `None` if no
+    /// such field exists. Default implementation returns `None` so
+    /// shard impls that have no index layer (e.g. test fakes) need no
+    /// extra code.
+    fn inverted_index(&self, _name: &str) -> Option<&InvertedIndex> {
+        None
+    }
+}
+
+/// Inverted index for one string field — a sorted term dictionary
+/// (FST) plus the concatenated bitmaps it points into.
+///
+/// Both halves are mmap'd, so lookups touch only the pages they read;
+/// the per-shard resident footprint at open time is roughly the size
+/// of the FST's in-memory index, not the postings file.
+pub struct InvertedIndex {
+    fst: fst::Map<Mmap>,
+    postings: Mmap,
+}
+
+impl InvertedIndex {
+    /// Number of terms in the dictionary. Cheap — the FST stores it.
+    #[must_use]
+    pub fn num_terms(&self) -> u64 {
+        self.fst.len() as u64
+    }
+
+    /// Doc set for `term`, or `None` if the term is not in the
+    /// dictionary.
+    #[must_use]
+    pub fn lookup(&self, term: &str) -> Option<RoaringBitmap> {
+        let offset = self.fst.get(term.as_bytes())?;
+        Some(read_bitmap_at(&self.postings, offset))
+    }
+
+    /// All terms in `[start, end_inclusive]`, in lexicographic order,
+    /// each paired with its doc set.
+    pub fn range(
+        &self,
+        start: &str,
+        end_inclusive: &str,
+    ) -> impl Iterator<Item = (String, RoaringBitmap)> + '_ {
+        let mut stream = self
+            .fst
+            .range()
+            .ge(start.as_bytes())
+            .le(end_inclusive.as_bytes())
+            .into_stream();
+        let postings: &[u8] = &self.postings;
+        std::iter::from_fn(move || {
+            let (k, v) = stream.next()?;
+            let term = utf8_term(k);
+            Some((term, read_bitmap_at(postings, v)))
+        })
+    }
+
+    /// All terms in lexicographic order, without their bitmaps.
+    pub fn terms(&self) -> impl Iterator<Item = String> + '_ {
+        let mut stream = self.fst.stream();
+        std::iter::from_fn(move || {
+            let (k, _) = stream.next()?;
+            Some(utf8_term(k))
+        })
+    }
+}
+
+/// FST stores keys as raw bytes; we only ever insert valid UTF-8 (the
+/// `add_string_field` API takes `String` keys), so an invalid sequence
+/// here means the shard file is corrupt.
+fn utf8_term(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .expect("FST term is not valid UTF-8 — shard file corrupt")
+        .to_owned()
+}
+
+fn read_bitmap_at(postings: &[u8], offset: u64) -> RoaringBitmap {
+    let offset = usize::try_from(offset).expect("postings offset fits in usize");
+    let slice = postings
+        .get(offset..)
+        .expect("postings offset within file — shard file corrupt");
+    // RoaringBitmap's wire format is self-bounded: deserialize_from reads
+    // exactly the bitmap's bytes and stops, so no length prefix is needed.
+    RoaringBitmap::deserialize_from(slice).expect("bitmap bytes deserialize — shard file corrupt")
+}
+
+/// Open a file at `path` and mmap its full contents read-only.
+///
+/// Safety: the OS treats mmap'd files as live — if the file is
+/// truncated or written to under our feet, reads through the slice
+/// can race or fault. Shard files satisfy the required invariant by
+/// construction: they are atomic-renamed into place once at write
+/// time and never mutated afterward.
+fn mmap_readonly(path: &Path) -> Result<Mmap> {
+    let file = fs::File::open(path).with_context(|| format!("open {} for mmap", path.display()))?;
+    #[allow(unsafe_code)]
+    // SAFETY: see function-level doc.
+    let mmap = unsafe { Mmap::map(&file) }.with_context(|| format!("mmap {}", path.display()))?;
+    Ok(mmap)
 }
 
 /// A shard backed by files on local disk.
 ///
-/// `metrics.arrow` is read into Arrow's heap buffers at open time; the
-/// hot-path `&[i64]` slice returned by [`Shard::forward_column`] is a
-/// borrow into those buffers. True mmap-backed zero-copy reads are a
-/// later optimisation; the trait signature does not foreclose it.
+/// `metrics.arrow` is read into Arrow's heap buffers at open time —
+/// a 1 GB shard means ~1 GB of resident heap per open. The hot-path
+/// `&[i64]` slice returned by [`Shard::forward_column`] is a borrow
+/// into those buffers. True mmap-backed zero-copy reads for forward
+/// columns are a later optimisation; the trait signature does not
+/// foreclose it.
+///
+/// Inverted-index files (FST + postings) are already mmap'd.
 pub struct DiskShard {
     metadata: Metadata,
     batch: RecordBatch,
+    indexes: HashMap<String, InvertedIndex>,
 }
 
 impl DiskShard {
-    /// `metrics.arrow` is read into Arrow's heap buffers in full here.
-    /// True mmap-backed zero-copy is a later optimisation; until then, a
-    /// 1 GB shard means ~1 GB of resident heap per open.
     pub fn open(dir: &Path) -> Result<Self> {
         let metadata_path = dir.join(METADATA_FILE);
         let metrics_path = dir.join(METRICS_FILE);
@@ -164,7 +281,13 @@ impl DiskShard {
             );
         }
 
-        Ok(Self { metadata, batch })
+        let indexes = load_indexes(dir, &metadata)?;
+
+        Ok(Self {
+            metadata,
+            batch,
+            indexes,
+        })
     }
 }
 
@@ -179,6 +302,57 @@ impl Shard for DiskShard {
         let int64 = array.as_any().downcast_ref::<Int64Array>()?;
         Some(int64.values())
     }
+
+    fn inverted_index(&self, name: &str) -> Option<&InvertedIndex> {
+        self.indexes.get(name)
+    }
+}
+
+fn load_indexes(dir: &Path, metadata: &Metadata) -> Result<HashMap<String, InvertedIndex>> {
+    let mut indexes = HashMap::new();
+    for field in &metadata.fields {
+        if field.kind != FieldKind::String {
+            continue;
+        }
+        let fst_path = posting_path(dir, &field.name, FST_EXT);
+        let posting_path = posting_path(dir, &field.name, POSTING_EXT);
+
+        let fst_mmap = mmap_readonly(&fst_path)?;
+        let postings = mmap_readonly(&posting_path)?;
+        let fst =
+            fst::Map::new(fst_mmap).with_context(|| format!("parse FST {}", fst_path.display()))?;
+
+        indexes.insert(field.name.clone(), InvertedIndex { fst, postings });
+    }
+    Ok(indexes)
+}
+
+fn posting_path(dir: &Path, field: &str, ext: &str) -> PathBuf {
+    dir.join(POSTINGS_DIR).join(format!("{field}.{ext}"))
+}
+
+/// Sibling temp path used by [`write_atomic`]: same directory as
+/// `path`, filename prefixed with `.` and suffixed with `.tmp`.
+fn tmp_sibling(path: &Path) -> PathBuf {
+    let parent = path.parent().expect("shard files always have a parent dir");
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("shard files have UTF-8 names");
+    parent.join(format!(".{name}.tmp"))
+}
+
+/// Write to a sibling `.tmp` file then atomically rename it into
+/// place. A crashed writer leaves the `.tmp` behind but never a
+/// half-written final file.
+fn write_atomic<F>(final_path: &Path, write_fn: F) -> Result<()>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let tmp = tmp_sibling(final_path);
+    write_fn(&tmp)?;
+    fs::rename(&tmp, final_path).with_context(|| format!("rename {} into place", tmp.display()))?;
+    Ok(())
 }
 
 fn validate_schema_matches(
@@ -186,16 +360,22 @@ fn validate_schema_matches(
     batch: &RecordBatch,
     metrics_path: &Path,
 ) -> Result<()> {
+    let metric_fields: Vec<&FieldSchema> = metadata
+        .fields
+        .iter()
+        .filter(|f| f.kind == FieldKind::Metric)
+        .collect();
+
     let schema = batch.schema_ref();
-    if schema.fields().len() != metadata.fields.len() {
+    if schema.fields().len() != metric_fields.len() {
         bail!(
-            "{}: schema field count {} does not match metadata {}",
+            "{}: schema metric-field count {} does not match metadata {}",
             metrics_path.display(),
             schema.fields().len(),
-            metadata.fields.len(),
+            metric_fields.len(),
         );
     }
-    for (decl, batch_field) in metadata.fields.iter().zip(schema.fields()) {
+    for (decl, batch_field) in metric_fields.iter().zip(schema.fields()) {
         if decl.name.as_str() != batch_field.name().as_str() {
             bail!(
                 "{}: schema field name mismatch: metadata says {:?}, batch says {:?}",
@@ -204,17 +384,13 @@ fn validate_schema_matches(
                 batch_field.name(),
             );
         }
-        match decl.kind {
-            FieldKind::Metric => {
-                if batch_field.data_type() != &DataType::Int64 {
-                    bail!(
-                        "{}: metric field {:?} must be Int64, got {:?}",
-                        metrics_path.display(),
-                        decl.name,
-                        batch_field.data_type(),
-                    );
-                }
-            }
+        if batch_field.data_type() != &DataType::Int64 {
+            bail!(
+                "{}: metric field {:?} must be Int64, got {:?}",
+                metrics_path.display(),
+                decl.name,
+                batch_field.data_type(),
+            );
         }
     }
     Ok(())
@@ -222,14 +398,15 @@ fn validate_schema_matches(
 
 /// Build a shard directory on disk.
 ///
-/// All columns must have the same length. `finalize` writes
-/// `metrics.arrow` and `metadata.json` to temp files and atomically
-/// renames them into place so a crashed run leaves no partially-written
-/// shard visible to readers.
+/// All metric columns must have the same length. `finalize` writes
+/// every file to a `.tmp` sibling and atomically renames it into
+/// place, so a crashed run leaves no partially-written shard visible
+/// to readers.
 pub struct DiskShardWriter {
     dir: PathBuf,
     time_range: (i64, i64),
     columns: Vec<(String, Vec<i64>)>,
+    string_fields: Vec<(String, BTreeMap<String, RoaringBitmap>)>,
     num_docs: Option<u64>,
 }
 
@@ -240,13 +417,14 @@ impl DiskShardWriter {
             dir: dir.to_path_buf(),
             time_range,
             columns: Vec::new(),
+            string_fields: Vec::new(),
             num_docs: None,
         })
     }
 
-    /// Add a metric (`Int64`) column. All columns added to one writer
-    /// must have the same length; the first call fixes the row count
-    /// and subsequent mismatches return an error.
+    /// Add a metric (`Int64`) column. All metric columns added to one
+    /// writer must have the same length; the first call fixes the row
+    /// count and subsequent mismatches return an error.
     ///
     /// `values` is owned so [`Int64Array::from`] can take it without a
     /// copy on `finalize`.
@@ -259,37 +437,98 @@ impl DiskShardWriter {
             }
             Some(_) => {}
         }
-        if self.columns.iter().any(|(n, _)| n == name) {
-            bail!("column {name:?} already added");
-        }
+        self.ensure_unused_name(name)?;
         self.columns.push((name.to_string(), values));
         Ok(())
     }
 
-    pub fn finalize(self) -> Result<()> {
-        let num_docs = self.num_docs.unwrap_or(0);
+    /// Add a string field's inverted index. `postings` maps each term
+    /// to its doc-ID bitmap; the `BTreeMap` ensures lex-sorted
+    /// iteration, which the FST builder requires.
+    ///
+    /// `postings` must contain at least one term — an empty index
+    /// would produce a zero-byte postings file that fails to mmap on
+    /// read. Callers should simply omit the field instead.
+    ///
+    /// Per-term bitmaps are sparse; callers may include only docs that
+    /// have a term. Doc IDs are validated against `num_docs` at
+    /// [`finalize`].
+    pub fn add_string_field(
+        &mut self,
+        name: &str,
+        postings: BTreeMap<String, RoaringBitmap>,
+    ) -> Result<()> {
+        if postings.is_empty() {
+            bail!("string field {name:?}: postings map is empty; omit the field instead");
+        }
+        self.ensure_unused_name(name)?;
+        self.string_fields.push((name.to_string(), postings));
+        Ok(())
+    }
 
+    fn ensure_unused_name(&self, name: &str) -> Result<()> {
+        if self.columns.iter().any(|(n, _)| n == name)
+            || self.string_fields.iter().any(|(n, _)| n == name)
+        {
+            bail!("field {name:?} already added");
+        }
+        Ok(())
+    }
+
+    pub fn finalize(self) -> Result<()> {
+        // num_docs is the doc-ID universe size. Metric columns fix it
+        // explicitly via their row count; string fields are sparse over
+        // that universe. When no metric column declares it, derive
+        // num_docs from the highest doc ID any string bitmap touches.
+        let max_string_doc = self
+            .string_fields
+            .iter()
+            .flat_map(|(_, postings)| postings.values())
+            .filter_map(RoaringBitmap::max)
+            .max();
+        let num_docs = match (self.num_docs, max_string_doc) {
+            (Some(declared), Some(max)) if u64::from(max) >= declared => {
+                bail!(
+                    "string-field bitmap references doc ID {max} but num_docs is {declared}; \
+                     bitmap doc IDs must be < num_docs"
+                );
+            }
+            (Some(declared), _) => declared,
+            (None, Some(max)) => u64::from(max) + 1,
+            (None, None) => 0,
+        };
+
+        // metadata.fields lists metric fields before string fields,
+        // regardless of add_* call order — readers that rely on the
+        // metric-prefix in validate_schema_matches depend on this.
+        let mut fields: Vec<FieldSchema> =
+            Vec::with_capacity(self.columns.len() + self.string_fields.len());
+        for (name, _) in &self.columns {
+            fields.push(FieldSchema {
+                name: name.clone(),
+                kind: FieldKind::Metric,
+            });
+        }
+        for (name, _) in &self.string_fields {
+            fields.push(FieldSchema {
+                name: name.clone(),
+                kind: FieldKind::String,
+            });
+        }
         let metadata = Metadata {
             format_version: FORMAT_VERSION,
             num_docs,
             time_range_start: self.time_range.0,
             time_range_end: self.time_range.1,
-            fields: self
-                .columns
-                .iter()
-                .map(|(name, _)| FieldSchema {
-                    name: name.clone(),
-                    kind: FieldKind::Metric,
-                })
-                .collect(),
+            fields,
         };
 
-        let fields: Vec<Field> = self
+        let arrow_fields: Vec<Field> = self
             .columns
             .iter()
             .map(|(name, _)| Field::new(name, DataType::Int64, false))
             .collect();
-        let schema = Arc::new(Schema::new(fields));
+        let schema = Arc::new(Schema::new(arrow_fields));
 
         let arrays: Vec<ArrayRef> = self
             .columns
@@ -297,38 +536,95 @@ impl DiskShardWriter {
             .map(|(_, values)| Arc::new(Int64Array::from(values)) as ArrayRef)
             .collect();
 
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), arrays).context("build record batch")?;
+        // Required when there are no metric columns (string-only
+        // shards): RecordBatch can't infer row count from zero arrays.
+        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(
+            usize::try_from(num_docs).expect("num_docs fits in usize"),
+        ));
+        let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &options)
+            .context("build record batch")?;
 
-        let metrics_tmp = self.dir.join(METRICS_TMP);
-        let metadata_tmp = self.dir.join(METADATA_TMP);
-
-        {
-            let file = fs::File::create(&metrics_tmp)
-                .with_context(|| format!("create {}", metrics_tmp.display()))?;
+        // Ordering: metrics.arrow and all postings files are renamed
+        // into place before metadata.json, so a reader that sees
+        // metadata.json is guaranteed to find every file it claims.
+        write_atomic(&self.dir.join(METRICS_FILE), |tmp| {
+            let file =
+                fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
             let mut writer = FileWriter::try_new(file, &schema)
-                .with_context(|| format!("init Arrow IPC writer for {}", metrics_tmp.display()))?;
+                .with_context(|| format!("init Arrow IPC writer for {}", tmp.display()))?;
             writer
                 .write(&batch)
-                .with_context(|| format!("write record batch to {}", metrics_tmp.display()))?;
+                .with_context(|| format!("write record batch to {}", tmp.display()))?;
             writer
                 .finish()
-                .with_context(|| format!("finalise {}", metrics_tmp.display()))?;
+                .with_context(|| format!("finalise {}", tmp.display()))?;
+            Ok(())
+        })?;
+
+        if !self.string_fields.is_empty() {
+            let postings_dir = self.dir.join(POSTINGS_DIR);
+            fs::create_dir_all(&postings_dir)
+                .with_context(|| format!("create {}", postings_dir.display()))?;
+            for (name, postings) in &self.string_fields {
+                write_string_field(&self.dir, name, postings)?;
+            }
         }
 
         let metadata_json = serde_json::to_vec_pretty(&metadata).context("serialise metadata")?;
-        fs::write(&metadata_tmp, &metadata_json)
-            .with_context(|| format!("write {}", metadata_tmp.display()))?;
-
-        // Rename metrics first so a reader that sees metadata.json is
-        // guaranteed to also see metrics.arrow.
-        fs::rename(&metrics_tmp, self.dir.join(METRICS_FILE))
-            .with_context(|| format!("rename {} into place", metrics_tmp.display()))?;
-        fs::rename(&metadata_tmp, self.dir.join(METADATA_FILE))
-            .with_context(|| format!("rename {} into place", metadata_tmp.display()))?;
+        write_atomic(&self.dir.join(METADATA_FILE), |tmp| {
+            fs::write(tmp, &metadata_json).with_context(|| format!("write {}", tmp.display()))
+        })?;
 
         Ok(())
     }
+}
+
+/// Write `<field>.posting` (concatenated bitmaps) and `<field>.fst`
+/// (term → byte offset into postings) for one string field. Posting
+/// is renamed in first so a reader seeing the `.fst` is guaranteed
+/// the offsets resolve.
+fn write_string_field(
+    dir: &Path,
+    name: &str,
+    postings: &BTreeMap<String, RoaringBitmap>,
+) -> Result<()> {
+    let mut offsets: Vec<(String, u64)> = Vec::with_capacity(postings.len());
+    write_atomic(&posting_path(dir, name, POSTING_EXT), |tmp| {
+        let file = fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut writer = io::BufWriter::new(file);
+        let mut cursor: u64 = 0;
+        for (term, bitmap) in postings {
+            offsets.push((term.clone(), cursor));
+            bitmap
+                .serialize_into(&mut writer)
+                .with_context(|| format!("serialise bitmap for term {term:?}"))?;
+            cursor += bitmap.serialized_size() as u64;
+        }
+        writer
+            .flush()
+            .with_context(|| format!("flush {}", tmp.display()))?;
+        Ok(())
+    })?;
+
+    write_atomic(&posting_path(dir, name, FST_EXT), |tmp| {
+        let file = fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
+        let mut builder = fst::MapBuilder::new(io::BufWriter::new(file))
+            .with_context(|| format!("init FST builder for {}", tmp.display()))?;
+        for (term, offset) in &offsets {
+            builder
+                .insert(term.as_bytes(), *offset)
+                .with_context(|| format!("insert term {term:?} into FST"))?;
+        }
+        // into_inner finalises the FST (writes the footer); the second
+        // call unwraps the BufWriter to flush it to disk.
+        builder
+            .into_inner()
+            .with_context(|| format!("finalise FST {}", tmp.display()))?
+            .into_inner()
+            .with_context(|| format!("flush FST {}", tmp.display()))?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Open the shard at `path` and write a human-readable summary
@@ -356,15 +652,21 @@ pub fn inspect(path: &Path, out: &mut dyn io::Write) -> Result<()> {
     writeln!(out, "                 ({start_iso} .. {end_iso})")?;
     writeln!(out, "schema:")?;
     for field in &metadata.fields {
-        let (kind, dtype) = match field.kind {
-            FieldKind::Metric => ("metric", "int64"),
+        let (kind_label, detail) = match field.kind {
+            FieldKind::Metric => ("metric", "int64".to_string()),
+            FieldKind::String => {
+                let idx = shard
+                    .inverted_index(&field.name)
+                    .expect("string field present in metadata but not loaded");
+                ("string", format!("index ({} terms)", idx.num_terms()))
+            }
         };
         writeln!(
             out,
             "  {:<width$}  {}  {}",
             field.name,
-            kind,
-            dtype,
+            kind_label,
+            detail,
             width = widest_name
         )?;
     }
@@ -378,173 +680,4 @@ fn format_timestamp(secs: i64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn write_shard(dir: &Path, time_range: (i64, i64), columns: Vec<(&str, Vec<i64>)>) {
-        let mut w = DiskShardWriter::new(dir, time_range).expect("new writer");
-        for (name, values) in columns {
-            w.add_metric(name, values).expect("add_metric");
-        }
-        w.finalize().expect("finalize");
-    }
-
-    #[test]
-    fn metadata_roundtrips_through_serde_json() {
-        let m = Metadata {
-            format_version: FORMAT_VERSION,
-            num_docs: 100,
-            time_range_start: 1_700_000_000,
-            time_range_end: 1_700_003_600,
-            fields: vec![
-                FieldSchema {
-                    name: "a".into(),
-                    kind: FieldKind::Metric,
-                },
-                FieldSchema {
-                    name: "b".into(),
-                    kind: FieldKind::Metric,
-                },
-            ],
-        };
-        let bytes = serde_json::to_vec(&m).unwrap();
-        let back: Metadata = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(m, back);
-    }
-
-    #[test]
-    fn disk_shard_roundtrip_minimal() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let values: Vec<i64> = (0..100).collect();
-        write_shard(
-            tmp.path(),
-            (1_700_000_000, 1_700_003_600),
-            vec![("x", values.clone())],
-        );
-
-        let shard = DiskShard::open(tmp.path()).expect("open");
-        assert_eq!(shard.num_docs(), 100);
-        assert_eq!(shard.time_range(), (1_700_000_000, 1_700_003_600));
-        assert_eq!(shard.forward_column("x").unwrap(), values.as_slice());
-    }
-
-    #[test]
-    fn disk_shard_roundtrip_multi_column() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let ascending: Vec<i64> = (0..50).collect();
-        let descending: Vec<i64> = (0..50).rev().collect();
-        let mixed: Vec<i64> = (0..50).map(|i| if i % 2 == 0 { i } else { -i }).collect();
-
-        write_shard(
-            tmp.path(),
-            (1, 2),
-            vec![
-                ("asc", ascending.clone()),
-                ("desc", descending.clone()),
-                ("mixed", mixed.clone()),
-            ],
-        );
-
-        let shard = DiskShard::open(tmp.path()).expect("open");
-        assert_eq!(shard.num_docs(), 50);
-        assert_eq!(shard.forward_column("asc").unwrap(), ascending.as_slice());
-        assert_eq!(shard.forward_column("desc").unwrap(), descending.as_slice());
-        assert_eq!(shard.forward_column("mixed").unwrap(), mixed.as_slice());
-    }
-
-    #[test]
-    fn disk_shard_rejects_missing_metadata() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        let err = DiskShard::open(tmp.path())
-            .err()
-            .expect("expected error opening empty dir");
-        let msg = err.to_string();
-        assert!(msg.contains("metadata.json"), "got: {msg}");
-    }
-
-    #[test]
-    fn disk_shard_rejects_schema_mismatch() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        write_shard(tmp.path(), (0, 0), vec![("real", vec![1, 2, 3])]);
-
-        // Replace metadata.json with a doctored copy that claims a different
-        // field name. The Arrow IPC file is unchanged, so the schema check
-        // should reject the inconsistency.
-        let metadata_path = tmp.path().join(METADATA_FILE);
-        let mut metadata: Metadata =
-            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
-        metadata.fields[0].name = "ghost".into();
-        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-
-        let err = DiskShard::open(tmp.path())
-            .err()
-            .expect("expected schema-mismatch error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("field name mismatch") || msg.contains("ghost"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn disk_shard_rejects_degenerate_time_range() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        write_shard(tmp.path(), (0, 0), vec![("x", vec![1, 2, 3])]);
-
-        // Doctor metadata.json to invert the time range.
-        let metadata_path = tmp.path().join(METADATA_FILE);
-        let mut metadata: Metadata =
-            serde_json::from_slice(&fs::read(&metadata_path).unwrap()).unwrap();
-        metadata.time_range_start = 200;
-        metadata.time_range_end = 100;
-        fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-
-        let err = DiskShard::open(tmp.path())
-            .err()
-            .expect("expected degenerate-range error");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("validate") || msg.to_lowercase().contains("time range"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn disk_shard_unknown_column_is_none() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        write_shard(tmp.path(), (0, 0), vec![("x", vec![1, 2, 3])]);
-
-        let shard = DiskShard::open(tmp.path()).expect("open");
-        assert!(shard.forward_column("nope").is_none());
-    }
-
-    #[test]
-    fn inspect_emits_path_metadata_and_schema() {
-        let tmp = tempfile::tempdir().expect("tmpdir");
-        // Pick a recognisable time so the ISO line is easy to assert on.
-        write_shard(
-            tmp.path(),
-            (1_700_000_000, 1_700_003_600),
-            vec![
-                ("alpha", vec![1, 2, 3]),
-                ("beta", vec![4, 5, 6]),
-                ("gamma_long_name", vec![7, 8, 9]),
-            ],
-        );
-
-        let mut buf = Vec::new();
-        inspect(tmp.path(), &mut buf).expect("inspect");
-        let out = String::from_utf8(buf).expect("utf-8");
-
-        assert!(out.contains(&tmp.path().display().to_string()), "{out}");
-        assert!(out.contains("format version:  1"), "{out}");
-        assert!(out.contains("num docs:        3"), "{out}");
-        assert!(out.contains("1700000000 .. 1700003600"), "{out}");
-        assert!(out.contains("2023-11-14T22:13:20"), "{out}");
-        assert!(out.contains("alpha"), "{out}");
-        assert!(out.contains("beta"), "{out}");
-        assert!(out.contains("gamma_long_name"), "{out}");
-        assert!(out.contains("metric"), "{out}");
-        assert!(out.contains("int64"), "{out}");
-    }
-}
+mod tests;

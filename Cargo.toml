@@ -58,6 +58,11 @@ async-trait = "0.1"
 # Columnar storage format (shard forward columns)
 arrow = { version = "56", default-features = false, features = ["ipc"] }
 
+# Inverted index (shard postings)
+roaring = "0.10"
+fst = "0.4"
+memmap2 = "0.9"
+
 # Time / date formatting (Unix epoch → ISO 8601 for inspect output, etc.)
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 

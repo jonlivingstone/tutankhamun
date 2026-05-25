@@ -118,9 +118,9 @@ fn parent_path(path: &Path) -> Path {
     parent
 }
 
-/// Holds the shards a daemon owns. v0 is a one-shot scan: call
-/// [`refresh`](Self::refresh) once at startup to populate the list, then
-/// read via [`all_shards`](Self::all_shards) or
+/// Holds the shards a daemon owns. Call
+/// [`refresh`](Self::refresh) to populate the list, then read via
+/// [`all_shards`](Self::all_shards) or
 /// [`shards_in_time_range`](Self::shards_in_time_range).
 pub struct ShardManager {
     source: Arc<dyn ShardSource>,
