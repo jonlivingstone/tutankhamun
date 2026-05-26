@@ -169,8 +169,8 @@ directly.
 
 ## Ingest
 
-- [ ] Batch ingest pipeline — Rust port of TSV converter — §3.3 v1
-- [ ] Output Tutankhamun-format shards (Arrow IPC + Roaring +
+- [x] Batch ingest pipeline — Rust port of TSV converter — §3.3 v1
+- [x] Output Tutankhamun-format shards (Arrow IPC + Roaring +
       FST) — §3.3 v1
 - [ ] Upload to object storage via `object_store` — §3.3 v1
 - [ ] Daemon writable local state directory (configured via

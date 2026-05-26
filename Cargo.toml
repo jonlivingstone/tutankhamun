@@ -66,6 +66,9 @@ memmap2 = "0.9"
 # Time / date formatting (Unix epoch → ISO 8601 for inspect output, etc.)
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
+# CSV ingest
+csv = "1"
+
 # Dev-only
 tempfile = "3"
 

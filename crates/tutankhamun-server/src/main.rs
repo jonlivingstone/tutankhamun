@@ -12,6 +12,7 @@ use clap::{Args, Parser, Subcommand};
 use tracing::{error, info, warn};
 
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
+use tutankhamun_server::ingest::{self, IngestOptions};
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard;
@@ -49,6 +50,29 @@ enum Command {
         /// shard).
         #[arg(long)]
         filter: Option<String>,
+    },
+    /// Build a shard from a CSV/TSV input file.
+    Ingest {
+        /// Path to the CSV/TSV input file (must have a header row).
+        input: PathBuf,
+        /// Directory to write the finalised shard into.
+        #[arg(long)]
+        output: PathBuf,
+        /// Header name of the time column. Values may be unix epoch
+        /// seconds, RFC 3339, or `YYYY-MM-DD HH:MM:SS` (treated as
+        /// UTC). Bare integers always parse as epoch — preprocess
+        /// `YYYYMMDD` columns to one of the above formats.
+        #[arg(long)]
+        time: String,
+        /// Header name of an int64 metric column. Repeatable.
+        #[arg(long = "metric")]
+        metrics: Vec<String>,
+        /// Header name of a string-field column. Repeatable.
+        #[arg(long = "string")]
+        strings: Vec<String>,
+        /// Field delimiter (default ','). Use `$'\t'` for TSV.
+        #[arg(long, default_value = ",")]
+        delimiter: char,
     },
 }
 
@@ -130,7 +154,38 @@ fn main() -> anyhow::Result<()> {
             metric,
             filter,
         } => run_query(dir, metric, filter.as_deref()),
+        Command::Ingest {
+            input,
+            output,
+            time,
+            metrics,
+            strings,
+            delimiter,
+        } => run_ingest(input, output, time, metrics, strings, *delimiter),
     }
+}
+
+fn run_ingest(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    time: &str,
+    metrics: &[String],
+    strings: &[String],
+    delimiter: char,
+) -> anyhow::Result<()> {
+    if !delimiter.is_ascii() {
+        anyhow::bail!("delimiter must be a single ASCII byte (got {delimiter:?})");
+    }
+    let delimiter_byte = delimiter as u8;
+    let opts = IngestOptions {
+        time: time.to_string(),
+        metrics: metrics.to_vec(),
+        strings: strings.to_vec(),
+        delimiter: delimiter_byte,
+    };
+    let n = ingest::ingest_csv(input, output, &opts)?;
+    println!("wrote {n} docs to {}", output.display());
+    Ok(())
 }
 
 fn run_query(dir: &std::path::Path, metric: &str, filter: Option<&str>) -> anyhow::Result<()> {
