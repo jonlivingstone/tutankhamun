@@ -37,16 +37,17 @@ enum Command {
     Storage(StorageArgs),
     /// Shard inspection / maintenance.
     Shard(ShardArgs),
-    /// Sum a metric column across every shard discovered under a
-    /// local directory, optionally restricted by a string-field term
-    /// and/or a time-range window.
+    /// Sum one or more metric columns across every shard discovered
+    /// under a local directory, optionally restricted by a
+    /// string-field term and/or a time-range window.
     Query {
         /// Local directory containing one or more shards (anywhere
         /// underneath). Remote storage backends are not yet supported.
         dir: PathBuf,
-        /// Metric column to sum.
-        #[arg(long)]
-        metric: String,
+        /// Metric column to sum. Repeatable — one sum per metric is
+        /// returned in declaration order. At least one required.
+        #[arg(long = "metric", required = true)]
+        metrics: Vec<String>,
         /// Optional `<field>=<term>` restriction (applied to every
         /// shard).
         #[arg(long)]
@@ -148,14 +149,16 @@ enum ShardCommand {
         )]
         url: String,
     },
-    /// Sum a metric column over the docs in a shard, optionally
-    /// restricted to those matching a single string-field term.
+    /// Sum one or more metric columns over the docs in a shard,
+    /// optionally restricted to those matching a single string-field
+    /// term.
     Query {
         /// Path to the shard directory.
         path: PathBuf,
-        /// Metric column to sum.
-        #[arg(long)]
-        metric: String,
+        /// Metric column to sum. Repeatable — one sum per metric is
+        /// returned in declaration order. At least one required.
+        #[arg(long = "metric", required = true)]
+        metrics: Vec<String>,
         /// Optional `<field>=<term>` restriction.
         #[arg(long)]
         filter: Option<String>,
@@ -192,13 +195,13 @@ fn main() -> anyhow::Result<()> {
         Command::Shard(args) => run_shard(args),
         Command::Query {
             dir,
-            metric,
+            metrics,
             filter,
             from,
             to,
         } => run_query(
             dir,
-            metric,
+            metrics,
             filter.as_deref(),
             from.as_deref(),
             to.as_deref(),
@@ -242,11 +245,13 @@ fn run_ingest(
 
 fn run_query(
     dir: &std::path::Path,
-    metric: &str,
+    metrics: &[String],
     filter: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
 ) -> anyhow::Result<()> {
+    // clap's `required = true` on `metrics` guarantees non-empty.
+    let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
     let parsed = filter.map(parse_filter).transpose()?;
     let time_range = parse_time_range(from, to)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -255,7 +260,11 @@ fn run_query(
     let stdout = io::stdout();
     let mut out = stdout.lock();
     runtime.block_on(shard_source::query_dataset(
-        dir, parsed, metric, time_range, &mut out,
+        dir,
+        parsed,
+        &metric_refs,
+        time_range,
+        &mut out,
     ))
 }
 
@@ -403,13 +412,15 @@ fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
         }
         ShardCommand::Query {
             path,
-            metric,
+            metrics,
             filter,
         } => {
+            // clap's `required = true` on `metrics` guarantees non-empty.
+            let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
             let parsed = filter.as_deref().map(parse_filter).transpose()?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            shard::query(path, parsed, metric, &mut out)
+            shard::query(path, parsed, &metric_refs, &mut out)
         }
     }
 }

@@ -680,50 +680,94 @@ pub fn format_timestamp(secs: i64) -> String {
         .map_or_else(|| "(out of range)".to_string(), |t| t.to_rfc3339())
 }
 
-/// Per-shard result of [`query_shard`]. Aggregatable across shards by
-/// summing each field — `num_docs` and `matched` add as `u64`, `sum`
-/// as `i128`.
-#[derive(Debug, Clone, Copy, Default)]
+/// Per-shard result of [`query_shard`]. Aggregatable across shards:
+/// `num_docs` and `matched` add as `u64`; `sums` adds element-wise
+/// as `i128` (the slot order matches the `metrics` slice passed in).
+#[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub num_docs: u64,
     pub matched: u64,
-    pub sum: i128,
+    pub sums: Vec<i128>,
+}
+
+impl QueryResult {
+    /// Zero-initialised accumulator with `num_metrics` sum slots —
+    /// the cross-shard reducer's starting point. Centralises the
+    /// `sums.len() == metrics.len()` invariant.
+    #[must_use]
+    pub fn zeros(num_metrics: usize) -> Self {
+        Self {
+            num_docs: 0,
+            matched: 0,
+            sums: vec![0; num_metrics],
+        }
+    }
 }
 
 /// Open the shard at `path`, optionally restrict to docs matching
-/// `filter = Some((field, term))`, and sum the named metric over the
-/// resulting doc set.
+/// `filter = Some((field, term))`, and sum each named metric over the
+/// resulting doc set. Returns one sum per input metric in
+/// declaration order.
 ///
-/// Accumulates into `i128` so the result is overflow-free for any
-/// realistic shard.
-pub fn query_shard(path: &Path, filter: Option<(&str, &str)>, metric: &str) -> Result<QueryResult> {
+/// Accumulates into `i128` so each per-metric sum is overflow-free
+/// for any realistic shard.
+pub fn query_shard(
+    path: &Path,
+    filter: Option<(&str, &str)>,
+    metrics: &[&str],
+) -> Result<QueryResult> {
     let shard = DiskShard::open(path)?;
     let metadata = shard.metadata();
 
-    require_field(metadata, metric, FieldKind::Metric)?;
-    let col = shard
-        .forward_column(metric)
-        .expect("metric field kind validated above");
+    // One pass that validates kind, rejects duplicate names, and
+    // collects the column slices. Duplicates would produce confusing
+    // repeated output lines (same column summed twice); the caller
+    // almost certainly meant something else.
+    let mut seen = std::collections::HashSet::new();
+    let cols: Vec<&[i64]> = metrics
+        .iter()
+        .map(|m| {
+            require_field(metadata, m, FieldKind::Metric)?;
+            if !seen.insert(*m) {
+                bail!("metric {m:?} declared more than once");
+            }
+            Ok(shard
+                .forward_column(m)
+                .expect("metric field kind validated above"))
+        })
+        .collect::<Result<_>>()?;
 
-    let (matched, sum) = if let Some((field, term)) = filter {
+    let (matched, sums) = if let Some((field, term)) = filter {
         require_field(metadata, field, FieldKind::String)?;
         let idx = shard
             .inverted_index(field)
             .expect("string field kind validated above");
-        idx.lookup(term).map_or((0, 0), |bm| {
-            let m = bm.len();
-            let s: i128 = bm.iter().map(|doc| i128::from(col[doc as usize])).sum();
-            (m, s)
-        })
+        idx.lookup(term).map_or_else(
+            || (0u64, vec![0i128; cols.len()]),
+            |bm| {
+                let m = bm.len();
+                // Per-column iteration: each metric scans the bitmap
+                // once over its own slice — cache-warm and trivially
+                // parallelisable later if profiling demands it.
+                let s: Vec<i128> = cols
+                    .iter()
+                    .map(|col| bm.iter().map(|d| i128::from(col[d as usize])).sum())
+                    .collect();
+                (m, s)
+            },
+        )
     } else {
-        let sum: i128 = col.iter().copied().map(i128::from).sum();
-        (metadata.num_docs, sum)
+        let sums: Vec<i128> = cols
+            .iter()
+            .map(|col| col.iter().copied().map(i128::from).sum())
+            .collect();
+        (metadata.num_docs, sums)
     };
 
     Ok(QueryResult {
         num_docs: metadata.num_docs,
         matched,
-        sum,
+        sums,
     })
 }
 
@@ -731,23 +775,24 @@ pub fn query_shard(path: &Path, filter: Option<(&str, &str)>, metric: &str) -> R
 pub fn query(
     path: &Path,
     filter: Option<(&str, &str)>,
-    metric: &str,
+    metrics: &[&str],
     out: &mut dyn io::Write,
 ) -> Result<()> {
-    let result = query_shard(path, filter, metric)?;
+    let result = query_shard(path, filter, metrics)?;
     writeln!(out, "shard:    {}", path.display())?;
-    write_query_summary(out, filter, metric, &result)?;
+    write_query_summary(out, filter, metrics, &result)?;
     Ok(())
 }
 
-/// Emit the shared "filter / matched / metric sum" block used by both
-/// the single-shard ([`query`]) and dataset-wide (`shard_source::query_dataset`)
-/// CLI verbs. Callers are responsible for printing whatever header
-/// they want above it.
+/// Emit the shared "filter / matched / metric sums" block used by
+/// both the single-shard ([`query`]) and dataset-wide
+/// (`shard_source::query_dataset`) CLI verbs. Callers are responsible
+/// for printing whatever header they want above it. Per-metric lines
+/// are padded to the longest metric name for column alignment.
 pub fn write_query_summary(
     out: &mut dyn io::Write,
     filter: Option<(&str, &str)>,
-    metric: &str,
+    metrics: &[&str],
     result: &QueryResult,
 ) -> io::Result<()> {
     if let Some((field, term)) = filter {
@@ -760,7 +805,21 @@ pub fn write_query_summary(
     } else {
         writeln!(out, "matched:  all {} docs", result.num_docs)?;
     }
-    writeln!(out, "{metric}:   sum = {}", result.sum)?;
+    // Pad label to longest-metric + colon, then three literal spaces
+    // before "sum" — same gap as the previous single-metric output
+    // ("{metric}:   sum = N"), so existing single-metric output is
+    // unchanged and multi-metric output aligns into a column.
+    let widest = metrics.iter().map(|m| m.len()).max().unwrap_or(0);
+    for (i, m) in metrics.iter().enumerate() {
+        let label = format!("{m}:");
+        writeln!(
+            out,
+            "{:<width$}   sum = {}",
+            label,
+            result.sums[i],
+            width = widest + 1
+        )?;
+    }
     Ok(())
 }
 

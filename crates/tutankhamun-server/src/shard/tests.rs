@@ -355,19 +355,84 @@ fn write_query_fixture(dir: &Path) {
     w.finalize().expect("finalize");
 }
 
+fn write_multi_metric_fixture(dir: &Path) {
+    // 5 docs:
+    //   clicks      = [10, 20, 30, 40, 50]  (sum 150)
+    //   impressions = [100, 200, 300, 400, 500]  (sum 1500)
+    //   country     : us=[0, 2, 4], de=[1, 3]
+    let mut postings = BTreeMap::new();
+    postings.insert("de".to_string(), bitmap([1, 3]));
+    postings.insert("us".to_string(), bitmap([0, 2, 4]));
+    let mut w = DiskShardWriter::new(dir, (0, 0)).expect("new");
+    w.add_metric("clicks", vec![10, 20, 30, 40, 50])
+        .expect("add_metric clicks");
+    w.add_metric("impressions", vec![100, 200, 300, 400, 500])
+        .expect("add_metric impressions");
+    w.add_string_field("country", postings)
+        .expect("add_string_field");
+    w.finalize().expect("finalize");
+}
+
+#[test]
+fn query_shard_returns_one_sum_per_metric() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_multi_metric_fixture(tmp.path());
+
+    let r = query_shard(tmp.path(), None, &["clicks", "impressions"])
+        .expect("query_shard multi-metric");
+    assert_eq!(r.num_docs, 5);
+    assert_eq!(r.matched, 5);
+    assert_eq!(r.sums, vec![150, 1500]);
+
+    // Slot order follows input order — flipping the metrics flips the sums.
+    let r = query_shard(tmp.path(), None, &["impressions", "clicks"])
+        .expect("query_shard multi-metric reversed");
+    assert_eq!(r.sums, vec![1500, 150]);
+}
+
+#[test]
+fn query_shard_multi_metric_with_filter() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_multi_metric_fixture(tmp.path());
+
+    // us = docs 0, 2, 4: clicks 10+30+50=90, impressions 100+300+500=900.
+    let r = query_shard(
+        tmp.path(),
+        Some(("country", "us")),
+        &["clicks", "impressions"],
+    )
+    .expect("query_shard multi-metric filtered");
+    assert_eq!(r.matched, 3);
+    assert_eq!(r.sums, vec![90, 900]);
+}
+
+#[test]
+fn query_shard_rejects_duplicate_metrics() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_multi_metric_fixture(tmp.path());
+
+    let err = query_shard(tmp.path(), None, &["clicks", "clicks"])
+        .expect_err("expected duplicate-metric rejection");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clicks") && msg.contains("more than once"),
+        "{msg}"
+    );
+}
+
 #[test]
 fn query_sums_metric_filtered_by_term() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    query(tmp.path(), Some(("country", "us")), "clicks", &mut buf).expect("query us");
+    query(tmp.path(), Some(("country", "us")), &["clicks"], &mut buf).expect("query us");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  3 / 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 90"), "{out}");
 
     let mut buf = Vec::new();
-    query(tmp.path(), Some(("country", "de")), "clicks", &mut buf).expect("query de");
+    query(tmp.path(), Some(("country", "de")), &["clicks"], &mut buf).expect("query de");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  2 / 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 60"), "{out}");
@@ -379,7 +444,7 @@ fn query_no_filter_sums_all_docs() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    query(tmp.path(), None, "clicks", &mut buf).expect("query");
+    query(tmp.path(), None, &["clicks"], &mut buf).expect("query");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  all 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 150"), "{out}");
@@ -392,7 +457,7 @@ fn query_missing_filter_term_is_zero() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    query(tmp.path(), Some(("country", "fr")), "clicks", &mut buf).expect("query fr");
+    query(tmp.path(), Some(("country", "fr")), &["clicks"], &mut buf).expect("query fr");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  0 / 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 0"), "{out}");
@@ -404,7 +469,7 @@ fn query_rejects_unknown_metric() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), None, "no_such_metric", &mut buf)
+    let err = query(tmp.path(), None, &["no_such_metric"], &mut buf)
         .expect_err("expected unknown-metric error");
     let msg = err.to_string();
     assert!(msg.contains("no_such_metric"), "{msg}");
@@ -416,7 +481,8 @@ fn query_rejects_string_field_as_metric() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), None, "country", &mut buf).expect_err("expected wrong-kind error");
+    let err =
+        query(tmp.path(), None, &["country"], &mut buf).expect_err("expected wrong-kind error");
     let msg = err.to_string();
     assert!(
         msg.contains("country") && msg.to_lowercase().contains("not a metric"),
@@ -430,7 +496,7 @@ fn query_rejects_unknown_filter_field() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), Some(("cuontry", "us")), "clicks", &mut buf)
+    let err = query(tmp.path(), Some(("cuontry", "us")), &["clicks"], &mut buf)
         .expect_err("expected unknown-field error");
     let msg = err.to_string();
     assert!(msg.contains("cuontry"), "{msg}");
@@ -442,7 +508,7 @@ fn query_rejects_metric_field_as_filter() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), Some(("clicks", "10")), "clicks", &mut buf)
+    let err = query(tmp.path(), Some(("clicks", "10")), &["clicks"], &mut buf)
         .expect_err("expected wrong-kind error");
     let msg = err.to_string();
     assert!(

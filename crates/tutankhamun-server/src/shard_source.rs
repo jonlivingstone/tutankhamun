@@ -185,7 +185,7 @@ impl ShardManager {
 pub async fn query_dataset(
     root: &std::path::Path,
     filter: Option<(&str, &str)>,
-    metric: &str,
+    metrics: &[&str],
     time_range: Option<(i64, i64)>,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
@@ -236,18 +236,20 @@ pub async fn query_dataset(
         return Ok(());
     }
 
-    let mut total = crate::shard::QueryResult::default();
+    let mut total = crate::shard::QueryResult::zeros(metrics.len());
     for summary in &summaries {
         let shard_path = root.join(summary.location.as_ref());
-        let r = crate::shard::query_shard(&shard_path, filter, metric)
+        let r = crate::shard::query_shard(&shard_path, filter, metrics)
             .with_context(|| format!("query {}", shard_path.display()))?;
         total.num_docs += r.num_docs;
         total.matched += r.matched;
-        total.sum += r.sum;
+        for (t, s) in total.sums.iter_mut().zip(&r.sums) {
+            *t += s;
+        }
     }
 
     writeln!(out, "shards:   {} scanned", summaries.len())?;
-    crate::shard::write_query_summary(out, filter, metric, &total)?;
+    crate::shard::write_query_summary(out, filter, metrics, &total)?;
     Ok(())
 }
 
@@ -522,7 +524,7 @@ mod tests {
         query_dataset(
             tmp.path(),
             Some(("country", "us")),
-            "clicks",
+            &["clicks"],
             None,
             &mut buf,
         )
@@ -546,7 +548,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, "clicks", None, &mut buf)
+        query_dataset(tmp.path(), None, &["clicks"], None, &mut buf)
             .await
             .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
@@ -560,7 +562,7 @@ mod tests {
     async fn query_dataset_empty_dir_reports_no_shards() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, "clicks", None, &mut buf)
+        query_dataset(tmp.path(), None, &["clicks"], None, &mut buf)
             .await
             .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
@@ -574,7 +576,7 @@ mod tests {
         std::fs::write(&file_path, b"hello").expect("write");
 
         let mut buf = Vec::new();
-        let err = query_dataset(&file_path, None, "clicks", None, &mut buf)
+        let err = query_dataset(&file_path, None, &["clicks"], None, &mut buf)
             .await
             .expect_err("expected file-not-directory rejection");
         let msg = err.to_string();
@@ -609,7 +611,7 @@ mod tests {
         query_dataset(
             tmp.path(),
             None,
-            "clicks",
+            &["clicks"],
             Some((86_400, 200_000)),
             &mut buf,
         )
@@ -631,7 +633,7 @@ mod tests {
         query_dataset(
             tmp.path(),
             None,
-            "clicks",
+            &["clicks"],
             Some((3 * 86_400, i64::MAX)),
             &mut buf,
         )
@@ -651,7 +653,7 @@ mod tests {
         query_dataset(
             tmp.path(),
             None,
-            "clicks",
+            &["clicks"],
             Some((i64::MIN, 86_400 + 60)),
             &mut buf,
         )
@@ -671,7 +673,7 @@ mod tests {
         query_dataset(
             tmp.path(),
             None,
-            "clicks",
+            &["clicks"],
             Some((10 * 86_400, 11 * 86_400)),
             &mut buf,
         )
@@ -687,6 +689,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_dataset_aggregates_multi_metric_across_shards() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        // Two shards, each with two metrics.
+        for (sub, clicks, impressions) in [
+            ("a/shard-000", vec![10, 20, 30], vec![100, 200, 300]),
+            ("b/shard-001", vec![40, 50], vec![400, 500]),
+        ] {
+            let shard = tmp.path().join(sub);
+            let mut w = crate::shard::DiskShardWriter::new(&shard, (0, 0)).expect("new");
+            w.add_metric("clicks", clicks).expect("add clicks");
+            w.add_metric("impressions", impressions)
+                .expect("add impressions");
+            w.finalize().expect("finalize");
+        }
+
+        let mut buf = Vec::new();
+        query_dataset(tmp.path(), None, &["clicks", "impressions"], None, &mut buf)
+            .await
+            .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("shards:   2 scanned"), "{out}");
+        // 10+20+30+40+50 = 150
+        assert!(out.contains("clicks:        sum = 150"), "{out}");
+        // 100+200+300+400+500 = 1500
+        assert!(out.contains("impressions:   sum = 1500"), "{out}");
+    }
+
+    #[tokio::test]
     async fn query_dataset_rejects_inverted_range() {
         // from > to would silently match shards spanning both bounds
         // (not the empty set users expect from the closed interval),
@@ -698,7 +728,7 @@ mod tests {
         let err = query_dataset(
             tmp.path(),
             None,
-            "clicks",
+            &["clicks"],
             Some((200_000, 86_400)),
             &mut buf,
         )
@@ -715,7 +745,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         write_5_day_dataset(tmp.path());
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, "clicks", None, &mut buf)
+        query_dataset(tmp.path(), None, &["clicks"], None, &mut buf)
             .await
             .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
@@ -730,7 +760,7 @@ mod tests {
         write_query_shard(&tmp.path().join("ok/shard-000"), vec![1, 2, 3], &[0], &[]);
 
         let mut buf = Vec::new();
-        let err = query_dataset(tmp.path(), None, "no_such_metric", None, &mut buf)
+        let err = query_dataset(tmp.path(), None, &["no_such_metric"], None, &mut buf)
             .await
             .expect_err("expected error from missing metric in one of the shards");
         // `{:#}` renders the full anyhow chain (with_context wraps the
