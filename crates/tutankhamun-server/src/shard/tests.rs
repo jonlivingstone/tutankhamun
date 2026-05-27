@@ -484,8 +484,10 @@ fn query_rejects_string_field_as_metric() {
     let err =
         query(tmp.path(), None, &["country"], &mut buf).expect_err("expected wrong-kind error");
     let msg = err.to_string();
+    // The error names the offending field and the kinds that would
+    // have been acceptable for a metric (metric or int).
     assert!(
-        msg.contains("country") && msg.to_lowercase().contains("not a metric"),
+        msg.contains("country") && msg.contains("metric") && msg.contains("int"),
         "{msg}"
     );
 }
@@ -511,8 +513,10 @@ fn query_rejects_metric_field_as_filter() {
     let err = query(tmp.path(), Some(("clicks", "10")), &["clicks"], &mut buf)
         .expect_err("expected wrong-kind error");
     let msg = err.to_string();
+    // The error names the offending field and the kinds that would
+    // have been acceptable for a filter (string or int).
     assert!(
-        msg.contains("clicks") && msg.to_lowercase().contains("not a string"),
+        msg.contains("clicks") && msg.contains("string") && msg.contains("int"),
         "{msg}"
     );
 }
@@ -538,4 +542,195 @@ fn inspect_prints_string_field_term_count() {
     assert!(out.contains("country"), "{out}");
     assert!(out.contains("string"), "{out}");
     assert!(out.contains("index (3 terms)"), "{out}");
+}
+
+// ===== Int field tests =====
+
+#[test]
+fn int_key_encoding_round_trips() {
+    for v in [i64::MIN, -1_i64, 0_i64, 1_i64, i64::MAX, 12345, -67890] {
+        assert_eq!(decode_int_key(&encode_int_key(v)), v, "value {v}");
+    }
+}
+
+#[test]
+fn int_key_encoding_preserves_order() {
+    // Order-preserving: encode(a) < encode(b) iff a < b. Critical
+    // for FST range scans to give numeric semantics.
+    let pairs = [
+        (i64::MIN, -1),
+        (-100, -1),
+        (-1, 0),
+        (0, 1),
+        (1, 100),
+        (100, i64::MAX),
+    ];
+    for (a, b) in pairs {
+        assert!(encode_int_key(a) < encode_int_key(b), "{a} < {b}");
+    }
+}
+
+#[test]
+fn add_int_field_round_trip() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 1, 3])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    // Forward column: raw values in row order.
+    assert_eq!(shard.forward_column("vendor_id").unwrap(), &[1, 2, 1, 3]);
+    // Inverted index: 3 distinct terms (1, 2, 3); vendor 1 appears at docs 0 and 2.
+    let idx = shard
+        .inverted_index("vendor_id")
+        .expect("vendor_id has an index");
+    assert_eq!(idx.num_terms(), 3);
+    let v1 = idx.lookup_bytes(&encode_int_key(1)).expect("vendor 1");
+    assert_eq!(v1, bitmap([0, 2]));
+    let v2 = idx.lookup_bytes(&encode_int_key(2)).expect("vendor 2");
+    assert_eq!(v2, bitmap([1]));
+    let v3 = idx.lookup_bytes(&encode_int_key(3)).expect("vendor 3");
+    assert_eq!(v3, bitmap([3]));
+    assert!(idx.lookup_bytes(&encode_int_key(999)).is_none());
+}
+
+#[test]
+fn int_field_negative_values() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("delta", vec![-100, 0, 100, -100])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    assert_eq!(
+        shard.forward_column("delta").unwrap(),
+        &[-100, 0, 100, -100]
+    );
+    let idx = shard.inverted_index("delta").expect("delta index");
+    assert_eq!(
+        idx.lookup_bytes(&encode_int_key(-100)).unwrap(),
+        bitmap([0, 3])
+    );
+    assert_eq!(idx.lookup_bytes(&encode_int_key(0)).unwrap(), bitmap([1]));
+    assert_eq!(idx.lookup_bytes(&encode_int_key(100)).unwrap(), bitmap([2]));
+}
+
+#[test]
+fn int_field_i64_boundary_values() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![i64::MIN, i64::MAX, 0])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    assert_eq!(shard.forward_column("v").unwrap(), &[i64::MIN, i64::MAX, 0]);
+    let idx = shard.inverted_index("v").expect("v index");
+    assert_eq!(
+        idx.lookup_bytes(&encode_int_key(i64::MIN)).unwrap(),
+        bitmap([0])
+    );
+    assert_eq!(
+        idx.lookup_bytes(&encode_int_key(i64::MAX)).unwrap(),
+        bitmap([1])
+    );
+    assert_eq!(idx.lookup_bytes(&encode_int_key(0)).unwrap(), bitmap([2]));
+}
+
+#[test]
+fn int_field_range_is_numeric_order() {
+    // Values include 100, 5, -100, -5: lex sort on decimal strings
+    // would put "100" before "5"; numeric sort (via the
+    // order-preserving encoding) puts -100 < -5 < 5 < 100.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![100, 5, -100, -5])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    let idx = shard.inverted_index("v").expect("v index");
+    // Range [-50, 50] should match -5 and 5 only — not 100 (which
+    // would slip in under naive lex-on-decimal-string).
+    let lo = encode_int_key(-50);
+    let hi = encode_int_key(50);
+    let in_range: Vec<RoaringBitmap> = idx.range_bytes(&lo, &hi).map(|(_, bm)| bm).collect();
+    assert_eq!(in_range.len(), 2, "should match exactly -5 and 5");
+    let mut union = RoaringBitmap::new();
+    for bm in in_range {
+        union |= bm;
+    }
+    // Doc IDs for -5 and 5 are 3 and 1 respectively (per the input order).
+    assert_eq!(union, bitmap([1, 3]));
+}
+
+#[test]
+fn query_shard_accepts_int_as_metric() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 1, 3])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(tmp.path(), None, &["vendor_id"]).expect("query_shard");
+    assert_eq!(r.num_docs, 4);
+    assert_eq!(r.matched, 4);
+    assert_eq!(r.sums, vec![1 + 2 + 1 + 3]);
+}
+
+#[test]
+fn query_shard_int_field_used_as_both_filter_and_metric() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 1, 3])
+        .expect("add_int_field");
+    w.add_metric("fare", vec![100, 200, 300, 400])
+        .expect("add_metric");
+    w.finalize().expect("finalize");
+
+    // Filter on vendor_id=1 (matches docs 0 and 2), sum both
+    // vendor_id (1+1=2) and fare (100+300=400) for those docs.
+    let r = query_shard(tmp.path(), Some(("vendor_id", "1")), &["vendor_id", "fare"])
+        .expect("query_shard");
+    assert_eq!(r.matched, 2);
+    assert_eq!(r.sums, vec![2, 400]);
+}
+
+#[test]
+fn query_shard_int_filter_term_must_parse_as_int() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 3])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let err = query_shard(
+        tmp.path(),
+        Some(("vendor_id", "not-a-number")),
+        &["vendor_id"],
+    )
+    .expect_err("expected parse error for non-int filter term");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("vendor_id") && msg.contains("not a valid int64"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn inspect_shows_int_field_row() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 1, 3])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let mut buf = Vec::new();
+    inspect(tmp.path(), &mut buf).expect("inspect");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("vendor_id"), "{out}");
+    assert!(out.contains("int"), "{out}");
+    assert!(out.contains("forward+index (3 terms)"), "{out}");
 }

@@ -86,15 +86,32 @@ pub struct FieldSchema {
     pub kind: FieldKind,
 }
 
-/// Field type within a shard. `Metric` is an int64 forward column;
-/// `String` is an inverted index over UTF-8 terms with no forward
-/// column. `Int` (forward column + inverted index over the numeric
-/// values) is not yet implemented.
+/// Field type within a shard.
+///
+/// - `Metric` — int64 forward column only. Aggregatable, not filterable.
+/// - `String` — inverted index over UTF-8 terms only. Filterable, not aggregatable.
+/// - `Int` — int64 forward column AND inverted index over the numeric values.
+///   Both filterable and aggregatable. Index keys are stored as
+///   order-preserving big-endian i64 (sign bit flipped), so bytewise lex
+///   sort on the FST equals numeric sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldKind {
     Metric,
     String,
+    Int,
+}
+
+impl std::fmt::Display for FieldKind {
+    /// Lowercase form matching the JSON serialisation and the labels
+    /// used in `inspect` output / CLI errors.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FieldKind::Metric => "metric",
+            FieldKind::String => "string",
+            FieldKind::Int => "int",
+        })
+    }
 }
 
 /// Read-only access to a shard's contents.
@@ -144,31 +161,50 @@ impl InvertedIndex {
     }
 
     /// Doc set for `term`, or `None` if the term is not in the
-    /// dictionary.
+    /// dictionary. Thin wrapper around [`lookup_bytes`] for the
+    /// common UTF-8 case (string fields).
     #[must_use]
     pub fn lookup(&self, term: &str) -> Option<RoaringBitmap> {
-        let offset = self.fst.get(term.as_bytes())?;
+        self.lookup_bytes(term.as_bytes())
+    }
+
+    /// Doc set for the raw byte key, or `None`. Used by callers
+    /// whose terms aren't UTF-8 strings — e.g. `Int` fields encode
+    /// values via [`encode_int_key`] and look up with the resulting
+    /// 8-byte slice.
+    #[must_use]
+    pub fn lookup_bytes(&self, key: &[u8]) -> Option<RoaringBitmap> {
+        let offset = self.fst.get(key)?;
         Some(read_bitmap_at(&self.postings, offset))
     }
 
     /// All terms in `[start, end_inclusive]`, in lexicographic order,
-    /// each paired with its doc set.
+    /// each paired with its doc set. UTF-8 wrapper for string fields;
+    /// for byte-keyed indexes (Int) use [`range_bytes`].
     pub fn range(
         &self,
         start: &str,
         end_inclusive: &str,
     ) -> impl Iterator<Item = (String, RoaringBitmap)> + '_ {
-        let mut stream = self
-            .fst
-            .range()
-            .ge(start.as_bytes())
-            .le(end_inclusive.as_bytes())
-            .into_stream();
+        self.range_bytes(start.as_bytes(), end_inclusive.as_bytes())
+            .map(|(k, bm)| (utf8_term(&k), bm))
+    }
+
+    /// All byte-keyed terms in `[start, end_inclusive]`, in
+    /// lexicographic byte order, each paired with its doc set. For
+    /// `Int` fields whose FST keys are [`encode_int_key`]-encoded,
+    /// byte order = numeric order, so this gives natural numeric
+    /// range semantics.
+    pub fn range_bytes(
+        &self,
+        start: &[u8],
+        end_inclusive: &[u8],
+    ) -> impl Iterator<Item = (Vec<u8>, RoaringBitmap)> + '_ {
+        let mut stream = self.fst.range().ge(start).le(end_inclusive).into_stream();
         let postings: &[u8] = &self.postings;
         std::iter::from_fn(move || {
             let (k, v) = stream.next()?;
-            let term = utf8_term(k);
-            Some((term, read_bitmap_at(postings, v)))
+            Some((k.to_vec(), read_bitmap_at(postings, v)))
         })
     }
 
@@ -189,6 +225,21 @@ fn utf8_term(bytes: &[u8]) -> String {
     std::str::from_utf8(bytes)
         .expect("FST term is not valid UTF-8 — shard file corrupt")
         .to_owned()
+}
+
+/// Order-preserving big-endian i64 encoding for FST keys on `Int`
+/// fields. Flipping the sign bit makes bytewise lex order equal
+/// numeric order: `encode(-1) < encode(0) < encode(1)`.
+#[must_use]
+pub fn encode_int_key(v: i64) -> [u8; 8] {
+    (v ^ i64::MIN).to_be_bytes()
+}
+
+/// Inverse of [`encode_int_key`]. Slice must be 8 bytes.
+#[must_use]
+pub fn decode_int_key(bytes: &[u8]) -> i64 {
+    let arr: [u8; 8] = bytes.try_into().expect("int key is exactly 8 bytes");
+    i64::from_be_bytes(arr) ^ i64::MIN
 }
 
 fn read_bitmap_at(postings: &[u8], offset: u64) -> RoaringBitmap {
@@ -311,7 +362,10 @@ impl Shard for DiskShard {
 fn load_indexes(dir: &Path, metadata: &Metadata) -> Result<HashMap<String, InvertedIndex>> {
     let mut indexes = HashMap::new();
     for field in &metadata.fields {
-        if field.kind != FieldKind::String {
+        // String and Int fields both have inverted indexes on disk;
+        // their key encoding differs (UTF-8 bytes vs encode_int_key)
+        // but the FST/postings layout is identical.
+        if !matches!(field.kind, FieldKind::String | FieldKind::Int) {
             continue;
         }
         let fst_path = posting_path(dir, &field.name, FST_EXT);
@@ -360,10 +414,12 @@ fn validate_schema_matches(
     batch: &RecordBatch,
     metrics_path: &Path,
 ) -> Result<()> {
+    // Metric and Int fields both contribute an int64 column to
+    // metrics.arrow; String fields have no forward column.
     let metric_fields: Vec<&FieldSchema> = metadata
         .fields
         .iter()
-        .filter(|f| f.kind == FieldKind::Metric)
+        .filter(|f| matches!(f.kind, FieldKind::Metric | FieldKind::Int))
         .collect();
 
     let schema = batch.schema_ref();
@@ -405,9 +461,18 @@ fn validate_schema_matches(
 pub struct DiskShardWriter {
     dir: PathBuf,
     time_range: (i64, i64),
-    columns: Vec<(String, Vec<i64>)>,
+    forward_cols: Vec<ForwardCol>,
     string_fields: Vec<(String, BTreeMap<String, RoaringBitmap>)>,
     num_docs: Option<u64>,
+}
+
+/// One forward-column field, used for both `Metric` and `Int` kinds.
+/// `kind` is preserved so finalize can emit it in `metadata.fields`
+/// and (for `Int`) also derive the inverted index from `values`.
+struct ForwardCol {
+    name: String,
+    values: Vec<i64>,
+    kind: FieldKind,
 }
 
 impl DiskShardWriter {
@@ -416,19 +481,34 @@ impl DiskShardWriter {
         Ok(Self {
             dir: dir.to_path_buf(),
             time_range,
-            columns: Vec::new(),
+            forward_cols: Vec::new(),
             string_fields: Vec::new(),
             num_docs: None,
         })
     }
 
-    /// Add a metric (`Int64`) column. All metric columns added to one
-    /// writer must have the same length; the first call fixes the row
-    /// count and subsequent mismatches return an error.
+    /// Add a metric (`Int64`) column — aggregatable, not filterable.
+    /// All forward columns added to one writer must have the same
+    /// length; the first call fixes the row count and subsequent
+    /// mismatches return an error.
     ///
     /// `values` is owned so [`Int64Array::from`] can take it without a
     /// copy on `finalize`.
     pub fn add_metric(&mut self, name: &str, values: Vec<i64>) -> Result<()> {
+        self.add_forward_col(name, values, FieldKind::Metric)
+    }
+
+    /// Add an `Int` field — int64 forward column AND inverted index
+    /// over the values. Same row-count rules as [`add_metric`]; at
+    /// finalize the values double as the source for the inverted
+    /// index (one term per distinct value, keys
+    /// [`encode_int_key`]-encoded so FST lex order matches numeric
+    /// order).
+    pub fn add_int_field(&mut self, name: &str, values: Vec<i64>) -> Result<()> {
+        self.add_forward_col(name, values, FieldKind::Int)
+    }
+
+    fn add_forward_col(&mut self, name: &str, values: Vec<i64>, kind: FieldKind) -> Result<()> {
         let len = values.len() as u64;
         match self.num_docs {
             None => self.num_docs = Some(len),
@@ -438,7 +518,11 @@ impl DiskShardWriter {
             Some(_) => {}
         }
         self.ensure_unused_name(name)?;
-        self.columns.push((name.to_string(), values));
+        self.forward_cols.push(ForwardCol {
+            name: name.to_string(),
+            values,
+            kind,
+        });
         Ok(())
     }
 
@@ -467,7 +551,7 @@ impl DiskShardWriter {
     }
 
     fn ensure_unused_name(&self, name: &str) -> Result<()> {
-        if self.columns.iter().any(|(n, _)| n == name)
+        if self.forward_cols.iter().any(|c| c.name == name)
             || self.string_fields.iter().any(|(n, _)| n == name)
         {
             bail!("field {name:?} already added");
@@ -476,10 +560,11 @@ impl DiskShardWriter {
     }
 
     pub fn finalize(self) -> Result<()> {
-        // num_docs is the doc-ID universe size. Metric columns fix it
-        // explicitly via their row count; string fields are sparse over
-        // that universe. When no metric column declares it, derive
-        // num_docs from the highest doc ID any string bitmap touches.
+        // num_docs is the doc-ID universe size. Forward columns
+        // (Metric or Int) fix it explicitly via their row count;
+        // string fields are sparse over that universe. When no
+        // forward column declares it, derive num_docs from the
+        // highest doc ID any string bitmap touches.
         let max_string_doc = self
             .string_fields
             .iter()
@@ -498,15 +583,40 @@ impl DiskShardWriter {
             (None, None) => 0,
         };
 
-        // metadata.fields lists metric fields before string fields,
-        // regardless of add_* call order — readers that rely on the
-        // metric-prefix in validate_schema_matches depend on this.
+        // Build Int-field postings now — must run before
+        // `self.forward_cols.into_iter()` below moves the values into
+        // the Arrow arrays. For each int field, doc_id N gets a bit in
+        // the bitmap for term encode_int_key(values[N]).
+        //
+        // `BTreeMap<[u8; 8], _>` (not `Vec<u8>`) so the per-row key
+        // doesn't heap-allocate: 8-byte arrays are `Ord`
+        // lexicographically, which equals numeric order via the
+        // encoding, and `[u8; 8]: AsRef<[u8]>` so `write_indexed_field`
+        // accepts them unchanged.
+        let mut int_postings: Vec<(String, BTreeMap<[u8; 8], RoaringBitmap>)> = Vec::new();
+        for col in &self.forward_cols {
+            if col.kind != FieldKind::Int {
+                continue;
+            }
+            let mut postings: BTreeMap<[u8; 8], RoaringBitmap> = BTreeMap::new();
+            for (doc_id, &v) in col.values.iter().enumerate() {
+                postings
+                    .entry(encode_int_key(v))
+                    .or_default()
+                    .insert(u32::try_from(doc_id).expect("doc_id within u32 (writer enforced)"));
+            }
+            int_postings.push((col.name.clone(), postings));
+        }
+
+        // metadata.fields: forward_cols in insertion order (so they
+        // line up with the Arrow batch's columns, which
+        // validate_schema_matches relies on), then string fields.
         let mut fields: Vec<FieldSchema> =
-            Vec::with_capacity(self.columns.len() + self.string_fields.len());
-        for (name, _) in &self.columns {
+            Vec::with_capacity(self.forward_cols.len() + self.string_fields.len());
+        for col in &self.forward_cols {
             fields.push(FieldSchema {
-                name: name.clone(),
-                kind: FieldKind::Metric,
+                name: col.name.clone(),
+                kind: col.kind,
             });
         }
         for (name, _) in &self.string_fields {
@@ -524,19 +634,19 @@ impl DiskShardWriter {
         };
 
         let arrow_fields: Vec<Field> = self
-            .columns
+            .forward_cols
             .iter()
-            .map(|(name, _)| Field::new(name, DataType::Int64, false))
+            .map(|c| Field::new(&c.name, DataType::Int64, false))
             .collect();
         let schema = Arc::new(Schema::new(arrow_fields));
 
         let arrays: Vec<ArrayRef> = self
-            .columns
+            .forward_cols
             .into_iter()
-            .map(|(_, values)| Arc::new(Int64Array::from(values)) as ArrayRef)
+            .map(|c| Arc::new(Int64Array::from(c.values)) as ArrayRef)
             .collect();
 
-        // Required when there are no metric columns (string-only
+        // Required when there are no forward columns (string-only
         // shards): RecordBatch can't infer row count from zero arrays.
         let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(
             usize::try_from(num_docs).expect("num_docs fits in usize"),
@@ -561,12 +671,15 @@ impl DiskShardWriter {
             Ok(())
         })?;
 
-        if !self.string_fields.is_empty() {
+        if !self.string_fields.is_empty() || !int_postings.is_empty() {
             let postings_dir = self.dir.join(POSTINGS_DIR);
             fs::create_dir_all(&postings_dir)
                 .with_context(|| format!("create {}", postings_dir.display()))?;
             for (name, postings) in &self.string_fields {
-                write_string_field(&self.dir, name, postings)?;
+                write_indexed_field(&self.dir, name, postings)?;
+            }
+            for (name, postings) in &int_postings {
+                write_indexed_field(&self.dir, name, postings)?;
             }
         }
 
@@ -580,24 +693,36 @@ impl DiskShardWriter {
 }
 
 /// Write `<field>.posting` (concatenated bitmaps) and `<field>.fst`
-/// (term → byte offset into postings) for one string field. Posting
+/// (term → byte offset into postings) for one indexed field. Posting
 /// is renamed in first so a reader seeing the `.fst` is guaranteed
 /// the offsets resolve.
-fn write_string_field(
+///
+/// Generic over key type so `String` (UTF-8) and `Vec<u8>`
+/// (order-preserving int encoding) both work through one path. The
+/// `BTreeMap` iteration order = byte order in both cases, which is
+/// what the FST builder requires.
+fn write_indexed_field<K>(
     dir: &Path,
     name: &str,
-    postings: &BTreeMap<String, RoaringBitmap>,
-) -> Result<()> {
-    let mut offsets: Vec<(String, u64)> = Vec::with_capacity(postings.len());
+    postings: &BTreeMap<K, RoaringBitmap>,
+) -> Result<()>
+where
+    K: AsRef<[u8]>,
+{
+    // Copy keys to owned Vec<u8> so the second pass (FST build) can
+    // see them after the first pass (posting writes) borrows
+    // `postings` to iterate. Per-key copy is tiny vs the bitmap
+    // serialisation cost.
+    let mut offsets: Vec<(Vec<u8>, u64)> = Vec::with_capacity(postings.len());
     write_atomic(&posting_path(dir, name, POSTING_EXT), |tmp| {
         let file = fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
         let mut writer = io::BufWriter::new(file);
         let mut cursor: u64 = 0;
-        for (term, bitmap) in postings {
-            offsets.push((term.clone(), cursor));
+        for (key, bitmap) in postings {
+            offsets.push((key.as_ref().to_vec(), cursor));
             bitmap
                 .serialize_into(&mut writer)
-                .with_context(|| format!("serialise bitmap for term {term:?}"))?;
+                .with_context(|| format!("serialise bitmap for field {name:?}"))?;
             cursor += bitmap.serialized_size() as u64;
         }
         writer
@@ -610,10 +735,10 @@ fn write_string_field(
         let file = fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
         let mut builder = fst::MapBuilder::new(io::BufWriter::new(file))
             .with_context(|| format!("init FST builder for {}", tmp.display()))?;
-        for (term, offset) in &offsets {
+        for (key, offset) in &offsets {
             builder
-                .insert(term.as_bytes(), *offset)
-                .with_context(|| format!("insert term {term:?} into FST"))?;
+                .insert(key, *offset)
+                .with_context(|| format!("insert key into FST for field {name:?}"))?;
         }
         // into_inner finalises the FST (writes the footer); the second
         // call unwraps the BufWriter to flush it to disk.
@@ -660,10 +785,20 @@ pub fn inspect(path: &Path, out: &mut dyn io::Write) -> Result<()> {
                     .expect("string field present in metadata but not loaded");
                 ("string", format!("index ({} terms)", idx.num_terms()))
             }
+            FieldKind::Int => {
+                let idx = shard
+                    .inverted_index(&field.name)
+                    .expect("int field present in metadata but not loaded");
+                ("int", format!("forward+index ({} terms)", idx.num_terms()))
+            }
         };
+        // Pad kind_label to 6 (the longest kind name: "metric" /
+        // "string") so the detail column lines up across mixed-kind
+        // shards (an "int" row would otherwise shorten its detail
+        // column by 3 chars vs neighbouring "metric"/"string" rows).
         writeln!(
             out,
-            "  {:<width$}  {}  {}",
+            "  {:<width$}  {:<6}  {}",
             field.name,
             kind_label,
             detail,
@@ -727,7 +862,8 @@ pub fn query_shard(
     let cols: Vec<&[i64]> = metrics
         .iter()
         .map(|m| {
-            require_field(metadata, m, FieldKind::Metric)?;
+            // Metric or Int field — both contribute a forward column.
+            require_field(metadata, m, &[FieldKind::Metric, FieldKind::Int])?;
             if !seen.insert(*m) {
                 bail!("metric {m:?} declared more than once");
             }
@@ -738,11 +874,24 @@ pub fn query_shard(
         .collect::<Result<_>>()?;
 
     let (matched, sums) = if let Some((field, term)) = filter {
-        require_field(metadata, field, FieldKind::String)?;
+        // String or Int field — both have an inverted index, but the
+        // term encoding differs: String uses UTF-8 bytes directly,
+        // Int parses the decimal term and encodes via encode_int_key.
+        let filter_field = require_field(metadata, field, &[FieldKind::String, FieldKind::Int])?;
         let idx = shard
             .inverted_index(field)
-            .expect("string field kind validated above");
-        idx.lookup(term).map_or_else(
+            .expect("indexed field kind validated above");
+        let bm = match filter_field.kind {
+            FieldKind::String => idx.lookup(term),
+            FieldKind::Int => {
+                let v: i64 = term.parse().with_context(|| {
+                    format!("filter term {term:?} is not a valid int64 for field {field:?}")
+                })?;
+                idx.lookup_bytes(&encode_int_key(v))
+            }
+            FieldKind::Metric => unreachable!("require_field rejected non-indexed kind"),
+        };
+        bm.map_or_else(
             || (0u64, vec![0i128; cols.len()]),
             |bm| {
                 let m = bm.len();
@@ -823,25 +972,30 @@ pub fn write_query_summary(
     Ok(())
 }
 
-/// Verify that `name` is declared in `metadata.fields` and has the
-/// expected `FieldKind`. Returns the matching `FieldSchema` on success;
-/// produces a uniform error message on either missing-field or
-/// wrong-kind failures so callers can rely on consistent CLI output.
+/// Verify that `name` is declared in `metadata.fields` and has one
+/// of the accepted `FieldKind`s. Returns the matching `FieldSchema`
+/// on success; produces a uniform error message on either
+/// missing-field or wrong-kind failures so callers can rely on
+/// consistent CLI output.
 fn require_field<'a>(
     metadata: &'a Metadata,
     name: &str,
-    want: FieldKind,
+    accept: &[FieldKind],
 ) -> Result<&'a FieldSchema> {
     let field = metadata
         .fields
         .iter()
         .find(|f| f.name == name)
         .ok_or_else(|| anyhow::anyhow!("field {name:?} not found in shard"))?;
-    if field.kind != want {
+    if !accept.contains(&field.kind) {
+        let expected = accept
+            .iter()
+            .map(FieldKind::to_string)
+            .collect::<Vec<_>>()
+            .join(" or ");
         bail!(
-            "field {name:?} is a {:?} field, not a {:?}",
+            "field {name:?} is a {} field, expected {expected}",
             field.kind,
-            want
         );
     }
     Ok(field)

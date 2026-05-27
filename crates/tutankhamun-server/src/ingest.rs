@@ -13,17 +13,23 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use roaring::RoaringBitmap;
 
-use crate::shard::DiskShardWriter;
+use crate::shard::{DiskShardWriter, FieldKind};
 
 /// What to extract from each row, by column name.
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
     /// Header name of the column to parse as the doc's time.
     pub time: String,
-    /// Header names of columns to store as int64 metric forward columns.
+    /// Header names of columns to store as int64 metric forward
+    /// columns (aggregatable, not filterable).
     pub metrics: Vec<String>,
-    /// Header names of columns to store as string-field inverted indexes.
+    /// Header names of columns to store as string-field inverted
+    /// indexes (filterable, not aggregatable).
     pub strings: Vec<String>,
+    /// Header names of columns to store as `Int` fields — int64
+    /// forward column plus inverted index over the numeric values
+    /// (both filterable and aggregatable).
+    pub ints: Vec<String>,
     /// Field delimiter — `,` for CSV, `\t` for TSV.
     pub delimiter: u8,
     /// How to partition rows into shards. Defaults to one shard per
@@ -112,17 +118,28 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
     };
 
     let time_idx = find(&opts.time)?;
-    let metrics_proto: Vec<MetricCol> = opts
-        .metrics
-        .iter()
-        .map(|name| {
-            Ok(MetricCol {
-                name: name.clone(),
-                col_idx: find(name)?,
-                values: Vec::new(),
-            })
-        })
-        .collect::<Result<_>>()?;
+    // Metric and Int fields share the same numeric accumulator —
+    // their only difference is which `DiskShardWriter` method
+    // receives them at finalize. Metrics-then-ints preserves the
+    // existing "all forward columns up front" ordering in the
+    // resulting Arrow schema.
+    let mut numeric_proto: Vec<NumericCol> = Vec::new();
+    for name in &opts.metrics {
+        numeric_proto.push(NumericCol {
+            name: name.clone(),
+            col_idx: find(name)?,
+            values: Vec::new(),
+            kind: FieldKind::Metric,
+        });
+    }
+    for name in &opts.ints {
+        numeric_proto.push(NumericCol {
+            name: name.clone(),
+            col_idx: find(name)?,
+            values: Vec::new(),
+            kind: FieldKind::Int,
+        });
+    }
     let strings_proto: Vec<StringCol> = opts
         .strings
         .iter()
@@ -160,7 +177,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
         let key = opts.shard_by.bucket_key(t);
         let bucket = buckets
             .entry(key)
-            .or_insert_with(|| BucketBuilder::new(&metrics_proto, &strings_proto));
+            .or_insert_with(|| BucketBuilder::new(&numeric_proto, &strings_proto));
         bucket.push_row(&row, line, t)?;
         total_rows += 1;
     }
@@ -185,6 +202,7 @@ fn check_no_duplicate_columns(opts: &IngestOptions) -> Result<()> {
     for name in std::iter::once(&opts.time)
         .chain(&opts.metrics)
         .chain(&opts.strings)
+        .chain(&opts.ints)
     {
         if !seen.insert(name.as_str()) {
             bail!("column {name:?} declared more than once");
@@ -193,10 +211,14 @@ fn check_no_duplicate_columns(opts: &IngestOptions) -> Result<()> {
     Ok(())
 }
 
-struct MetricCol {
+/// Numeric (`Metric` or `Int`) column accumulator. Both kinds parse
+/// rows the same way (i64 forward column); `kind` tags them so
+/// finalize knows which `DiskShardWriter` method to call.
+struct NumericCol {
     name: String,
     col_idx: usize,
     values: Vec<i64>,
+    kind: FieldKind,
 }
 
 struct StringCol {
@@ -206,10 +228,10 @@ struct StringCol {
 }
 
 /// One in-progress shard's accumulators. Built from prototype
-/// `MetricCol` / `StringCol` arrays so every bucket inherits the same
-/// names + column indexes; data structures start empty.
+/// arrays so every bucket inherits the same names + column indexes;
+/// data structures start empty.
 struct BucketBuilder {
-    metrics: Vec<MetricCol>,
+    numeric: Vec<NumericCol>,
     strings: Vec<StringCol>,
     time_min: i64,
     time_max: i64,
@@ -217,14 +239,15 @@ struct BucketBuilder {
 }
 
 impl BucketBuilder {
-    fn new(metrics_proto: &[MetricCol], strings_proto: &[StringCol]) -> Self {
+    fn new(numeric_proto: &[NumericCol], strings_proto: &[StringCol]) -> Self {
         Self {
-            metrics: metrics_proto
+            numeric: numeric_proto
                 .iter()
-                .map(|m| MetricCol {
-                    name: m.name.clone(),
-                    col_idx: m.col_idx,
+                .map(|c| NumericCol {
+                    name: c.name.clone(),
+                    col_idx: c.col_idx,
                     values: Vec::new(),
+                    kind: c.kind,
                 })
                 .collect(),
             strings: strings_proto
@@ -245,15 +268,15 @@ impl BucketBuilder {
         self.time_min = self.time_min.min(t);
         self.time_max = self.time_max.max(t);
 
-        for col in &mut self.metrics {
+        for col in &mut self.numeric {
             let raw = row
                 .get(col.col_idx)
-                .with_context(|| format!("line {line}: missing metric column"))?;
+                .with_context(|| format!("line {line}: missing {} column", col.kind))?;
             let value: i64 = raw.parse().with_context(|| {
                 format!(
-                    "line {line}: metric column {:?} value {raw:?}: only int64 values are \
+                    "line {line}: {} column {:?} value {raw:?}: only int64 values are \
                      supported (multiply decimal values by 100 etc. and round)",
-                    col.name,
+                    col.kind, col.name,
                 )
             })?;
             col.values.push(value);
@@ -290,10 +313,16 @@ impl BucketBuilder {
         let num_docs = u64::from(self.doc_id);
         let mut writer = DiskShardWriter::new(output_dir, (self.time_min, self.time_max))
             .with_context(|| format!("create writer at {}", output_dir.display()))?;
-        for col in self.metrics {
-            writer
-                .add_metric(&col.name, col.values)
-                .with_context(|| format!("add metric {:?}", col.name))?;
+        for col in self.numeric {
+            match col.kind {
+                FieldKind::Metric => writer
+                    .add_metric(&col.name, col.values)
+                    .with_context(|| format!("add metric {:?}", col.name))?,
+                FieldKind::Int => writer
+                    .add_int_field(&col.name, col.values)
+                    .with_context(|| format!("add int field {:?}", col.name))?,
+                FieldKind::String => unreachable!("NumericCol only holds Metric or Int"),
+            }
         }
         for col in self.strings {
             writer
@@ -400,6 +429,7 @@ mod tests {
             time: time.to_string(),
             metrics: metrics.iter().map(|s| (*s).to_string()).collect(),
             strings: strings.iter().map(|s| (*s).to_string()).collect(),
+            ints: Vec::new(),
             delimiter: b',',
             shard_by: ShardBy::None,
         }
@@ -605,6 +635,43 @@ mod tests {
             .expect_err("expected unknown-column rejection");
         let msg = err.to_string();
         assert!(msg.contains("not_a_column"), "{msg}");
+    }
+
+    #[test]
+    fn ingest_csv_int_field_round_trip() {
+        // CSV with an int field declared via --int. Verify that
+        // both the forward column AND the inverted index land on
+        // disk and behave correctly.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            "pickup,vendor_id,fare_cents\n\
+             1700000000,1,2500\n\
+             1700000300,2,3700\n\
+             1700000600,1,4500\n\
+             1700000900,3,2200\n",
+        );
+        let shard_dir = tmp.path().join("shard");
+        let opts = IngestOptions {
+            time: "pickup".to_string(),
+            metrics: vec!["fare_cents".to_string()],
+            strings: Vec::new(),
+            ints: vec!["vendor_id".to_string()],
+            delimiter: b',',
+            shard_by: ShardBy::None,
+        };
+        ingest_csv(&input, &shard_dir, &opts).expect("ingest");
+
+        let shard = crate::shard::DiskShard::open(&shard_dir).expect("open");
+        // Forward column carries the raw values.
+        assert_eq!(shard.forward_column("vendor_id").unwrap(), &[1, 2, 1, 3]);
+        // Inverted index has one bitmap per distinct value.
+        let idx = shard.inverted_index("vendor_id").expect("vendor_id index");
+        assert_eq!(idx.num_terms(), 3);
+        let v1 = idx
+            .lookup_bytes(&crate::shard::encode_int_key(1))
+            .expect("vendor 1");
+        assert_eq!(v1.len(), 2);
     }
 
     #[test]

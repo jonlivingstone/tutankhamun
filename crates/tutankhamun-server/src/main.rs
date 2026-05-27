@@ -80,12 +80,19 @@ enum Command {
         /// `YYYYMMDD` columns to one of the above formats.
         #[arg(long)]
         time: String,
-        /// Header name of an int64 metric column. Repeatable.
+        /// Header name of an int64 metric column (aggregatable
+        /// only). Repeatable.
         #[arg(long = "metric")]
         metrics: Vec<String>,
-        /// Header name of a string-field column. Repeatable.
+        /// Header name of a string-field column (filterable only).
+        /// Repeatable.
         #[arg(long = "string")]
         strings: Vec<String>,
+        /// Header name of an int64 column to ingest as an `Int`
+        /// field (both aggregatable and filterable — useful for
+        /// numeric IDs like `vendor_id`). Repeatable.
+        #[arg(long = "int")]
+        ints: Vec<String>,
         /// Field delimiter (default ','). Use `$'\t'` for TSV.
         #[arg(long, default_value = ",")]
         delimiter: char,
@@ -212,18 +219,24 @@ fn main() -> anyhow::Result<()> {
             time,
             metrics,
             strings,
+            ints,
             delimiter,
             shard_by,
-        } => run_ingest(input, output, time, metrics, strings, *delimiter, *shard_by),
+        } => run_ingest(
+            input, output, time, metrics, strings, ints, *delimiter, *shard_by,
+        ),
     }
 }
 
+// Args mirror the CLI flag count, which is the user-facing surface.
+#[allow(clippy::too_many_arguments)]
 fn run_ingest(
     input: &std::path::Path,
     output: &std::path::Path,
     time: &str,
     metrics: &[String],
     strings: &[String],
+    ints: &[String],
     delimiter: char,
     shard_by: ShardByArg,
 ) -> anyhow::Result<()> {
@@ -235,6 +248,7 @@ fn run_ingest(
         time: time.to_string(),
         metrics: metrics.to_vec(),
         strings: strings.to_vec(),
+        ints: ints.to_vec(),
         delimiter: delimiter_byte,
         shard_by: shard_by.into(),
     };
