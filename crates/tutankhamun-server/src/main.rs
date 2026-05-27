@@ -8,11 +8,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
-use tutankhamun_server::ingest::{self, IngestOptions};
+use tutankhamun_server::ingest::{self, IngestOptions, ShardBy};
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard;
@@ -51,11 +51,13 @@ enum Command {
         #[arg(long)]
         filter: Option<String>,
     },
-    /// Build a shard from a CSV/TSV input file.
+    /// Build one or more shards from a CSV/TSV input file.
     Ingest {
         /// Path to the CSV/TSV input file (must have a header row).
         input: PathBuf,
-        /// Directory to write the finalised shard into.
+        /// Directory to write the finalised shard(s) into. With
+        /// `--shard-by daily` or `hourly`, one shard per time bucket
+        /// is written under this root (e.g. `<root>/YYYY-MM-DD/`).
         #[arg(long)]
         output: PathBuf,
         /// Header name of the time column. Values may be unix epoch
@@ -73,7 +75,33 @@ enum Command {
         /// Field delimiter (default ','). Use `$'\t'` for TSV.
         #[arg(long, default_value = ",")]
         delimiter: char,
+        /// Partition rows into shards by UTC time bucket. `none`
+        /// produces one shard at `--output`; `daily` / `hourly`
+        /// produce one shard per day / hour under `--output`.
+        #[arg(long, value_enum, default_value_t = ShardByArg::None)]
+        shard_by: ShardByArg,
     },
+}
+
+/// CLI-facing shard-by aliases. Maps to the engine's duration-based
+/// [`ShardBy`] in `run_ingest`; future aliases / explicit-duration
+/// support are CLI-only changes.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum ShardByArg {
+    #[default]
+    None,
+    Daily,
+    Hourly,
+}
+
+impl From<ShardByArg> for ShardBy {
+    fn from(a: ShardByArg) -> Self {
+        match a {
+            ShardByArg::None => ShardBy::None,
+            ShardByArg::Daily => ShardBy::Bucket { seconds: 86_400 },
+            ShardByArg::Hourly => ShardBy::Bucket { seconds: 3600 },
+        }
+    }
 }
 
 #[derive(Args, Debug)]
@@ -161,7 +189,8 @@ fn main() -> anyhow::Result<()> {
             metrics,
             strings,
             delimiter,
-        } => run_ingest(input, output, time, metrics, strings, *delimiter),
+            shard_by,
+        } => run_ingest(input, output, time, metrics, strings, *delimiter, *shard_by),
     }
 }
 
@@ -172,6 +201,7 @@ fn run_ingest(
     metrics: &[String],
     strings: &[String],
     delimiter: char,
+    shard_by: ShardByArg,
 ) -> anyhow::Result<()> {
     if !delimiter.is_ascii() {
         anyhow::bail!("delimiter must be a single ASCII byte (got {delimiter:?})");
@@ -182,6 +212,7 @@ fn run_ingest(
         metrics: metrics.to_vec(),
         strings: strings.to_vec(),
         delimiter: delimiter_byte,
+        shard_by: shard_by.into(),
     };
     let n = ingest::ingest_csv(input, output, &opts)?;
     println!("wrote {n} docs to {}", output.display());

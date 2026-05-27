@@ -7,7 +7,7 @@
 //! Used by the `t9n ingest` CLI verb.
 
 use std::collections::{BTreeMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDateTime};
@@ -26,6 +26,61 @@ pub struct IngestOptions {
     pub strings: Vec<String>,
     /// Field delimiter — `,` for CSV, `\t` for TSV.
     pub delimiter: u8,
+    /// How to partition rows into shards. Defaults to one shard per
+    /// ingest (`ShardBy::None`).
+    pub shard_by: ShardBy,
+}
+
+/// How rows are partitioned into shards. The internal model is
+/// duration-based (`Bucket { seconds }`); the CLI exposes named
+/// aliases (`daily` → 86400, `hourly` → 3600) but the engine accepts
+/// any positive bucket size — adding `--shard-by 6h` later is a
+/// CLI-parser change only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ShardBy {
+    /// All rows into a single shard at the `--output` path.
+    #[default]
+    None,
+    /// One shard per `seconds`-wide UTC time bucket.
+    Bucket { seconds: i64 },
+}
+
+impl ShardBy {
+    /// Integer bucket key for an epoch-seconds time. Equal keys land
+    /// in the same shard. `div_euclid` (not `/`) so pre-1970 inputs
+    /// floor toward negative infinity correctly.
+    fn bucket_key(self, epoch: i64) -> i64 {
+        match self {
+            Self::None => 0,
+            Self::Bucket { seconds } => epoch.div_euclid(seconds),
+        }
+    }
+
+    /// Where to write the shard for `key` under `root`. Dirname
+    /// precision is tied to the bucket size — when a new size lands
+    /// the match below must gain a matching format, otherwise two
+    /// distinct buckets could collide on the same dirname (e.g.
+    /// `seconds=1800` would write `YYYY-MM-DDTHH` for both
+    /// half-hours of an hour). Fail fast rather than silently merge.
+    fn output_dir(self, root: &Path, key: i64) -> PathBuf {
+        match self {
+            Self::None => root.to_path_buf(),
+            Self::Bucket { seconds } => {
+                let bucket_start = key.saturating_mul(seconds);
+                let dt = DateTime::from_timestamp(bucket_start, 0)
+                    .expect("bucket_start within chrono range");
+                let fmt = match seconds {
+                    86_400 => "%Y-%m-%d",
+                    3600 => "%Y-%m-%dT%H",
+                    _ => panic!(
+                        "ShardBy::output_dir has no dirname format defined for {seconds}s \
+                         buckets — extend the match before exposing this granularity on the CLI"
+                    ),
+                };
+                root.join(dt.format(fmt).to_string())
+            }
+        }
+    }
 }
 
 /// Read `input`, parse rows according to `opts`, and write a single
@@ -57,7 +112,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
     };
 
     let time_idx = find(&opts.time)?;
-    let mut metrics: Vec<MetricCol> = opts
+    let metrics_proto: Vec<MetricCol> = opts
         .metrics
         .iter()
         .map(|name| {
@@ -68,7 +123,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
             })
         })
         .collect::<Result<_>>()?;
-    let mut strings: Vec<StringCol> = opts
+    let strings_proto: Vec<StringCol> = opts
         .strings
         .iter()
         .map(|name| {
@@ -80,13 +135,16 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
         })
         .collect::<Result<_>>()?;
 
-    let mut time_min = i64::MAX;
-    let mut time_max = i64::MIN;
-    let mut doc_id: u32 = 0;
+    // BTreeMap (not HashMap) so finalize iterates buckets in
+    // time-ascending order — operators following the log see
+    // chronological progress, and deterministic order is easier to
+    // debug on partial failures.
+    let mut buckets: BTreeMap<i64, BucketBuilder> = BTreeMap::new();
     // Caches the successful time format after the first row so subsequent
     // rows skip the failing-parser attempts. Mixed-format inputs still
     // work via the full-detection fallback inside parse_time.
     let mut time_hint: Option<TimeFormat> = None;
+    let mut total_rows: u64 = 0;
 
     for record in reader.records() {
         let row = record.with_context(|| format!("read {}", input.display()))?;
@@ -98,65 +156,25 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
         let (t, fmt) = parse_time(time_str, time_hint)
             .with_context(|| format!("line {line}: time column {time_str:?}"))?;
         time_hint = Some(fmt);
-        time_min = time_min.min(t);
-        time_max = time_max.max(t);
 
-        for col in &mut metrics {
-            let raw = row
-                .get(col.col_idx)
-                .with_context(|| format!("line {line}: missing metric column"))?;
-            let value: i64 = raw.parse().with_context(|| {
-                format!(
-                    "line {line}: metric column {:?} value {raw:?}: only int64 values are \
-                     supported (multiply decimal values by 100 etc. and round)",
-                    col.name,
-                )
-            })?;
-            col.values.push(value);
-        }
-
-        for col in &mut strings {
-            let term = row
-                .get(col.col_idx)
-                .with_context(|| format!("line {line}: missing string column"))?;
-            // Look up first to avoid allocating a fresh String for terms
-            // that already exist — low-cardinality columns repeat heavily.
-            if let Some(bm) = col.postings.get_mut(term) {
-                bm.insert(doc_id);
-            } else {
-                let mut bm = RoaringBitmap::new();
-                bm.insert(doc_id);
-                col.postings.insert(term.to_string(), bm);
-            }
-        }
-
-        doc_id = doc_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("line {line}: doc ID overflow (> u32::MAX rows)"))?;
+        let key = opts.shard_by.bucket_key(t);
+        let bucket = buckets
+            .entry(key)
+            .or_insert_with(|| BucketBuilder::new(&metrics_proto, &strings_proto));
+        bucket.push_row(&row, line, t)?;
+        total_rows += 1;
     }
 
-    let num_docs = u64::from(doc_id);
-    if num_docs == 0 {
+    if total_rows == 0 {
         bail!("no data rows in {}", input.display());
     }
 
-    let mut writer = DiskShardWriter::new(output, (time_min, time_max))
-        .with_context(|| format!("create writer at {}", output.display()))?;
-    for col in metrics {
-        writer
-            .add_metric(&col.name, col.values)
-            .with_context(|| format!("add metric {:?}", col.name))?;
+    let mut written: u64 = 0;
+    for (key, bucket) in buckets {
+        let shard_dir = opts.shard_by.output_dir(output, key);
+        written += bucket.finalize(&shard_dir)?;
     }
-    for col in strings {
-        writer
-            .add_string_field(&col.name, col.postings)
-            .with_context(|| format!("add string field {:?}", col.name))?;
-    }
-    writer
-        .finalize()
-        .with_context(|| format!("finalize {}", output.display()))?;
-
-    Ok(num_docs)
+    Ok(written)
 }
 
 /// Reject before opening the CSV — failing after parsing millions of
@@ -185,6 +203,108 @@ struct StringCol {
     name: String,
     col_idx: usize,
     postings: BTreeMap<String, RoaringBitmap>,
+}
+
+/// One in-progress shard's accumulators. Built from prototype
+/// `MetricCol` / `StringCol` arrays so every bucket inherits the same
+/// names + column indexes; data structures start empty.
+struct BucketBuilder {
+    metrics: Vec<MetricCol>,
+    strings: Vec<StringCol>,
+    time_min: i64,
+    time_max: i64,
+    doc_id: u32,
+}
+
+impl BucketBuilder {
+    fn new(metrics_proto: &[MetricCol], strings_proto: &[StringCol]) -> Self {
+        Self {
+            metrics: metrics_proto
+                .iter()
+                .map(|m| MetricCol {
+                    name: m.name.clone(),
+                    col_idx: m.col_idx,
+                    values: Vec::new(),
+                })
+                .collect(),
+            strings: strings_proto
+                .iter()
+                .map(|s| StringCol {
+                    name: s.name.clone(),
+                    col_idx: s.col_idx,
+                    postings: BTreeMap::new(),
+                })
+                .collect(),
+            time_min: i64::MAX,
+            time_max: i64::MIN,
+            doc_id: 0,
+        }
+    }
+
+    fn push_row(&mut self, row: &csv::StringRecord, line: u64, t: i64) -> Result<()> {
+        self.time_min = self.time_min.min(t);
+        self.time_max = self.time_max.max(t);
+
+        for col in &mut self.metrics {
+            let raw = row
+                .get(col.col_idx)
+                .with_context(|| format!("line {line}: missing metric column"))?;
+            let value: i64 = raw.parse().with_context(|| {
+                format!(
+                    "line {line}: metric column {:?} value {raw:?}: only int64 values are \
+                     supported (multiply decimal values by 100 etc. and round)",
+                    col.name,
+                )
+            })?;
+            col.values.push(value);
+        }
+
+        for col in &mut self.strings {
+            let term = row
+                .get(col.col_idx)
+                .with_context(|| format!("line {line}: missing string column"))?;
+            // Look up first to avoid allocating a fresh String for terms
+            // that already exist — low-cardinality columns repeat heavily.
+            if let Some(bm) = col.postings.get_mut(term) {
+                bm.insert(self.doc_id);
+            } else {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(self.doc_id);
+                col.postings.insert(term.to_string(), bm);
+            }
+        }
+
+        self.doc_id = self
+            .doc_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("line {line}: doc ID overflow (> u32::MAX rows)"))?;
+        Ok(())
+    }
+
+    fn finalize(self, output_dir: &Path) -> Result<u64> {
+        // Buckets are only created on first push_row, so doc_id is
+        // always >= 1 here. Catch a refactor that breaks that
+        // invariant before time_min/time_max (MAX/MIN) reach
+        // Metadata::validate.
+        debug_assert!(self.doc_id > 0, "finalize called on empty BucketBuilder");
+        let num_docs = u64::from(self.doc_id);
+        let mut writer = DiskShardWriter::new(output_dir, (self.time_min, self.time_max))
+            .with_context(|| format!("create writer at {}", output_dir.display()))?;
+        for col in self.metrics {
+            writer
+                .add_metric(&col.name, col.values)
+                .with_context(|| format!("add metric {:?}", col.name))?;
+        }
+        for col in self.strings {
+            writer
+                .add_string_field(&col.name, col.postings)
+                .with_context(|| format!("add string field {:?}", col.name))?;
+        }
+        writer
+            .finalize()
+            .with_context(|| format!("finalize {}", output_dir.display()))?;
+        Ok(num_docs)
+    }
 }
 
 /// Which time parser matched. Cached across rows so the hot path skips
@@ -254,6 +374,21 @@ mod tests {
             metrics: metrics.iter().map(|s| (*s).to_string()).collect(),
             strings: strings.iter().map(|s| (*s).to_string()).collect(),
             delimiter: b',',
+            shard_by: ShardBy::None,
+        }
+    }
+
+    fn opts_daily(time: &str, metrics: &[&str], strings: &[&str]) -> IngestOptions {
+        IngestOptions {
+            shard_by: ShardBy::Bucket { seconds: 86_400 },
+            ..opts(time, metrics, strings)
+        }
+    }
+
+    fn opts_hourly(time: &str, metrics: &[&str], strings: &[&str]) -> IngestOptions {
+        IngestOptions {
+            shard_by: ShardBy::Bucket { seconds: 3600 },
+            ..opts(time, metrics, strings)
         }
     }
 
@@ -448,5 +583,142 @@ mod tests {
         ingest_csv(&input, &shard_dir, &opts("pickup", &["x"], &[])).expect("ingest");
         let shard = DiskShard::open(&shard_dir).expect("open");
         assert_eq!(shard.time_range(), (100, 900));
+    }
+
+    // 2023-01-01T00:00:00Z, 2023-01-02T00:00:00Z, 2023-01-03T00:00:00Z
+    // are 1672531200, 1672617600, 1672704000.
+    const DAY_0: i64 = 1_672_531_200;
+    const DAY_1: i64 = 1_672_617_600;
+    const DAY_2: i64 = 1_672_704_000;
+
+    #[test]
+    fn ingest_csv_shard_by_daily_produces_one_shard_per_day() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {DAY_0},10\n\
+                 {d0_late},20\n\
+                 {DAY_1},30\n\
+                 {DAY_2},40\n\
+                 {DAY_2},50\n",
+                d0_late = DAY_0 + 3600,
+            ),
+        );
+        let root = tmp.path().join("dataset");
+        let n = ingest_csv(&input, &root, &opts_daily("pickup", &["x"], &[])).expect("ingest");
+        assert_eq!(n, 5);
+
+        assert!(root.join("2023-01-01").is_dir(), "{root:?}");
+        assert!(root.join("2023-01-02").is_dir());
+        assert!(root.join("2023-01-03").is_dir());
+
+        let s0 = DiskShard::open(&root.join("2023-01-01")).expect("open day 0");
+        assert_eq!(s0.num_docs(), 2);
+        assert_eq!(s0.forward_column("x").unwrap(), &[10, 20]);
+        let s1 = DiskShard::open(&root.join("2023-01-02")).expect("open day 1");
+        assert_eq!(s1.num_docs(), 1);
+        assert_eq!(s1.forward_column("x").unwrap(), &[30]);
+        let s2 = DiskShard::open(&root.join("2023-01-03")).expect("open day 2");
+        assert_eq!(s2.num_docs(), 2);
+        assert_eq!(s2.forward_column("x").unwrap(), &[40, 50]);
+    }
+
+    #[test]
+    fn ingest_csv_shard_by_hourly_produces_one_shard_per_hour() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {DAY_0},1\n\
+                 {h1},2\n\
+                 {h2},3\n",
+                h1 = DAY_0 + 3600,
+                h2 = DAY_0 + 7200,
+            ),
+        );
+        let root = tmp.path().join("dataset");
+        ingest_csv(&input, &root, &opts_hourly("pickup", &["x"], &[])).expect("ingest");
+
+        assert!(root.join("2023-01-01T00").is_dir(), "{root:?}");
+        assert!(root.join("2023-01-01T01").is_dir());
+        assert!(root.join("2023-01-01T02").is_dir());
+    }
+
+    #[test]
+    fn ingest_csv_shard_by_daily_handles_midnight_boundary() {
+        // A row at exactly the start of a day belongs to that day,
+        // not the previous one (div_euclid semantics).
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {last_sec_of_day_0},1\n\
+                 {DAY_1},2\n",
+                last_sec_of_day_0 = DAY_1 - 1,
+            ),
+        );
+        let root = tmp.path().join("dataset");
+        ingest_csv(&input, &root, &opts_daily("pickup", &["x"], &[])).expect("ingest");
+        assert!(root.join("2023-01-01").is_dir(), "{root:?}");
+        assert!(root.join("2023-01-02").is_dir());
+
+        let s0 = DiskShard::open(&root.join("2023-01-01")).expect("open");
+        assert_eq!(s0.num_docs(), 1);
+        let s1 = DiskShard::open(&root.join("2023-01-02")).expect("open");
+        assert_eq!(s1.num_docs(), 1);
+    }
+
+    #[test]
+    fn ingest_csv_shard_by_isolates_string_postings() {
+        // Term "us" appears only in day-0 rows; "de" only in day-1.
+        // Each shard's inverted index should reflect only its own
+        // bucket, with the other term absent.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,country,x\n\
+                 {DAY_0},us,10\n\
+                 {DAY_0},us,20\n\
+                 {DAY_1},de,30\n\
+                 {DAY_1},de,40\n",
+            ),
+        );
+        let root = tmp.path().join("dataset");
+        ingest_csv(&input, &root, &opts_daily("pickup", &["x"], &["country"])).expect("ingest");
+
+        let s0 = DiskShard::open(&root.join("2023-01-01")).expect("open");
+        let idx0 = s0.inverted_index("country").expect("country idx");
+        assert!(idx0.lookup("us").is_some(), "us in day 0");
+        assert!(idx0.lookup("de").is_none(), "de absent from day 0");
+
+        let s1 = DiskShard::open(&root.join("2023-01-02")).expect("open");
+        let idx1 = s1.inverted_index("country").expect("country idx");
+        assert!(idx1.lookup("de").is_some(), "de in day 1");
+        assert!(idx1.lookup("us").is_none(), "us absent from day 1");
+    }
+
+    #[test]
+    fn ingest_csv_shard_by_none_unchanged() {
+        // Round-trip: with shard_by=None (the default opts()), the
+        // shard lands directly at `output`, not under a date subdir.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {DAY_0},10\n\
+                 {DAY_2},20\n",
+            ),
+        );
+        let shard_dir = tmp.path().join("shard");
+        ingest_csv(&input, &shard_dir, &opts("pickup", &["x"], &[])).expect("ingest");
+        let shard = DiskShard::open(&shard_dir).expect("open");
+        assert_eq!(shard.num_docs(), 2);
+        assert_eq!(shard.time_range(), (DAY_0, DAY_2));
     }
 }

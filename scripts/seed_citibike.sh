@@ -69,7 +69,7 @@ with open(sys.argv[1]) as fin, open(sys.argv[2], "w") as fout:
 PY
 fi
 
-echo ">>> ingesting into $OUT_DIR"
+echo ">>> ingesting into $OUT_DIR (one shard per day)"
 cargo run --release --quiet --bin t9n -- ingest "$CSV_DUR" \
     --output "$OUT_DIR" \
     --time started_at \
@@ -77,17 +77,19 @@ cargo run --release --quiet --bin t9n -- ingest "$CSV_DUR" \
     --string rideable_type \
     --string member_casual \
     --string start_station_id \
-    --string end_station_id
+    --string end_station_id \
+    --shard-by daily
 
 cat <<EOF
 
-shard ready at: $OUT_DIR
+dataset ready at: $OUT_DIR
+  (one shard per day: $OUT_DIR/YYYY-MM-DD/)
 
 try:
-  cargo run --release --bin t9n -- shard inspect $OUT_DIR
-  cargo run --release --bin t9n -- shard query $OUT_DIR --metric trip_seconds
-  cargo run --release --bin t9n -- shard query $OUT_DIR \\
+  cargo run --release --bin t9n -- shard inspect $OUT_DIR/2023-01-01
+  cargo run --release --bin t9n -- query $OUT_DIR --metric trip_seconds
+  cargo run --release --bin t9n -- query $OUT_DIR \\
       --filter member_casual=member --metric trip_seconds
-  cargo run --release --bin t9n -- shard query $OUT_DIR \\
+  cargo run --release --bin t9n -- query $OUT_DIR \\
       --filter rideable_type=electric_bike --metric trip_seconds
 EOF
