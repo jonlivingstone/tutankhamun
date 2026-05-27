@@ -106,6 +106,19 @@ impl ShardSource for ObjectStoreShardSource {
     }
 }
 
+/// Render a `--from`/`--to` epoch for human display. `i64::MIN` and
+/// `i64::MAX` come from the "unspecified bound" sentinel used by the
+/// CLI; they'd otherwise round-trip through chrono as
+/// `(out of range)`, which is honest but ugly. Display them as
+/// `(unbounded)` so the user sees the actual semantic.
+fn format_bound(epoch: i64) -> String {
+    if epoch == i64::MIN || epoch == i64::MAX {
+        "(unbounded)".to_string()
+    } else {
+        crate::shard::format_timestamp(epoch)
+    }
+}
+
 /// Return the directory containing `path` as a new [`Path`]. Empty if
 /// `path` has zero or one segments.
 fn parent_path(path: &Path) -> Path {
@@ -160,6 +173,12 @@ impl ShardManager {
 /// `root` (a local directory) and write a human-readable aggregate to
 /// `out`. Used by the top-level `t9n query` CLI verb.
 ///
+/// When `time_range` is `Some((from, to))`, shards whose
+/// `[time_range_start, time_range_end]` window does not intersect
+/// `[from, to]` are pruned via [`ShardSummary::intersects_time_range`]
+/// before any are opened — the operational win that time-bucketed
+/// ingest exists to enable.
+///
 /// Discovery uses [`ObjectStoreShardSource`] backed by a local-filesystem
 /// `object_store` rooted at `root`; remote backends are not yet supported
 /// (that needs the local hot-storage cache).
@@ -167,6 +186,7 @@ pub async fn query_dataset(
     root: &std::path::Path,
     filter: Option<(&str, &str)>,
     metric: &str,
+    time_range: Option<(i64, i64)>,
     out: &mut dyn std::io::Write,
 ) -> Result<()> {
     use anyhow::Context as _;
@@ -180,11 +200,38 @@ pub async fn query_dataset(
         .map_err(|()| anyhow::anyhow!("{} is not a valid directory path", root.display()))?;
     let registry = crate::storage::StorageRegistry::from_url(url.as_str())?;
 
+    if let Some((from, to)) = time_range
+        && from > to
+    {
+        // Swapped bounds quietly returns shards that *span* both
+        // bounds (because the predicate is `shard.start <= end &&
+        // shard.end >= start`), not the empty set a user would expect
+        // — refuse the call rather than silently mislead.
+        anyhow::bail!("invalid time range: from must be <= to (got from={from}, to={to})");
+    }
+
     let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(registry.store()));
-    let summaries = source.discover().await?;
+    let all_summaries = source.discover().await?;
+    let summaries: Vec<&ShardSummary> = if let Some((from, to)) = time_range {
+        all_summaries
+            .iter()
+            .filter(|s| s.intersects_time_range(from, to))
+            .collect()
+    } else {
+        all_summaries.iter().collect()
+    };
+
+    writeln!(out, "dataset:  {}", root.display())?;
+    if let Some((from, to)) = time_range {
+        writeln!(
+            out,
+            "range:    {} .. {}",
+            format_bound(from),
+            format_bound(to),
+        )?;
+    }
 
     if summaries.is_empty() {
-        writeln!(out, "dataset:  {}", root.display())?;
         writeln!(out, "no shards found")?;
         return Ok(());
     }
@@ -199,7 +246,6 @@ pub async fn query_dataset(
         total.sum += r.sum;
     }
 
-    writeln!(out, "dataset:  {}", root.display())?;
     writeln!(out, "shards:   {} scanned", summaries.len())?;
     crate::shard::write_query_summary(out, filter, metric, &total)?;
     Ok(())
@@ -473,9 +519,15 @@ mod tests {
 
         // Filtered sum: us docs in shard-000 = 10+30 = 40, in shard-001 = 100+400 = 500.
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), Some(("country", "us")), "clicks", &mut buf)
-            .await
-            .expect("query dataset");
+        query_dataset(
+            tmp.path(),
+            Some(("country", "us")),
+            "clicks",
+            None,
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
         assert!(out.contains("shards:   2 scanned"), "{out}");
         assert!(out.contains("matched:  4 / 7 docs"), "{out}");
@@ -494,7 +546,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, "clicks", &mut buf)
+        query_dataset(tmp.path(), None, "clicks", None, &mut buf)
             .await
             .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
@@ -508,7 +560,7 @@ mod tests {
     async fn query_dataset_empty_dir_reports_no_shards() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, "clicks", &mut buf)
+        query_dataset(tmp.path(), None, "clicks", None, &mut buf)
             .await
             .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
@@ -522,11 +574,154 @@ mod tests {
         std::fs::write(&file_path, b"hello").expect("write");
 
         let mut buf = Vec::new();
-        let err = query_dataset(&file_path, None, "clicks", &mut buf)
+        let err = query_dataset(&file_path, None, "clicks", None, &mut buf)
             .await
             .expect_err("expected file-not-directory rejection");
         let msg = err.to_string();
         assert!(msg.contains("not a directory"), "{msg}");
+    }
+
+    /// Helper for the time-range tests: writes 5 single-day shards
+    /// under `<root>/day-N/` with time ranges (N*86400, N*86400 + 60)
+    /// and 1 doc of `clicks=10*(N+1)` per shard, for N in 0..5.
+    /// Returns the root path.
+    fn write_5_day_dataset(root: &std::path::Path) {
+        for n in 0u32..5 {
+            let shard = root.join(format!("day-{n}"));
+            let mut w = crate::shard::DiskShardWriter::new(
+                &shard,
+                (i64::from(n) * 86_400, i64::from(n) * 86_400 + 60),
+            )
+            .expect("new");
+            w.add_metric("clicks", vec![10 * i64::from(n + 1)])
+                .expect("add_metric");
+            w.finalize().expect("finalize");
+        }
+    }
+
+    #[tokio::test]
+    async fn query_dataset_with_range_keeps_intersecting_shards() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_5_day_dataset(tmp.path());
+        // Days 0..5 with values 10, 20, 30, 40, 50.
+        // Range covers days 1 and 2 (epoch 86400 .. 200000).
+        let mut buf = Vec::new();
+        query_dataset(
+            tmp.path(),
+            None,
+            "clicks",
+            Some((86_400, 200_000)),
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("range:"), "{out}");
+        assert!(out.contains("shards:   2 scanned"), "{out}");
+        // 20 + 30 = 50, summed across the 2 scanned shards.
+        assert!(out.contains("clicks:   sum = 50"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_with_from_only_keeps_shards_after() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_5_day_dataset(tmp.path());
+        // From day 3 onward; i64::MAX as the implicit upper bound.
+        let mut buf = Vec::new();
+        query_dataset(
+            tmp.path(),
+            None,
+            "clicks",
+            Some((3 * 86_400, i64::MAX)),
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("shards:   2 scanned"), "{out}"); // days 3 + 4
+        assert!(out.contains("clicks:   sum = 90"), "{out}"); // 40 + 50
+    }
+
+    #[tokio::test]
+    async fn query_dataset_with_to_only_keeps_shards_before() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_5_day_dataset(tmp.path());
+        // i64::MIN as the implicit lower bound, up to day 1 end.
+        let mut buf = Vec::new();
+        query_dataset(
+            tmp.path(),
+            None,
+            "clicks",
+            Some((i64::MIN, 86_400 + 60)),
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("shards:   2 scanned"), "{out}"); // days 0 + 1
+        assert!(out.contains("clicks:   sum = 30"), "{out}"); // 10 + 20
+    }
+
+    #[tokio::test]
+    async fn query_dataset_range_excluding_all_shards_reports_no_shards() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_5_day_dataset(tmp.path());
+        // Range strictly after day 4's window.
+        let mut buf = Vec::new();
+        query_dataset(
+            tmp.path(),
+            None,
+            "clicks",
+            Some((10 * 86_400, 11 * 86_400)),
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("range:"), "{out}");
+        assert!(out.contains("no shards found"), "{out}");
+        assert!(
+            !out.contains("shards:"),
+            "shouldn't print scanned count: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_dataset_rejects_inverted_range() {
+        // from > to would silently match shards spanning both bounds
+        // (not the empty set users expect from the closed interval),
+        // so the engine refuses it with a clear error rather than
+        // returning misleading data.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_5_day_dataset(tmp.path());
+        let mut buf = Vec::new();
+        let err = query_dataset(
+            tmp.path(),
+            None,
+            "clicks",
+            Some((200_000, 86_400)),
+            &mut buf,
+        )
+        .await
+        .expect_err("expected inverted-range rejection");
+        let msg = err.to_string();
+        assert!(msg.contains("from must be <= to"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn query_dataset_no_range_unchanged() {
+        // Regression guard: passing None preserves today's behaviour
+        // (every shard scanned, no time-range line in output).
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        write_5_day_dataset(tmp.path());
+        let mut buf = Vec::new();
+        query_dataset(tmp.path(), None, "clicks", None, &mut buf)
+            .await
+            .expect("query dataset");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("shards:   5 scanned"), "{out}");
+        assert!(out.contains("clicks:   sum = 150"), "{out}"); // 10+20+30+40+50
+        assert!(!out.contains("range:"), "{out}");
     }
 
     #[tokio::test]
@@ -535,7 +730,7 @@ mod tests {
         write_query_shard(&tmp.path().join("ok/shard-000"), vec![1, 2, 3], &[0], &[]);
 
         let mut buf = Vec::new();
-        let err = query_dataset(tmp.path(), None, "no_such_metric", &mut buf)
+        let err = query_dataset(tmp.path(), None, "no_such_metric", None, &mut buf)
             .await
             .expect_err("expected error from missing metric in one of the shards");
         // `{:#}` renders the full anyhow chain (with_context wraps the

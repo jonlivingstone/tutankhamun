@@ -674,7 +674,8 @@ pub fn inspect(path: &Path, out: &mut dyn io::Write) -> Result<()> {
     Ok(())
 }
 
-fn format_timestamp(secs: i64) -> String {
+#[must_use]
+pub fn format_timestamp(secs: i64) -> String {
     DateTime::from_timestamp(secs, 0)
         .map_or_else(|| "(out of range)".to_string(), |t| t.to_rfc3339())
 }

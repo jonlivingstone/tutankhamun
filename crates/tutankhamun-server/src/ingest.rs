@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use roaring::RoaringBitmap;
 
 use crate::shard::DiskShardWriter;
@@ -314,6 +314,7 @@ enum TimeFormat {
     Epoch,
     Rfc3339,
     Naive,
+    Date,
 }
 
 /// Three-way time parsing: unix epoch seconds, RFC 3339, or
@@ -323,6 +324,7 @@ enum TimeFormat {
 /// full detection chain on miss so mixed-format inputs still work.
 ///
 /// **Caveats** worth surfacing to users:
+///
 /// - Epoch is tried first. Bare integers like `"20231114"` (YYYYMMDD)
 ///   parse as a Unix epoch (~1970-08-22), not the intended date.
 ///   Preprocess such columns to epoch seconds or an ISO-8601 string.
@@ -334,14 +336,19 @@ fn parse_time(s: &str, hint: Option<TimeFormat>) -> Result<(i64, TimeFormat)> {
     {
         return Ok((t, h));
     }
-    for fmt in [TimeFormat::Epoch, TimeFormat::Rfc3339, TimeFormat::Naive] {
+    for fmt in [
+        TimeFormat::Epoch,
+        TimeFormat::Rfc3339,
+        TimeFormat::Naive,
+        TimeFormat::Date,
+    ] {
         if let Some(t) = try_parse(s, fmt) {
             return Ok((t, fmt));
         }
     }
     bail!(
-        "unrecognized time format (expected unix epoch seconds, RFC 3339, or \
-         'YYYY-MM-DD HH:MM:SS')"
+        "unrecognized time format (expected unix epoch seconds, RFC 3339, \
+         'YYYY-MM-DD HH:MM:SS', or 'YYYY-MM-DD')"
     )
 }
 
@@ -354,7 +361,27 @@ fn try_parse(s: &str, fmt: TimeFormat) -> Option<i64> {
         TimeFormat::Naive => NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
             .ok()
             .map(|naive| naive.and_utc().timestamp()),
+        TimeFormat::Date => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|dt| dt.and_utc().timestamp()),
     }
+}
+
+/// One-shot CLI-friendly time parse. Wraps [`parse_time`] for callers
+/// that don't need the format-hint cache (e.g. parsing `--from` /
+/// `--to` arguments once per invocation).
+pub fn parse_time_str(s: &str) -> Result<i64> {
+    parse_time(s, None).map(|(t, _)| t)
+}
+
+/// Returns the start-of-day epoch if `s` is a bare `YYYY-MM-DD`
+/// date, or `None` otherwise. Single-source the date format so
+/// callers that want end-of-day semantics (e.g. `--to`'s
+/// inclusive-day bump) don't have to re-parse with chrono themselves.
+#[must_use]
+pub fn parse_date_only(s: &str) -> Option<i64> {
+    try_parse(s, TimeFormat::Date)
 }
 
 #[cfg(test)]
@@ -461,6 +488,18 @@ mod tests {
             parse_time("2023-11-14T22:13:20+00:00", None).unwrap().0,
             1_700_000_000
         );
+    }
+
+    #[test]
+    fn ingest_csv_parses_date_only_as_start_of_day() {
+        // Date-only inputs parse as start-of-day UTC. Used by `t9n
+        // query --from 2023-01-08`-style CLI args.
+        assert_eq!(parse_time("2023-01-01", None).unwrap().0, DAY_0);
+        // 2023-11-14T00:00:00Z
+        assert_eq!(parse_time("2023-11-14", None).unwrap().0, 1_699_920_000);
+        // parse_time_str (the CLI-friendly wrapper) returns the
+        // same value.
+        assert_eq!(parse_time_str("2023-01-01").unwrap(), DAY_0);
     }
 
     #[test]

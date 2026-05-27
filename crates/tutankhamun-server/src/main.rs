@@ -38,7 +38,8 @@ enum Command {
     /// Shard inspection / maintenance.
     Shard(ShardArgs),
     /// Sum a metric column across every shard discovered under a
-    /// local directory, optionally restricted by a string-field term.
+    /// local directory, optionally restricted by a string-field term
+    /// and/or a time-range window.
     Query {
         /// Local directory containing one or more shards (anywhere
         /// underneath). Remote storage backends are not yet supported.
@@ -50,6 +51,18 @@ enum Command {
         /// shard).
         #[arg(long)]
         filter: Option<String>,
+        /// Inclusive lower bound of the time window — only shards
+        /// whose time range intersects `[from, to]` are scanned.
+        /// Accepts `YYYY-MM-DD` (start-of-day UTC), unix epoch
+        /// seconds, RFC 3339, or `YYYY-MM-DD HH:MM:SS` (UTC).
+        #[arg(long)]
+        from: Option<String>,
+        /// Inclusive upper bound of the time window. Same formats as
+        /// `--from`; a bare `YYYY-MM-DD` value is bumped to end-of-day
+        /// (`23:59:59Z`) so the named date is fully included. May be
+        /// omitted independently of `--from`.
+        #[arg(long)]
+        to: Option<String>,
     },
     /// Build one or more shards from a CSV/TSV input file.
     Ingest {
@@ -181,7 +194,15 @@ fn main() -> anyhow::Result<()> {
             dir,
             metric,
             filter,
-        } => run_query(dir, metric, filter.as_deref()),
+            from,
+            to,
+        } => run_query(
+            dir,
+            metric,
+            filter.as_deref(),
+            from.as_deref(),
+            to.as_deref(),
+        ),
         Command::Ingest {
             input,
             output,
@@ -219,14 +240,56 @@ fn run_ingest(
     Ok(())
 }
 
-fn run_query(dir: &std::path::Path, metric: &str, filter: Option<&str>) -> anyhow::Result<()> {
+fn run_query(
+    dir: &std::path::Path,
+    metric: &str,
+    filter: Option<&str>,
+    from: Option<&str>,
+    to: Option<&str>,
+) -> anyhow::Result<()> {
     let parsed = filter.map(parse_filter).transpose()?;
+    let time_range = parse_time_range(from, to)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    runtime.block_on(shard_source::query_dataset(dir, parsed, metric, &mut out))
+    runtime.block_on(shard_source::query_dataset(
+        dir, parsed, metric, time_range, &mut out,
+    ))
+}
+
+/// Resolve `--from` / `--to` into the closed interval expected by
+/// `query_dataset`. Returns `None` when both are absent (preserves
+/// today's "scan every shard" behaviour); otherwise the missing
+/// half is filled in with `i64::MIN` / `i64::MAX`.
+fn parse_time_range(from: Option<&str>, to: Option<&str>) -> anyhow::Result<Option<(i64, i64)>> {
+    use anyhow::Context as _;
+    if from.is_none() && to.is_none() {
+        return Ok(None);
+    }
+    let from = from
+        .map(ingest::parse_time_str)
+        .transpose()
+        .context("parse --from")?
+        .unwrap_or(i64::MIN);
+    let to = to
+        .map(parse_to_inclusive)
+        .transpose()
+        .context("parse --to")?
+        .unwrap_or(i64::MAX);
+    Ok(Some((from, to)))
+}
+
+/// `--to` accepts the same formats as `--from`, but a bare date is
+/// bumped to end-of-day (`23:59:59Z`) so `--to 2023-01-14` covers
+/// the whole of Jan 14 rather than stopping at midnight. Explicit
+/// datetimes pass through unchanged.
+fn parse_to_inclusive(s: &str) -> anyhow::Result<i64> {
+    if let Some(start_of_day) = ingest::parse_date_only(s) {
+        return Ok(start_of_day + 86_399);
+    }
+    ingest::parse_time_str(s)
 }
 
 fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
