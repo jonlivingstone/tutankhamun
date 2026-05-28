@@ -815,37 +815,90 @@ pub fn format_timestamp(secs: i64) -> String {
         .map_or_else(|| "(out of range)".to_string(), |t| t.to_rfc3339())
 }
 
+/// Which aggregate to display per metric. `query_shard` always
+/// computes sum/min/max during the scan; this just picks which one
+/// the display layer emits (avg is derived from sum + matched count
+/// at display time).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Aggregate {
+    #[default]
+    Sum,
+    Min,
+    Max,
+    Avg,
+}
+
+/// Per-metric aggregates from one shard (or accumulated across
+/// shards). `sum` adds across shards; `min`/`max` reduce; `avg` is
+/// computed at display time from `sum / matched` (composes correctly
+/// — averaging per-shard averages would be wrong).
+///
+/// `min`/`max` are `None` when no docs matched the metric (e.g.
+/// filter term not in the dictionary, or empty shard).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MetricAggregates {
+    pub sum: i128,
+    pub min: Option<i64>,
+    pub max: Option<i64>,
+}
+
+impl MetricAggregates {
+    fn merge_min(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.min(y)),
+            (x, None) | (None, x) => x,
+        }
+    }
+
+    fn merge_max(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+        match (a, b) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, None) | (None, x) => x,
+        }
+    }
+
+    /// Element-wise combine — used by the cross-shard reducer.
+    pub fn absorb(&mut self, other: &Self) {
+        self.sum += other.sum;
+        self.min = Self::merge_min(self.min, other.min);
+        self.max = Self::merge_max(self.max, other.max);
+    }
+}
+
 /// Per-shard result of [`query_shard`]. Aggregatable across shards:
-/// `num_docs` and `matched` add as `u64`; `sums` adds element-wise
-/// as `i128` (the slot order matches the `metrics` slice passed in).
+/// `num_docs` and `matched` add as `u64`; `aggregates` combines
+/// element-wise via [`MetricAggregates::absorb`] (the slot order
+/// matches the `metrics` slice passed in).
 #[derive(Debug, Clone, Default)]
 pub struct QueryResult {
     pub num_docs: u64,
     pub matched: u64,
-    pub sums: Vec<i128>,
+    pub aggregates: Vec<MetricAggregates>,
 }
 
 impl QueryResult {
-    /// Zero-initialised accumulator with `num_metrics` sum slots —
-    /// the cross-shard reducer's starting point. Centralises the
-    /// `sums.len() == metrics.len()` invariant.
+    /// Zero-initialised accumulator with `num_metrics` slots — the
+    /// cross-shard reducer's starting point. Centralises the
+    /// `aggregates.len() == metrics.len()` invariant.
     #[must_use]
     pub fn zeros(num_metrics: usize) -> Self {
         Self {
             num_docs: 0,
             matched: 0,
-            sums: vec![0; num_metrics],
+            aggregates: vec![MetricAggregates::default(); num_metrics],
         }
     }
 }
 
 /// Open the shard at `path`, optionally restrict to docs matching
-/// `filter = Some((field, term))`, and sum each named metric over the
-/// resulting doc set. Returns one sum per input metric in
-/// declaration order.
+/// `filter = Some((field, term))`, and compute sum/min/max for each
+/// named metric over the resulting doc set. Returns one
+/// [`MetricAggregates`] per input metric in declaration order. Avg is
+/// derived at display time from `sum / matched` so it composes
+/// correctly across shards.
 ///
-/// Accumulates into `i128` so each per-metric sum is overflow-free
-/// for any realistic shard.
+/// All three aggregates are computed in a single scan; picking which
+/// one(s) to display is the caller's job.
 pub fn query_shard(
     path: &Path,
     filter: Option<(&str, &str)>,
@@ -873,7 +926,7 @@ pub fn query_shard(
         })
         .collect::<Result<_>>()?;
 
-    let (matched, sums) = if let Some((field, term)) = filter {
+    let (matched, aggregates) = if let Some((field, term)) = filter {
         // String or Int field — both have an inverted index, but the
         // term encoding differs: String uses UTF-8 bytes directly,
         // Int parses the decimal term and encodes via encode_int_key.
@@ -892,56 +945,66 @@ pub fn query_shard(
             FieldKind::Metric => unreachable!("require_field rejected non-indexed kind"),
         };
         bm.map_or_else(
-            || (0u64, vec![0i128; cols.len()]),
+            || (0u64, vec![MetricAggregates::default(); cols.len()]),
             |bm| {
-                let m = bm.len();
-                // Per-column iteration: each metric scans the bitmap
-                // once over its own slice — cache-warm and trivially
-                // parallelisable later if profiling demands it.
-                let s: Vec<i128> = cols
+                let aggs: Vec<MetricAggregates> = cols
                     .iter()
-                    .map(|col| bm.iter().map(|d| i128::from(col[d as usize])).sum())
+                    .map(|col| aggregate_iter(bm.iter().map(|d| col[d as usize])))
                     .collect();
-                (m, s)
+                (bm.len(), aggs)
             },
         )
     } else {
-        let sums: Vec<i128> = cols
+        let aggs: Vec<MetricAggregates> = cols
             .iter()
-            .map(|col| col.iter().copied().map(i128::from).sum())
+            .map(|col| aggregate_iter(col.iter().copied()))
             .collect();
-        (metadata.num_docs, sums)
+        (metadata.num_docs, aggs)
     };
 
     Ok(QueryResult {
         num_docs: metadata.num_docs,
         matched,
-        sums,
+        aggregates,
     })
 }
 
-/// Used by the `t9n shard query` CLI subcommand.
-pub fn query(
-    path: &Path,
-    filter: Option<(&str, &str)>,
-    metrics: &[&str],
-    out: &mut dyn io::Write,
-) -> Result<()> {
-    let result = query_shard(path, filter, metrics)?;
-    writeln!(out, "shard:    {}", path.display())?;
-    write_query_summary(out, filter, metrics, &result)?;
-    Ok(())
+/// Empty iterator yields `MetricAggregates::default()` (sum=0,
+/// min/max=None) — the contract `format_aggregate` relies on to render
+/// "n/a" for empty matches.
+fn aggregate_iter(values: impl Iterator<Item = i64>) -> MetricAggregates {
+    let mut iter = values;
+    let Some(first) = iter.next() else {
+        return MetricAggregates::default();
+    };
+    let mut sum = i128::from(first);
+    let mut min = first;
+    let mut max = first;
+    for v in iter {
+        sum += i128::from(v);
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    MetricAggregates {
+        sum,
+        min: Some(min),
+        max: Some(max),
+    }
 }
 
-/// Emit the shared "filter / matched / metric sums" block used by
-/// both the single-shard ([`query`]) and dataset-wide
-/// (`shard_source::query_dataset`) CLI verbs. Callers are responsible
-/// for printing whatever header they want above it. Per-metric lines
-/// are padded to the longest metric name for column alignment.
+/// Emit the shared "filter / matched / metric aggregates" block used
+/// by both the single-shard and dataset-wide CLI verbs. Callers print
+/// whatever header they want above it. Per-metric lines show the
+/// chosen aggregate, padded to the longest metric name.
 pub fn write_query_summary(
     out: &mut dyn io::Write,
     filter: Option<(&str, &str)>,
     metrics: &[&str],
+    aggregate: Aggregate,
     result: &QueryResult,
 ) -> io::Result<()> {
     if let Some((field, term)) = filter {
@@ -954,22 +1017,44 @@ pub fn write_query_summary(
     } else {
         writeln!(out, "matched:  all {} docs", result.num_docs)?;
     }
-    // Pad label to longest-metric + colon, then three literal spaces
-    // before "sum" — same gap as the previous single-metric output
-    // ("{metric}:   sum = N"), so existing single-metric output is
-    // unchanged and multi-metric output aligns into a column.
     let widest = metrics.iter().map(|m| m.len()).max().unwrap_or(0);
+    let op_name = match aggregate {
+        Aggregate::Sum => "sum",
+        Aggregate::Min => "min",
+        Aggregate::Max => "max",
+        Aggregate::Avg => "avg",
+    };
     for (i, m) in metrics.iter().enumerate() {
         let label = format!("{m}:");
+        let value = format_aggregate(aggregate, &result.aggregates[i], result.matched);
         writeln!(
             out,
-            "{:<width$}   sum = {}",
+            "{:<width$}   {op_name} = {value}",
             label,
-            result.sums[i],
             width = widest + 1
         )?;
     }
     Ok(())
+}
+
+/// Render a single metric's aggregate value. `min`/`max`/`avg` are
+/// "n/a" when no docs matched (the underlying min/max are `None`,
+/// avg has zero denominator).
+fn format_aggregate(op: Aggregate, agg: &MetricAggregates, matched: u64) -> String {
+    match op {
+        Aggregate::Sum => agg.sum.to_string(),
+        Aggregate::Min => agg.min.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        Aggregate::Max => agg.max.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
+        Aggregate::Avg => {
+            if matched == 0 {
+                "n/a".to_string()
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let avg = (agg.sum as f64) / (matched as f64);
+                format!("{avg:.2}")
+            }
+        }
+    }
 }
 
 /// Verify that `name` is declared in `metadata.fields` and has one

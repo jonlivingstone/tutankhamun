@@ -3,7 +3,7 @@
 //! Single binary with subcommands. `t9n serve` runs the daemon; `t9n storage`
 //! groups operator commands for the storage backend.
 
-use std::io;
+use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +16,7 @@ use tutankhamun_server::ingest::{self, IngestOptions, ShardBy};
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard;
+use tutankhamun_server::shard::Aggregate;
 use tutankhamun_server::shard_source::{
     self, ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
 };
@@ -37,17 +38,23 @@ enum Command {
     Storage(StorageArgs),
     /// Shard inspection / maintenance.
     Shard(ShardArgs),
-    /// Sum one or more metric columns across every shard discovered
-    /// under a local directory, optionally restricted by a
+    /// Aggregate one or more metric columns across every shard
+    /// discovered under a local directory, optionally restricted by a
     /// string-field term and/or a time-range window.
     Query {
         /// Local directory containing one or more shards (anywhere
         /// underneath). Remote storage backends are not yet supported.
         dir: PathBuf,
-        /// Metric column to sum. Repeatable — one sum per metric is
-        /// returned in declaration order. At least one required.
+        /// Metric column to aggregate. Repeatable — one line per
+        /// metric is returned in declaration order. At least one
+        /// required.
         #[arg(long = "metric", required = true)]
         metrics: Vec<String>,
+        /// Aggregate to compute per metric. Default `sum`. Accepts
+        /// `sum`, `min`, `max`, `avg`. `min`/`max`/`avg` display
+        /// `n/a` when no docs matched.
+        #[arg(long, value_enum, default_value_t = Aggregate::Sum)]
+        aggregate: Aggregate,
         /// Optional `<field>=<term>` restriction (applied to every
         /// shard).
         #[arg(long)]
@@ -156,16 +163,21 @@ enum ShardCommand {
         )]
         url: String,
     },
-    /// Sum one or more metric columns over the docs in a shard,
+    /// Aggregate one or more metric columns over the docs in a shard,
     /// optionally restricted to those matching a single string-field
     /// term.
     Query {
         /// Path to the shard directory.
         path: PathBuf,
-        /// Metric column to sum. Repeatable — one sum per metric is
-        /// returned in declaration order. At least one required.
+        /// Metric column to aggregate. Repeatable — one line per
+        /// metric is returned in declaration order. At least one
+        /// required.
         #[arg(long = "metric", required = true)]
         metrics: Vec<String>,
+        /// Aggregate to compute per metric. Default `sum`. Accepts
+        /// `sum`, `min`, `max`, `avg`.
+        #[arg(long, value_enum, default_value_t = Aggregate::Sum)]
+        aggregate: Aggregate,
         /// Optional `<field>=<term>` restriction.
         #[arg(long)]
         filter: Option<String>,
@@ -203,12 +215,14 @@ fn main() -> anyhow::Result<()> {
         Command::Query {
             dir,
             metrics,
+            aggregate,
             filter,
             from,
             to,
         } => run_query(
             dir,
             metrics,
+            *aggregate,
             filter.as_deref(),
             from.as_deref(),
             to.as_deref(),
@@ -260,6 +274,7 @@ fn run_ingest(
 fn run_query(
     dir: &std::path::Path,
     metrics: &[String],
+    aggregate: Aggregate,
     filter: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
@@ -271,15 +286,16 @@ fn run_query(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    runtime.block_on(shard_source::query_dataset(
+    let output = runtime.block_on(shard_source::query_dataset(
         dir,
         parsed,
         &metric_refs,
         time_range,
-        &mut out,
-    ))
+    ))?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    shard_source::render_dataset_query_output(&mut out, &output, parsed, &metric_refs, aggregate)?;
+    Ok(())
 }
 
 /// Resolve `--from` / `--to` into the closed interval expected by
@@ -427,14 +443,18 @@ fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
         ShardCommand::Query {
             path,
             metrics,
+            aggregate,
             filter,
         } => {
             // clap's `required = true` on `metrics` guarantees non-empty.
             let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
             let parsed = filter.as_deref().map(parse_filter).transpose()?;
+            let result = shard::query_shard(path, parsed, &metric_refs)?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
-            shard::query(path, parsed, &metric_refs, &mut out)
+            writeln!(out, "shard:    {}", path.display())?;
+            shard::write_query_summary(&mut out, parsed, &metric_refs, *aggregate, &result)?;
+            Ok(())
         }
     }
 }

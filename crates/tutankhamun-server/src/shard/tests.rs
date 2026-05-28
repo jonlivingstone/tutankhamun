@@ -21,6 +21,21 @@ fn write_string_shard(dir: &Path, field: &str, postings: BTreeMap<String, Roarin
     w.finalize().expect("finalize");
 }
 
+/// Test-only: mirrors what main.rs's single-shard CLI does so the
+/// existing text-shape assertions stay terse.
+fn query_cli(
+    path: &Path,
+    filter: Option<(&str, &str)>,
+    metrics: &[&str],
+    aggregate: Aggregate,
+    out: &mut dyn io::Write,
+) -> Result<()> {
+    let result = query_shard(path, filter, metrics)?;
+    writeln!(out, "shard:    {}", path.display())?;
+    write_query_summary(out, filter, metrics, aggregate, &result)?;
+    Ok(())
+}
+
 #[test]
 fn metadata_roundtrips_through_serde_json() {
     let m = Metadata {
@@ -382,12 +397,14 @@ fn query_shard_returns_one_sum_per_metric() {
         .expect("query_shard multi-metric");
     assert_eq!(r.num_docs, 5);
     assert_eq!(r.matched, 5);
-    assert_eq!(r.sums, vec![150, 1500]);
+    assert_eq!(r.aggregates[0].sum, 150);
+    assert_eq!(r.aggregates[1].sum, 1500);
 
     // Slot order follows input order — flipping the metrics flips the sums.
     let r = query_shard(tmp.path(), None, &["impressions", "clicks"])
         .expect("query_shard multi-metric reversed");
-    assert_eq!(r.sums, vec![1500, 150]);
+    assert_eq!(r.aggregates[0].sum, 1500);
+    assert_eq!(r.aggregates[1].sum, 150);
 }
 
 #[test]
@@ -403,7 +420,8 @@ fn query_shard_multi_metric_with_filter() {
     )
     .expect("query_shard multi-metric filtered");
     assert_eq!(r.matched, 3);
-    assert_eq!(r.sums, vec![90, 900]);
+    assert_eq!(r.aggregates[0].sum, 90);
+    assert_eq!(r.aggregates[1].sum, 900);
 }
 
 #[test]
@@ -426,13 +444,27 @@ fn query_sums_metric_filtered_by_term() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    query(tmp.path(), Some(("country", "us")), &["clicks"], &mut buf).expect("query us");
+    query_cli(
+        tmp.path(),
+        Some(("country", "us")),
+        &["clicks"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect("query us");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  3 / 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 90"), "{out}");
 
     let mut buf = Vec::new();
-    query(tmp.path(), Some(("country", "de")), &["clicks"], &mut buf).expect("query de");
+    query_cli(
+        tmp.path(),
+        Some(("country", "de")),
+        &["clicks"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect("query de");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  2 / 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 60"), "{out}");
@@ -444,7 +476,7 @@ fn query_no_filter_sums_all_docs() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    query(tmp.path(), None, &["clicks"], &mut buf).expect("query");
+    query_cli(tmp.path(), None, &["clicks"], Aggregate::Sum, &mut buf).expect("query");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  all 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 150"), "{out}");
@@ -457,7 +489,14 @@ fn query_missing_filter_term_is_zero() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    query(tmp.path(), Some(("country", "fr")), &["clicks"], &mut buf).expect("query fr");
+    query_cli(
+        tmp.path(),
+        Some(("country", "fr")),
+        &["clicks"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect("query fr");
     let out = String::from_utf8(buf).expect("utf-8");
     assert!(out.contains("matched:  0 / 5 docs"), "{out}");
     assert!(out.contains("clicks:   sum = 0"), "{out}");
@@ -469,8 +508,14 @@ fn query_rejects_unknown_metric() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), None, &["no_such_metric"], &mut buf)
-        .expect_err("expected unknown-metric error");
+    let err = query_cli(
+        tmp.path(),
+        None,
+        &["no_such_metric"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect_err("expected unknown-metric error");
     let msg = err.to_string();
     assert!(msg.contains("no_such_metric"), "{msg}");
 }
@@ -481,8 +526,8 @@ fn query_rejects_string_field_as_metric() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err =
-        query(tmp.path(), None, &["country"], &mut buf).expect_err("expected wrong-kind error");
+    let err = query_cli(tmp.path(), None, &["country"], Aggregate::Sum, &mut buf)
+        .expect_err("expected wrong-kind error");
     let msg = err.to_string();
     // The error names the offending field and the kinds that would
     // have been acceptable for a metric (metric or int).
@@ -498,8 +543,14 @@ fn query_rejects_unknown_filter_field() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), Some(("cuontry", "us")), &["clicks"], &mut buf)
-        .expect_err("expected unknown-field error");
+    let err = query_cli(
+        tmp.path(),
+        Some(("cuontry", "us")),
+        &["clicks"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect_err("expected unknown-field error");
     let msg = err.to_string();
     assert!(msg.contains("cuontry"), "{msg}");
 }
@@ -510,8 +561,14 @@ fn query_rejects_metric_field_as_filter() {
     write_query_fixture(tmp.path());
 
     let mut buf = Vec::new();
-    let err = query(tmp.path(), Some(("clicks", "10")), &["clicks"], &mut buf)
-        .expect_err("expected wrong-kind error");
+    let err = query_cli(
+        tmp.path(),
+        Some(("clicks", "10")),
+        &["clicks"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect_err("expected wrong-kind error");
     let msg = err.to_string();
     // The error names the offending field and the kinds that would
     // have been acceptable for a filter (string or int).
@@ -677,7 +734,7 @@ fn query_shard_accepts_int_as_metric() {
     let r = query_shard(tmp.path(), None, &["vendor_id"]).expect("query_shard");
     assert_eq!(r.num_docs, 4);
     assert_eq!(r.matched, 4);
-    assert_eq!(r.sums, vec![1 + 2 + 1 + 3]);
+    assert_eq!(r.aggregates[0].sum, i128::from(1 + 2 + 1 + 3));
 }
 
 #[test]
@@ -695,7 +752,8 @@ fn query_shard_int_field_used_as_both_filter_and_metric() {
     let r = query_shard(tmp.path(), Some(("vendor_id", "1")), &["vendor_id", "fare"])
         .expect("query_shard");
     assert_eq!(r.matched, 2);
-    assert_eq!(r.sums, vec![2, 400]);
+    assert_eq!(r.aggregates[0].sum, 2);
+    assert_eq!(r.aggregates[1].sum, 400);
 }
 
 #[test]
@@ -733,4 +791,116 @@ fn inspect_shows_int_field_row() {
     assert!(out.contains("vendor_id"), "{out}");
     assert!(out.contains("int"), "{out}");
     assert!(out.contains("forward+index (3 terms)"), "{out}");
+}
+
+#[test]
+fn query_shard_computes_min_max_in_single_scan() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("v", vec![10, -5, 30, 7, 22])
+        .expect("add_metric");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(tmp.path(), None, &["v"]).expect("query_shard");
+    let agg = &r.aggregates[0];
+    assert_eq!(agg.sum, 64);
+    assert_eq!(agg.min, Some(-5));
+    assert_eq!(agg.max, Some(30));
+}
+
+#[test]
+fn query_shard_min_max_under_filter() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("v", vec![10, -5, 30, 7, 22]).expect("metric");
+    w.add_int_field("g", vec![1, 1, 2, 1, 2]).expect("int");
+    w.finalize().expect("finalize");
+
+    // g=1 selects docs 0,1,3 -> values 10, -5, 7.
+    let r = query_shard(tmp.path(), Some(("g", "1")), &["v"]).expect("query_shard");
+    assert_eq!(r.matched, 3);
+    let agg = &r.aggregates[0];
+    assert_eq!(agg.sum, 12);
+    assert_eq!(agg.min, Some(-5));
+    assert_eq!(agg.max, Some(10));
+}
+
+#[test]
+fn query_shard_empty_match_yields_none_min_max() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("v", vec![1, 2, 3]).expect("metric");
+    w.add_string_field("c", BTreeMap::from([("us".to_string(), bitmap([0, 1, 2]))]))
+        .expect("string");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(tmp.path(), Some(("c", "fr")), &["v"]).expect("query_shard");
+    assert_eq!(r.matched, 0);
+    let agg = &r.aggregates[0];
+    assert_eq!(agg.sum, 0);
+    assert!(agg.min.is_none());
+    assert!(agg.max.is_none());
+}
+
+#[test]
+fn query_renders_min_max_avg() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("v", vec![10, 20, 30, 40]).expect("metric");
+    w.finalize().expect("finalize");
+
+    for (op, expected) in [
+        (Aggregate::Min, "min = 10"),
+        (Aggregate::Max, "max = 40"),
+        (Aggregate::Avg, "avg = 25.00"),
+    ] {
+        let mut buf = Vec::new();
+        query_cli(tmp.path(), None, &["v"], op, &mut buf).expect("query");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains(expected), "op={op:?} out={out}");
+    }
+}
+
+#[test]
+fn query_renders_n_a_when_no_match_for_min_max_avg() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("v", vec![1, 2, 3]).expect("metric");
+    w.add_string_field("c", BTreeMap::from([("us".to_string(), bitmap([0, 1, 2]))]))
+        .expect("string");
+    w.finalize().expect("finalize");
+
+    for op in [Aggregate::Min, Aggregate::Max, Aggregate::Avg] {
+        let mut buf = Vec::new();
+        query_cli(tmp.path(), Some(("c", "fr")), &["v"], op, &mut buf).expect("query");
+        let out = String::from_utf8(buf).expect("utf-8");
+        assert!(out.contains("= n/a"), "op={op:?} out={out}");
+    }
+}
+
+#[test]
+fn metric_aggregates_absorb_composes_min_max_avg_across_shards() {
+    let a = MetricAggregates {
+        sum: 60,
+        min: Some(10),
+        max: Some(40),
+    };
+    let b = MetricAggregates {
+        sum: 40,
+        min: Some(5),
+        max: Some(25),
+    };
+    let mut acc = a;
+    acc.absorb(&b);
+    assert_eq!(acc.sum, 100);
+    assert_eq!(acc.min, Some(5));
+    assert_eq!(acc.max, Some(40));
+
+    // None on one side is a no-op for that side (empty shard).
+    let empty = MetricAggregates::default();
+    let mut acc = a;
+    acc.absorb(&empty);
+    assert_eq!(acc.sum, 60);
+    assert_eq!(acc.min, Some(10));
+    assert_eq!(acc.max, Some(40));
 }

@@ -169,9 +169,33 @@ impl ShardManager {
     }
 }
 
+/// Structured result of a dataset-wide query — what `query_dataset`
+/// returns. Callers render this however they like (CLI text, Arrow
+/// batches, SQL result sets). `root` and `time_range` are always
+/// present; the scan outcome lives in [`DatasetQueryOutcome`].
+#[derive(Debug)]
+pub struct DatasetQueryOutput {
+    pub root: std::path::PathBuf,
+    pub time_range: Option<(i64, i64)>,
+    pub outcome: DatasetQueryOutcome,
+}
+
+/// What happened during the dataset scan. New variants (e.g.
+/// `PartialScanned` with per-shard errors) plug in without forcing
+/// existing callers to revisit the always-present fields.
+#[derive(Debug)]
+pub enum DatasetQueryOutcome {
+    /// No shards matched the time range, or none were discovered.
+    NoShards,
+    /// At least one shard was scanned and the results merged.
+    Scanned {
+        shards_scanned: std::num::NonZeroU64,
+        result: crate::shard::QueryResult,
+    },
+}
+
 /// Fan out [`shard::query_shard`] across every shard discovered under
-/// `root` (a local directory) and write a human-readable aggregate to
-/// `out`. Used by the top-level `t9n query` CLI verb.
+/// `root` (a local directory) and return the aggregated result.
 ///
 /// When `time_range` is `Some((from, to))`, shards whose
 /// `[time_range_start, time_range_end]` window does not intersect
@@ -187,8 +211,7 @@ pub async fn query_dataset(
     filter: Option<(&str, &str)>,
     metrics: &[&str],
     time_range: Option<(i64, i64)>,
-    out: &mut dyn std::io::Write,
-) -> Result<()> {
+) -> Result<DatasetQueryOutput> {
     use anyhow::Context as _;
 
     let root =
@@ -221,20 +244,13 @@ pub async fn query_dataset(
         all_summaries.iter().collect()
     };
 
-    writeln!(out, "dataset:  {}", root.display())?;
-    if let Some((from, to)) = time_range {
-        writeln!(
-            out,
-            "range:    {} .. {}",
-            format_bound(from),
-            format_bound(to),
-        )?;
-    }
-
-    if summaries.is_empty() {
-        writeln!(out, "no shards found")?;
-        return Ok(());
-    }
+    let Some(shards_scanned) = std::num::NonZeroU64::new(summaries.len() as u64) else {
+        return Ok(DatasetQueryOutput {
+            root,
+            time_range,
+            outcome: DatasetQueryOutcome::NoShards,
+        });
+    };
 
     let mut total = crate::shard::QueryResult::zeros(metrics.len());
     for summary in &summaries {
@@ -243,14 +259,50 @@ pub async fn query_dataset(
             .with_context(|| format!("query {}", shard_path.display()))?;
         total.num_docs += r.num_docs;
         total.matched += r.matched;
-        for (t, s) in total.sums.iter_mut().zip(&r.sums) {
-            *t += s;
+        for (t, s) in total.aggregates.iter_mut().zip(&r.aggregates) {
+            t.absorb(s);
         }
     }
 
-    writeln!(out, "shards:   {} scanned", summaries.len())?;
-    crate::shard::write_query_summary(out, filter, metrics, &total)?;
-    Ok(())
+    Ok(DatasetQueryOutput {
+        root,
+        time_range,
+        outcome: DatasetQueryOutcome::Scanned {
+            shards_scanned,
+            result: total,
+        },
+    })
+}
+
+/// Render a [`DatasetQueryOutput`] to `out` in the t9n CLI text shape.
+/// Single source of truth — main.rs and the test suite both call this
+/// so the format can't drift between them.
+pub fn render_dataset_query_output(
+    out: &mut dyn std::io::Write,
+    output: &DatasetQueryOutput,
+    filter: Option<(&str, &str)>,
+    metrics: &[&str],
+    aggregate: crate::shard::Aggregate,
+) -> std::io::Result<()> {
+    writeln!(out, "dataset:  {}", output.root.display())?;
+    if let Some((from, to)) = output.time_range {
+        writeln!(
+            out,
+            "range:    {} .. {}",
+            format_bound(from),
+            format_bound(to),
+        )?;
+    }
+    match &output.outcome {
+        DatasetQueryOutcome::NoShards => writeln!(out, "no shards found"),
+        DatasetQueryOutcome::Scanned {
+            shards_scanned,
+            result,
+        } => {
+            writeln!(out, "shards:   {shards_scanned} scanned")?;
+            crate::shard::write_query_summary(out, filter, metrics, aggregate, result)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +311,21 @@ mod tests {
     use crate::shard::{FieldKind, FieldSchema};
     use crate::storage::StorageRegistry;
     use object_store::PutPayload;
+
+    /// Test-only: mirrors what main.rs's dataset CLI does so the
+    /// existing text-shape assertions stay terse.
+    async fn query_dataset_cli(
+        root: &std::path::Path,
+        filter: Option<(&str, &str)>,
+        metrics: &[&str],
+        aggregate: crate::shard::Aggregate,
+        time_range: Option<(i64, i64)>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<()> {
+        let output = query_dataset(root, filter, metrics, time_range).await?;
+        render_dataset_query_output(out, &output, filter, metrics, aggregate)?;
+        Ok(())
+    }
 
     fn metadata(num_docs: u64, time_range: (i64, i64)) -> Metadata {
         Metadata {
@@ -521,10 +588,11 @@ mod tests {
 
         // Filtered sum: us docs in shard-000 = 10+30 = 40, in shard-001 = 100+400 = 500.
         let mut buf = Vec::new();
-        query_dataset(
+        query_dataset_cli(
             tmp.path(),
             Some(("country", "us")),
             &["clicks"],
+            crate::shard::Aggregate::Sum,
             None,
             &mut buf,
         )
@@ -548,9 +616,16 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, &["clicks"], None, &mut buf)
-            .await
-            .expect("query dataset");
+        query_dataset_cli(
+            tmp.path(),
+            None,
+            &["clicks"],
+            crate::shard::Aggregate::Sum,
+            None,
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
         assert!(out.contains("shards:   2 scanned"), "{out}");
         assert!(out.contains("matched:  all 7 docs"), "{out}");
@@ -562,9 +637,16 @@ mod tests {
     async fn query_dataset_empty_dir_reports_no_shards() {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, &["clicks"], None, &mut buf)
-            .await
-            .expect("query dataset");
+        query_dataset_cli(
+            tmp.path(),
+            None,
+            &["clicks"],
+            crate::shard::Aggregate::Sum,
+            None,
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
         assert!(out.contains("no shards found"), "{out}");
     }
@@ -576,9 +658,16 @@ mod tests {
         std::fs::write(&file_path, b"hello").expect("write");
 
         let mut buf = Vec::new();
-        let err = query_dataset(&file_path, None, &["clicks"], None, &mut buf)
-            .await
-            .expect_err("expected file-not-directory rejection");
+        let err = query_dataset_cli(
+            &file_path,
+            None,
+            &["clicks"],
+            crate::shard::Aggregate::Sum,
+            None,
+            &mut buf,
+        )
+        .await
+        .expect_err("expected file-not-directory rejection");
         let msg = err.to_string();
         assert!(msg.contains("not a directory"), "{msg}");
     }
@@ -608,10 +697,11 @@ mod tests {
         // Days 0..5 with values 10, 20, 30, 40, 50.
         // Range covers days 1 and 2 (epoch 86400 .. 200000).
         let mut buf = Vec::new();
-        query_dataset(
+        query_dataset_cli(
             tmp.path(),
             None,
             &["clicks"],
+            crate::shard::Aggregate::Sum,
             Some((86_400, 200_000)),
             &mut buf,
         )
@@ -630,10 +720,11 @@ mod tests {
         write_5_day_dataset(tmp.path());
         // From day 3 onward; i64::MAX as the implicit upper bound.
         let mut buf = Vec::new();
-        query_dataset(
+        query_dataset_cli(
             tmp.path(),
             None,
             &["clicks"],
+            crate::shard::Aggregate::Sum,
             Some((3 * 86_400, i64::MAX)),
             &mut buf,
         )
@@ -650,10 +741,11 @@ mod tests {
         write_5_day_dataset(tmp.path());
         // i64::MIN as the implicit lower bound, up to day 1 end.
         let mut buf = Vec::new();
-        query_dataset(
+        query_dataset_cli(
             tmp.path(),
             None,
             &["clicks"],
+            crate::shard::Aggregate::Sum,
             Some((i64::MIN, 86_400 + 60)),
             &mut buf,
         )
@@ -670,10 +762,11 @@ mod tests {
         write_5_day_dataset(tmp.path());
         // Range strictly after day 4's window.
         let mut buf = Vec::new();
-        query_dataset(
+        query_dataset_cli(
             tmp.path(),
             None,
             &["clicks"],
+            crate::shard::Aggregate::Sum,
             Some((10 * 86_400, 11 * 86_400)),
             &mut buf,
         )
@@ -705,9 +798,16 @@ mod tests {
         }
 
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, &["clicks", "impressions"], None, &mut buf)
-            .await
-            .expect("query dataset");
+        query_dataset_cli(
+            tmp.path(),
+            None,
+            &["clicks", "impressions"],
+            crate::shard::Aggregate::Sum,
+            None,
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
         assert!(out.contains("shards:   2 scanned"), "{out}");
         // 10+20+30+40+50 = 150
@@ -725,10 +825,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         write_5_day_dataset(tmp.path());
         let mut buf = Vec::new();
-        let err = query_dataset(
+        let err = query_dataset_cli(
             tmp.path(),
             None,
             &["clicks"],
+            crate::shard::Aggregate::Sum,
             Some((200_000, 86_400)),
             &mut buf,
         )
@@ -745,9 +846,16 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         write_5_day_dataset(tmp.path());
         let mut buf = Vec::new();
-        query_dataset(tmp.path(), None, &["clicks"], None, &mut buf)
-            .await
-            .expect("query dataset");
+        query_dataset_cli(
+            tmp.path(),
+            None,
+            &["clicks"],
+            crate::shard::Aggregate::Sum,
+            None,
+            &mut buf,
+        )
+        .await
+        .expect("query dataset");
         let out = String::from_utf8(buf).expect("utf-8");
         assert!(out.contains("shards:   5 scanned"), "{out}");
         assert!(out.contains("clicks:   sum = 150"), "{out}"); // 10+20+30+40+50
@@ -760,9 +868,16 @@ mod tests {
         write_query_shard(&tmp.path().join("ok/shard-000"), vec![1, 2, 3], &[0], &[]);
 
         let mut buf = Vec::new();
-        let err = query_dataset(tmp.path(), None, &["no_such_metric"], None, &mut buf)
-            .await
-            .expect_err("expected error from missing metric in one of the shards");
+        let err = query_dataset_cli(
+            tmp.path(),
+            None,
+            &["no_such_metric"],
+            crate::shard::Aggregate::Sum,
+            None,
+            &mut buf,
+        )
+        .await
+        .expect_err("expected error from missing metric in one of the shards");
         // `{:#}` renders the full anyhow chain (with_context wraps the
         // inner error, so the top-level Display only shows "query …").
         let msg = format!("{err:#}");
