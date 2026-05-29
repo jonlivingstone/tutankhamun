@@ -132,7 +132,8 @@ fn project_dirs() -> Option<&'static ProjectDirs> {
         .as_ref()
 }
 
-fn default_cache_dir() -> PathBuf {
+#[must_use]
+pub fn default_cache_dir() -> PathBuf {
     // Fallback only applies when the OS doesn't expose a home / data dir,
     // which is rare in practice but possible in minimal containers.
     project_dirs().map_or_else(

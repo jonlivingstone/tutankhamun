@@ -35,24 +35,24 @@ directly.
       in-memory) — §1.4
 - [x] Credential chain wiring (env, instance metadata, IRSA,
       Workload Identity, SSO) — no hardcoded credentials — §1.4
-- [ ] Local hot-storage cache — directory creation, XDG defaults
+- [x] Local hot-storage cache — directory creation, XDG defaults
       via `directories` crate — §1.5
-- [ ] Cache size enforcement (`--cache-size` accepts `100GB` /
+- [x] Cache size enforcement (`--cache-size` accepts `100GB` /
       `50%` / etc.) with 10 GB default — §1.5
 - [ ] Cache 5 %-free-space floor with `--cache-min-free-pct`
       override — §1.5
-- [ ] LRU eviction — §1.5
+- [x] LRU eviction — §1.5
 - [ ] `--pin-datasets` always-keep flag — §1.5
-- [ ] Persistent cache across restarts (scan cache dir, register
+- [x] Persistent cache across restarts (scan cache dir, register
       existing files) — §1.5
-- [ ] Content-hash validation on shard load — §1.5
+- [x] Content-hash validation on shard load — §1.5
 - [ ] Configurable hot-set pre-warm (`--prewarm`) — §1.5
 
 ## Engine — storage format (shards)
 
 - [x] Shard directory layout (`metadata.json`, `metrics.arrow`,
       `postings/<field>.fst`, `postings/<field>.posting`) — §2.1
-- [ ] `metadata.json` schema (Arrow schema, numDocs, time range,
+- [x] `metadata.json` schema (Arrow schema, numDocs, time range,
       format version, content hashes) — §2.1
 - [x] Forward column writer — uncompressed single-batch Arrow IPC
       via `arrow-rs` — §2.1

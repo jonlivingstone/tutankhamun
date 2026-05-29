@@ -106,6 +106,38 @@ impl ShardSource for ObjectStoreShardSource {
     }
 }
 
+/// Turn a user-supplied dataset source (a bare path or an
+/// `object_store` URL like `s3://bucket/dataset`) into a URL ready
+/// for [`query_dataset`]. Bare paths are canonicalised and converted
+/// to `file://`; the path must point at an existing directory.
+pub fn resolve_source_url(source: &str) -> Result<String> {
+    use anyhow::Context as _;
+    if source.contains("://") {
+        return Ok(source.to_string());
+    }
+    let canonical = std::fs::canonicalize(source).with_context(|| format!("resolve {source}"))?;
+    if !canonical.is_dir() {
+        anyhow::bail!("{} is not a valid directory path", canonical.display());
+    }
+    let url = url::Url::from_directory_path(&canonical)
+        .map_err(|()| anyhow::anyhow!("{} is not a valid directory path", canonical.display()))?;
+    Ok(url.to_string())
+}
+
+/// Strip any `user:pass@` userinfo from a URL before showing it to
+/// the user, so a credentials-bearing source URL doesn't land on
+/// stdout. Non-URL inputs pass through unchanged.
+fn redact_credentials(source: &str) -> String {
+    match url::Url::parse(source) {
+        Ok(mut u) if !u.username().is_empty() || u.password().is_some() => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.to_string()
+        }
+        _ => source.to_string(),
+    }
+}
+
 /// Render a `--from`/`--to` epoch for human display. `i64::MIN` and
 /// `i64::MAX` come from the "unspecified bound" sentinel used by the
 /// CLI; they'd otherwise round-trip through chrono as
@@ -171,11 +203,13 @@ impl ShardManager {
 
 /// Structured result of a dataset-wide query — what `query_dataset`
 /// returns. Callers render this however they like (CLI text, Arrow
-/// batches, SQL result sets). `root` and `time_range` are always
+/// batches, SQL result sets). `source` and `time_range` are always
 /// present; the scan outcome lives in [`DatasetQueryOutcome`].
 #[derive(Debug)]
 pub struct DatasetQueryOutput {
-    pub root: std::path::PathBuf,
+    /// URL or filesystem path the query ran against, in the form the
+    /// user supplied (or canonicalised for `file://`).
+    pub source: String,
     pub time_range: Option<(i64, i64)>,
     pub outcome: DatasetQueryOutcome,
 }
@@ -194,34 +228,24 @@ pub enum DatasetQueryOutcome {
     },
 }
 
-/// Fan out [`shard::query_shard`] across every shard discovered under
-/// `root` (a local directory) and return the aggregated result.
+/// Fan out [`crate::shard::query_shard`] across every shard
+/// discovered under `url` (any `object_store` URL — `file://`,
+/// `s3://`, `gs://`, `az://`, `memory://`) and return the aggregated
+/// result. Shards are pulled into `cache` on miss and read via mmap
+/// from the local copy.
 ///
 /// When `time_range` is `Some((from, to))`, shards whose
 /// `[time_range_start, time_range_end]` window does not intersect
 /// `[from, to]` are pruned via [`ShardSummary::intersects_time_range`]
-/// before any are opened — the operational win that time-bucketed
-/// ingest exists to enable.
-///
-/// Discovery uses [`ObjectStoreShardSource`] backed by a local-filesystem
-/// `object_store` rooted at `root`; remote backends are not yet supported
-/// (that needs the local hot-storage cache).
+/// before any are fetched.
 pub async fn query_dataset(
-    root: &std::path::Path,
+    url: &str,
+    cache: &crate::cache::Cache,
     filter: Option<(&str, &str)>,
     metrics: &[&str],
     time_range: Option<(i64, i64)>,
 ) -> Result<DatasetQueryOutput> {
     use anyhow::Context as _;
-
-    let root =
-        std::fs::canonicalize(root).with_context(|| format!("resolve {}", root.display()))?;
-    if !root.is_dir() {
-        anyhow::bail!("{} is not a directory", root.display());
-    }
-    let url = url::Url::from_directory_path(&root)
-        .map_err(|()| anyhow::anyhow!("{} is not a valid directory path", root.display()))?;
-    let registry = crate::storage::StorageRegistry::from_url(url.as_str())?;
 
     if let Some((from, to)) = time_range
         && from > to
@@ -233,8 +257,9 @@ pub async fn query_dataset(
         anyhow::bail!("invalid time range: from must be <= to (got from={from}, to={to})");
     }
 
-    let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(registry.store()));
-    let all_summaries = source.discover().await?;
+    let registry = crate::storage::StorageRegistry::from_url(url)?;
+    let discoverer: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(registry.store()));
+    let all_summaries = discoverer.discover().await?;
     let summaries: Vec<&ShardSummary> = if let Some((from, to)) = time_range {
         all_summaries
             .iter()
@@ -246,7 +271,7 @@ pub async fn query_dataset(
 
     let Some(shards_scanned) = std::num::NonZeroU64::new(summaries.len() as u64) else {
         return Ok(DatasetQueryOutput {
-            root,
+            source: url.to_string(),
             time_range,
             outcome: DatasetQueryOutcome::NoShards,
         });
@@ -254,9 +279,12 @@ pub async fn query_dataset(
 
     let mut total = crate::shard::QueryResult::zeros(metrics.len());
     for summary in &summaries {
-        let shard_path = root.join(summary.location.as_ref());
-        let r = crate::shard::query_shard(&shard_path, filter, metrics)
-            .with_context(|| format!("query {}", shard_path.display()))?;
+        let local_dir = cache
+            .fetch_shard(summary)
+            .await
+            .with_context(|| format!("cache fetch {}", summary.location))?;
+        let r = crate::shard::query_shard(&local_dir, filter, metrics)
+            .with_context(|| format!("query {}", summary.location))?;
         total.num_docs += r.num_docs;
         total.matched += r.matched;
         for (t, s) in total.aggregates.iter_mut().zip(&r.aggregates) {
@@ -265,7 +293,7 @@ pub async fn query_dataset(
     }
 
     Ok(DatasetQueryOutput {
-        root,
+        source: url.to_string(),
         time_range,
         outcome: DatasetQueryOutcome::Scanned {
             shards_scanned,
@@ -284,7 +312,7 @@ pub fn render_dataset_query_output(
     metrics: &[&str],
     aggregate: crate::shard::Aggregate,
 ) -> std::io::Result<()> {
-    writeln!(out, "dataset:  {}", output.root.display())?;
+    writeln!(out, "dataset:  {}", redact_credentials(&output.source))?;
     if let Some((from, to)) = output.time_range {
         writeln!(
             out,
@@ -312,8 +340,8 @@ mod tests {
     use crate::storage::StorageRegistry;
     use object_store::PutPayload;
 
-    /// Test-only: mirrors what main.rs's dataset CLI does so the
-    /// existing text-shape assertions stay terse.
+    /// Test-only: composes main.rs's CLI flow against a throwaway
+    /// cache so the existing text-shape assertions stay terse.
     async fn query_dataset_cli(
         root: &std::path::Path,
         filter: Option<(&str, &str)>,
@@ -322,8 +350,18 @@ mod tests {
         time_range: Option<(i64, i64)>,
         out: &mut dyn std::io::Write,
     ) -> Result<()> {
-        let output = query_dataset(root, filter, metrics, time_range).await?;
+        let url = resolve_source_url(root.to_str().expect("utf-8 test path"))?;
+        let registry = crate::storage::StorageRegistry::from_url(&url)?;
+        let cache_dir = tempfile::tempdir().expect("test cache tmpdir");
+        let cache = crate::cache::Cache::open(
+            cache_dir.path().to_path_buf(),
+            registry.store(),
+            url.clone(),
+            u64::MAX,
+        )?;
+        let output = query_dataset(&url, &cache, filter, metrics, time_range).await?;
         render_dataset_query_output(out, &output, filter, metrics, aggregate)?;
+        std::mem::forget(cache_dir);
         Ok(())
     }
 
@@ -337,6 +375,7 @@ mod tests {
                 name: "x".into(),
                 kind: FieldKind::Metric,
             }],
+            content_hashes: std::collections::BTreeMap::default(),
         }
     }
 
@@ -353,6 +392,20 @@ mod tests {
             location: Path::from(location),
             metadata: metadata(num_docs, time_range),
         }
+    }
+
+    #[test]
+    fn redact_credentials_strips_userinfo() {
+        assert_eq!(
+            redact_credentials("s3://AKIA:SECRET@bucket/path"),
+            "s3://bucket/path"
+        );
+        assert_eq!(
+            redact_credentials("s3://AKIA@bucket/path"),
+            "s3://bucket/path"
+        );
+        assert_eq!(redact_credentials("s3://bucket/path"), "s3://bucket/path");
+        assert_eq!(redact_credentials("/tmp/local"), "/tmp/local");
     }
 
     #[test]
@@ -466,6 +519,7 @@ mod tests {
                 time_range_start: 200,
                 time_range_end: 100,
                 fields: vec![],
+                content_hashes: std::collections::BTreeMap::default(),
             },
         )
         .await;
@@ -669,7 +723,7 @@ mod tests {
         .await
         .expect_err("expected file-not-directory rejection");
         let msg = err.to_string();
-        assert!(msg.contains("not a directory"), "{msg}");
+        assert!(msg.contains("not a valid directory path"), "{msg}");
     }
 
     /// Helper for the time-range tests: writes 5 single-day shards

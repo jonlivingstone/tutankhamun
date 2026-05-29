@@ -69,6 +69,13 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # CSV ingest
 csv = "1"
 
+# Cache content-hash validation
+sha2 = "0.10"
+hex = "0.4"
+
+# Disk capacity (for --cache-size percentage form)
+fs2 = "0.4"
+
 # Dev-only
 tempfile = "3"
 

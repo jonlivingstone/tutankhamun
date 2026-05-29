@@ -93,6 +93,15 @@ cargo run --release --bin t9n -- query \
 Casuals are 22% of trips but 38% of ride time — they ride about
 2× longer per trip.
 
+`--aggregate min|max|avg` swaps `sum` for any of the others:
+
+```sh
+cargo run --release --bin t9n -- query \
+    .local/storage/citibike/jc-202301 \
+    --metric trip_seconds --aggregate avg
+# trip_seconds:   avg = 707.61   (~12 min per trip)
+```
+
 By starting station — Hoboken Terminal:
 
 ```sh
@@ -112,6 +121,13 @@ or `YYYY-MM-DD HH:MM:SS`. Metric columns must be int64
 For a dataset that's already split into multiple shards under a
 directory, `t9n query <dir> --metric ... [--filter ...]` fans out
 across all of them and prints one aggregate.
+
+The same command takes an object-storage URL — `s3://`, `gs://`,
+`az://`, or `file://` — instead of a local path. Shards are
+downloaded into `~/Library/Caches/tutankhamun` (or the platform
+equivalent) on first query and read from there on subsequent runs.
+Override the cache location with `--cache-dir` and its size with
+`--cache-size 10GB` (or `50%` of disk).
 
 ## What's next
 

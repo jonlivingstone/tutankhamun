@@ -53,6 +53,7 @@ fn metadata_roundtrips_through_serde_json() {
                 kind: FieldKind::String,
             },
         ],
+        content_hashes: std::collections::BTreeMap::default(),
     };
     let bytes = serde_json::to_vec(&m).unwrap();
     let back: Metadata = serde_json::from_slice(&bytes).unwrap();
@@ -308,7 +309,7 @@ fn inspect_emits_path_metadata_and_schema() {
     let out = String::from_utf8(buf).expect("utf-8");
 
     assert!(out.contains(&tmp.path().display().to_string()), "{out}");
-    assert!(out.contains("format version:  1"), "{out}");
+    assert!(out.contains("format version:  2"), "{out}");
     assert!(out.contains("num docs:        3"), "{out}");
     assert!(out.contains("1700000000 .. 1700003600"), "{out}");
     assert!(out.contains("2023-11-14T22:13:20"), "{out}");

@@ -39,12 +39,14 @@ enum Command {
     /// Shard inspection / maintenance.
     Shard(ShardArgs),
     /// Aggregate one or more metric columns across every shard
-    /// discovered under a local directory, optionally restricted by a
+    /// discovered under a dataset source, optionally restricted by a
     /// string-field term and/or a time-range window.
     Query {
-        /// Local directory containing one or more shards (anywhere
-        /// underneath). Remote storage backends are not yet supported.
-        dir: PathBuf,
+        /// Where the shards live. Accepts a local directory path or
+        /// any `object_store` URL (`s3://`, `gs://`, `az://`,
+        /// `file://`, `memory://`). Bare paths are treated as
+        /// `file://`.
+        source: String,
         /// Metric column to aggregate. Repeatable — one line per
         /// metric is returned in declaration order. At least one
         /// required.
@@ -71,6 +73,18 @@ enum Command {
         /// omitted independently of `--from`.
         #[arg(long)]
         to: Option<String>,
+        /// Directory for the local shard cache. Defaults to the
+        /// platform cache dir (`~/.cache/t9n` on Linux,
+        /// `~/Library/Caches/tutankhamun` on macOS) — shared with the
+        /// daemon's storage cache.
+        #[arg(long, env = "T9N_CACHE_DIR")]
+        cache_dir: Option<PathBuf>,
+        /// Hard cap on resident cache bytes. Accepts plain units
+        /// (`10GB`, `1.5TB`, `512MiB`) or a percent of total disk
+        /// (`50%`). Whole shards are evicted oldest-mtime-first when
+        /// an insert would exceed this.
+        #[arg(long, env = "T9N_CACHE_SIZE", default_value = "10GB")]
+        cache_size: String,
     },
     /// Build one or more shards from a CSV/TSV input file.
     Ingest {
@@ -213,19 +227,23 @@ fn main() -> anyhow::Result<()> {
         Command::Storage(args) => run_storage(args),
         Command::Shard(args) => run_shard(args),
         Command::Query {
-            dir,
+            source,
             metrics,
             aggregate,
             filter,
             from,
             to,
+            cache_dir,
+            cache_size,
         } => run_query(
-            dir,
+            source,
             metrics,
             *aggregate,
             filter.as_deref(),
             from.as_deref(),
             to.as_deref(),
+            cache_dir.as_deref(),
+            cache_size,
         ),
         Command::Ingest {
             input,
@@ -271,23 +289,37 @@ fn run_ingest(
     Ok(())
 }
 
+// Args mirror the CLI flag count, which is the user-facing surface.
+#[allow(clippy::too_many_arguments)]
 fn run_query(
-    dir: &std::path::Path,
+    source: &str,
     metrics: &[String],
     aggregate: Aggregate,
     filter: Option<&str>,
     from: Option<&str>,
     to: Option<&str>,
+    cache_dir: Option<&std::path::Path>,
+    cache_size: &str,
 ) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     // clap's `required = true` on `metrics` guarantees non-empty.
     let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
     let parsed = filter.map(parse_filter).transpose()?;
     let time_range = parse_time_range(from, to)?;
+    let url = shard_source::resolve_source_url(source)?;
+    let cache_dir = resolve_cache_dir(cache_dir);
+    let size_cap = tutankhamun_server::cache::size::parse_cache_size(cache_size, &cache_dir)
+        .context("parse --cache-size")?;
+    let registry = StorageRegistry::from_url(&url)?;
+    let cache =
+        tutankhamun_server::cache::Cache::open(cache_dir, registry.store(), url.clone(), size_cap)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let output = runtime.block_on(shard_source::query_dataset(
-        dir,
+        &url,
+        &cache,
         parsed,
         &metric_refs,
         time_range,
@@ -296,6 +328,16 @@ fn run_query(
     let mut out = stdout.lock();
     shard_source::render_dataset_query_output(&mut out, &output, parsed, &metric_refs, aggregate)?;
     Ok(())
+}
+
+/// Turn a user-supplied `source` (bare path or `object_store` URL)
+/// into an `object_store` URL. Bare paths are canonicalised against
+/// the current working directory and converted to `file://`.
+fn resolve_cache_dir(overridden: Option<&std::path::Path>) -> PathBuf {
+    overridden.map_or_else(
+        tutankhamun_server::config::default_cache_dir,
+        std::path::Path::to_path_buf,
+    )
 }
 
 /// Resolve `--from` / `--to` into the closed interval expected by

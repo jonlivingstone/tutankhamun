@@ -2,6 +2,7 @@
 //!
 //! See `.docs/tutankhamun.md` for the design.
 
+pub mod cache;
 pub mod config;
 pub mod ingest;
 pub mod ops_http;

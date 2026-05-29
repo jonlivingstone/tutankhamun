@@ -44,15 +44,17 @@ use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 
-const METADATA_FILE: &str = "metadata.json";
+pub(crate) const METADATA_FILE: &str = "metadata.json";
 const METRICS_FILE: &str = "metrics.arrow";
 const POSTINGS_DIR: &str = "postings";
 const POSTING_EXT: &str = "posting";
 const FST_EXT: &str = "fst";
 
-/// Shard format version this build writes and refuses to read anything
-/// other than.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// Shard format version this build writes. Readers accept this version
+/// and the previous one (v1 had no `content_hashes` map; it loads
+/// without hash validation).
+pub(crate) const FORMAT_VERSION: u32 = 2;
+const MIN_SUPPORTED_FORMAT_VERSION: u32 = 1;
 
 /// Shard-level metadata persisted as `metadata.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,13 @@ pub struct Metadata {
     pub time_range_start: i64,
     pub time_range_end: i64,
     pub fields: Vec<FieldSchema>,
+    /// Per-file SHA-256 of every payload file in the shard, keyed by
+    /// the file's path relative to the shard directory (e.g.
+    /// `metrics.arrow`, `postings/country.fst`). Values are
+    /// `"sha256:<hex>"`. Empty (and skipped during validation) for
+    /// shards written with `format_version` 1.
+    #[serde(default)]
+    pub content_hashes: std::collections::BTreeMap<String, String>,
 }
 
 impl Metadata {
@@ -296,11 +305,14 @@ impl DiskShard {
             .validate()
             .with_context(|| format!("validate {}", metadata_path.display()))?;
 
-        if metadata.format_version != FORMAT_VERSION {
+        if metadata.format_version < MIN_SUPPORTED_FORMAT_VERSION
+            || metadata.format_version > FORMAT_VERSION
+        {
             bail!(
-                "{}: unsupported shard format_version {} (this build writes/reads {})",
+                "{}: unsupported shard format_version {} (this build accepts {}..={})",
                 metadata_path.display(),
                 metadata.format_version,
+                MIN_SUPPORTED_FORMAT_VERSION,
                 FORMAT_VERSION,
             );
         }
@@ -625,12 +637,13 @@ impl DiskShardWriter {
                 kind: FieldKind::String,
             });
         }
-        let metadata = Metadata {
+        let mut metadata = Metadata {
             format_version: FORMAT_VERSION,
             num_docs,
             time_range_start: self.time_range.0,
             time_range_end: self.time_range.1,
             fields,
+            content_hashes: BTreeMap::new(),
         };
 
         let arrow_fields: Vec<Field> = self
@@ -683,6 +696,7 @@ impl DiskShardWriter {
             }
         }
 
+        metadata.content_hashes = hash_payload_files(&self.dir)?;
         let metadata_json = serde_json::to_vec_pretty(&metadata).context("serialise metadata")?;
         write_atomic(&self.dir.join(METADATA_FILE), |tmp| {
             fs::write(tmp, &metadata_json).with_context(|| format!("write {}", tmp.display()))
@@ -690,6 +704,68 @@ impl DiskShardWriter {
 
         Ok(())
     }
+}
+
+/// Walk `dir` and hash every payload file (everything except
+/// `metadata.json` itself). Returns a map of `<rel-path>` →
+/// `"sha256:<hex>"`. Rel-paths use `/` separators regardless of host
+/// platform so the same shard reads back the same on any OS.
+fn hash_payload_files(dir: &Path) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    walk_files(dir, dir, &mut |abs_path, rel_path| {
+        if rel_path == METADATA_FILE {
+            return Ok(());
+        }
+        out.insert(rel_path.to_string(), sha256_file(abs_path)?);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// SHA-256 of `path`'s contents, formatted as `"sha256:<hex>"` — the
+/// shared form used in [`Metadata::content_hashes`] and the cache's
+/// per-file validator.
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(path).with_context(|| format!("hash read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Recursive walk over every file under `dir`. `root` is the path
+/// that rel-paths are computed against; pass `dir` for the top-level
+/// call. Skips leftover `.<name>.tmp` siblings from a crashed
+/// [`write_atomic`] (hashing those would either pollute
+/// `content_hashes` or leave dangling entries after a schema change).
+pub(crate) fn walk_files(
+    root: &Path,
+    dir: &Path,
+    f: &mut dyn FnMut(&Path, &str) -> Result<()>,
+) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            walk_files(root, &path, f)?;
+        } else if file_type.is_file() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if name_str.starts_with('.') && name_str.ends_with(".tmp") {
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .expect("walk_files stays under root")
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            f(&path, &rel)?;
+        }
+    }
+    Ok(())
 }
 
 /// Write `<field>.posting` (concatenated bitmaps) and `<field>.fst`
