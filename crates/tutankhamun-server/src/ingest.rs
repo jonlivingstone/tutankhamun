@@ -11,9 +11,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use object_store::ObjectStore;
+use object_store::path::Path as ObjPath;
 use roaring::RoaringBitmap;
 
-use crate::shard::{DiskShardWriter, FieldKind};
+use crate::shard::{DiskShardWriter, FieldKind, METADATA_FILE};
 
 /// What to extract from each row, by column name.
 #[derive(Debug, Clone)]
@@ -86,6 +88,138 @@ impl ShardBy {
                 root.join(dt.format(fmt).to_string())
             }
         }
+    }
+}
+
+/// Where `t9n ingest` should put its output. A bare path or
+/// `file://` URL routes to [`IngestDestination::Local`] (written
+/// directly); any other `object_store` URL routes to
+/// [`IngestDestination::Remote`] (written to a staging tempdir
+/// first, then uploaded by [`upload_ingest_tree`]).
+#[derive(Debug, Clone)]
+pub enum IngestDestination {
+    Local(PathBuf),
+    Remote(String),
+}
+
+impl IngestDestination {
+    /// Parse a `--output` argument. Bare paths become
+    /// `Local(PathBuf)`; URLs are dispatched by scheme.
+    pub fn parse(raw: &str) -> Result<Self> {
+        if !raw.contains("://") {
+            return Ok(Self::Local(PathBuf::from(raw)));
+        }
+        let url = url::Url::parse(raw).with_context(|| format!("parse output URL {raw:?}"))?;
+        if url.scheme() == "file" {
+            let path = url
+                .to_file_path()
+                .map_err(|()| anyhow::anyhow!("file URL {raw:?} has no filesystem path"))?;
+            return Ok(Self::Local(path));
+        }
+        Ok(Self::Remote(raw.to_string()))
+    }
+}
+
+/// Upload every shard under `local_root` to `url`, preserving the
+/// directory layout. Within each shard, every payload file uploads
+/// before `metadata.json` so the shard isn't discoverable until it's
+/// complete (the discovery code's "look for metadata.json" check).
+///
+/// "Shard" means any directory under `local_root` that directly
+/// contains a `metadata.json`. Handles both `--shard-by none` (one
+/// shard at the root) and `--shard-by daily`/`hourly` (one shard per
+/// bucket subdir).
+pub async fn upload_ingest_tree(local_root: &Path, url: &str) -> Result<()> {
+    let registry = crate::storage::StorageRegistry::from_url(url)?;
+    let store = registry.store();
+    for shard_dir in find_shard_dirs(local_root)? {
+        let remote_prefix = shard_dir
+            .strip_prefix(local_root)
+            .expect("find_shard_dirs returns paths under root")
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        upload_one_shard(&*store, &shard_dir, &remote_prefix).await?;
+    }
+    Ok(())
+}
+
+fn find_shard_dirs(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    walk_shard_dirs(root, &mut out)?;
+    Ok(out)
+}
+
+fn walk_shard_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if dir.join(METADATA_FILE).is_file() {
+        out.push(dir.to_path_buf());
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            walk_shard_dirs(&entry.path(), out)?;
+        }
+    }
+    Ok(())
+}
+
+async fn upload_one_shard(
+    store: &dyn ObjectStore,
+    local_shard_dir: &Path,
+    remote_prefix: &str,
+) -> Result<()> {
+    let metadata_local = local_shard_dir.join(METADATA_FILE);
+    if !metadata_local.is_file() {
+        bail!("missing {} in {}", METADATA_FILE, local_shard_dir.display());
+    }
+    let mut payload_files: Vec<(PathBuf, String)> = Vec::new();
+    crate::shard::walk_files(
+        local_shard_dir,
+        local_shard_dir,
+        &mut |abs_path, rel_path| {
+            if rel_path == METADATA_FILE {
+                return Ok(());
+            }
+            payload_files.push((abs_path.to_path_buf(), rel_path.to_string()));
+            Ok(())
+        },
+    )?;
+
+    for (abs_path, rel_path) in payload_files {
+        upload_file(
+            store,
+            &abs_path,
+            &join_remote_path(remote_prefix, &rel_path),
+        )
+        .await?;
+    }
+    // metadata.json LAST: discovery looks for it, so until it's
+    // there the shard is invisible — partial uploads can't be seen.
+    upload_file(
+        store,
+        &metadata_local,
+        &join_remote_path(remote_prefix, METADATA_FILE),
+    )
+    .await
+}
+
+async fn upload_file(store: &dyn ObjectStore, local: &Path, remote: &ObjPath) -> Result<()> {
+    use object_store::PutPayload;
+    let bytes = std::fs::read(local).with_context(|| format!("read {}", local.display()))?;
+    store
+        .put(remote, PutPayload::from(bytes))
+        .await
+        .with_context(|| format!("upload {} -> {remote}", local.display()))?;
+    Ok(())
+}
+
+fn join_remote_path(prefix: &str, rel: &str) -> ObjPath {
+    if prefix.is_empty() {
+        ObjPath::from(rel)
+    } else {
+        ObjPath::from(format!("{prefix}/{rel}"))
     }
 }
 
@@ -826,5 +960,130 @@ mod tests {
         let shard = DiskShard::open(&shard_dir).expect("open");
         assert_eq!(shard.num_docs(), 2);
         assert_eq!(shard.time_range(), (DAY_0, DAY_2));
+    }
+
+    #[test]
+    fn ingest_destination_parse_routes_paths_and_urls() {
+        assert!(matches!(
+            IngestDestination::parse("/tmp/foo").unwrap(),
+            IngestDestination::Local(p) if p == Path::new("/tmp/foo")
+        ));
+        assert!(matches!(
+            IngestDestination::parse("file:///tmp/foo").unwrap(),
+            IngestDestination::Local(p) if p == Path::new("/tmp/foo")
+        ));
+        assert!(matches!(
+            IngestDestination::parse("s3://bucket/dataset").unwrap(),
+            IngestDestination::Remote(u) if u == "s3://bucket/dataset"
+        ));
+        assert!(matches!(
+            IngestDestination::parse("memory:///foo").unwrap(),
+            IngestDestination::Remote(u) if u == "memory:///foo"
+        ));
+    }
+
+    fn tempdir_url(dir: &tempfile::TempDir) -> String {
+        url::Url::from_directory_path(dir.path())
+            .expect("tempdir is an absolute path")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn upload_ingest_tree_uploads_payload_and_metadata() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,fare\n\
+                 {DAY_0},100\n\
+                 {DAY_0},200\n",
+            ),
+        );
+        let staging = tempfile::tempdir().expect("staging tmpdir");
+        ingest_csv(&input, staging.path(), &opts("pickup", &["fare"], &[])).expect("ingest");
+
+        let remote = tempfile::tempdir().expect("remote tmpdir");
+        let url = tempdir_url(&remote);
+        upload_ingest_tree(staging.path(), &url)
+            .await
+            .expect("upload");
+
+        assert!(remote.path().join("metadata.json").is_file());
+        assert!(remote.path().join("metrics.arrow").is_file());
+    }
+
+    #[tokio::test]
+    async fn upload_ingest_tree_handles_shard_by_daily() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {DAY_0},10\n\
+                 {DAY_1},20\n\
+                 {DAY_2},30\n",
+            ),
+        );
+        let staging = tempfile::tempdir().expect("staging tmpdir");
+        ingest_csv(&input, staging.path(), &opts_daily("pickup", &["x"], &[])).expect("ingest");
+
+        let remote = tempfile::tempdir().expect("remote tmpdir");
+        let url = tempdir_url(&remote);
+        upload_ingest_tree(staging.path(), &url)
+            .await
+            .expect("upload");
+
+        for day in ["2023-01-01", "2023-01-02", "2023-01-03"] {
+            assert!(
+                remote.path().join(day).join("metadata.json").is_file(),
+                "{day}/metadata.json present"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_ingest_tree_yields_queryable_dataset() {
+        // End-to-end: ingest CSV → upload → query reads back the
+        // expected aggregate.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,fare\n\
+                 {DAY_0},100\n\
+                 {DAY_0},200\n\
+                 {DAY_0},300\n",
+            ),
+        );
+
+        let staging = tempfile::tempdir().expect("staging");
+        ingest_csv(&input, staging.path(), &opts("pickup", &["fare"], &[])).expect("ingest");
+
+        let remote = tempfile::tempdir().expect("remote");
+        let url = tempdir_url(&remote);
+        upload_ingest_tree(staging.path(), &url)
+            .await
+            .expect("upload");
+
+        let registry = crate::storage::StorageRegistry::from_url(&url).unwrap();
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let cache = crate::cache::Cache::open(
+            cache_dir.path().to_path_buf(),
+            registry.store(),
+            url.clone(),
+            10 * 1024 * 1024,
+        )
+        .expect("cache");
+
+        let output = crate::shard_source::query_dataset(&url, &cache, None, &["fare"], None)
+            .await
+            .expect("query");
+        match output.outcome {
+            crate::shard_source::DatasetQueryOutcome::Scanned { result, .. } => {
+                assert_eq!(result.matched, 3);
+                assert_eq!(result.aggregates[0].sum, 600);
+            }
+            crate::shard_source::DatasetQueryOutcome::NoShards => panic!("expected scan"),
+        }
     }
 }

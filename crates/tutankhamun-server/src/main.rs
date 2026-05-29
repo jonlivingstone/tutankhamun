@@ -90,11 +90,16 @@ enum Command {
     Ingest {
         /// Path to the CSV/TSV input file (must have a header row).
         input: PathBuf,
-        /// Directory to write the finalised shard(s) into. With
-        /// `--shard-by daily` or `hourly`, one shard per time bucket
-        /// is written under this root (e.g. `<root>/YYYY-MM-DD/`).
+        /// Where to write the finalised shard(s). Accepts a local
+        /// directory path or any `object_store` URL (`s3://`,
+        /// `gs://`, `az://`, `memory://`). With `--shard-by daily`
+        /// or `hourly`, one shard per time bucket is written under
+        /// this root (e.g. `<root>/YYYY-MM-DD/`). For remote URLs
+        /// each shard is staged in a tempdir and uploaded with
+        /// `metadata.json` last, so partial uploads stay invisible
+        /// to discovery.
         #[arg(long)]
-        output: PathBuf,
+        output: String,
         /// Header name of the time column. Values may be unix epoch
         /// seconds, RFC 3339, or `YYYY-MM-DD HH:MM:SS` (treated as
         /// UTC). Bare integers always parse as epoch — preprocess
@@ -264,7 +269,7 @@ fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_ingest(
     input: &std::path::Path,
-    output: &std::path::Path,
+    output: &str,
     time: &str,
     metrics: &[String],
     strings: &[String],
@@ -272,6 +277,7 @@ fn run_ingest(
     delimiter: char,
     shard_by: ShardByArg,
 ) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     if !delimiter.is_ascii() {
         anyhow::bail!("delimiter must be a single ASCII byte (got {delimiter:?})");
     }
@@ -284,8 +290,21 @@ fn run_ingest(
         delimiter: delimiter_byte,
         shard_by: shard_by.into(),
     };
-    let n = ingest::ingest_csv(input, output, &opts)?;
-    println!("wrote {n} docs to {}", output.display());
+    match ingest::IngestDestination::parse(output)? {
+        ingest::IngestDestination::Local(local) => {
+            let n = ingest::ingest_csv(input, &local, &opts)?;
+            println!("wrote {n} docs to {}", local.display());
+        }
+        ingest::IngestDestination::Remote(url) => {
+            let staging = tempfile::tempdir().context("create ingest staging tempdir")?;
+            let n = ingest::ingest_csv(input, staging.path(), &opts)?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(ingest::upload_ingest_tree(staging.path(), &url))?;
+            println!("wrote {n} docs to {url}");
+        }
+    }
     Ok(())
 }
 

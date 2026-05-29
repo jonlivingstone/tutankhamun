@@ -40,9 +40,9 @@ csv = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 fs2 = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tower = { workspace = true }
 
 [lints.rust]

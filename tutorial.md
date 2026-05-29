@@ -122,12 +122,15 @@ For a dataset that's already split into multiple shards under a
 directory, `t9n query <dir> --metric ... [--filter ...]` fans out
 across all of them and prints one aggregate.
 
-The same command takes an object-storage URL — `s3://`, `gs://`,
-`az://`, or `file://` — instead of a local path. Shards are
-downloaded into `~/Library/Caches/tutankhamun` (or the platform
-equivalent) on first query and read from there on subsequent runs.
-Override the cache location with `--cache-dir` and its size with
-`--cache-size 10GB` (or `50%` of disk).
+Both `t9n query` and `t9n ingest --output` accept an object-storage
+URL — `s3://`, `gs://`, `az://`, or `file://` — instead of a local
+path. On query, shards are downloaded into
+`~/Library/Caches/tutankhamun` (or the platform equivalent) on
+first read and reused from there on subsequent runs; override the
+cache location with `--cache-dir` and its size with
+`--cache-size 10GB` (or `50%` of disk). On ingest, shards are
+staged locally and uploaded with `metadata.json` last per shard so
+partial uploads stay invisible to readers.
 
 ## What's next
 
