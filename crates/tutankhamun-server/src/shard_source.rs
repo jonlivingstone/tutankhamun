@@ -241,7 +241,7 @@ pub enum DatasetQueryOutcome {
 pub async fn query_dataset(
     url: &str,
     cache: &crate::cache::Cache,
-    filter: Option<(&str, &str)>,
+    filter: Option<crate::shard::FilterClause<'_>>,
     metrics: &[&str],
     time_range: Option<(i64, i64)>,
 ) -> Result<DatasetQueryOutput> {
@@ -308,7 +308,7 @@ pub async fn query_dataset(
 pub fn render_dataset_query_output(
     out: &mut dyn std::io::Write,
     output: &DatasetQueryOutput,
-    filter: Option<(&str, &str)>,
+    filter: Option<crate::shard::FilterClause<'_>>,
     metrics: &[&str],
     aggregate: crate::shard::Aggregate,
 ) -> std::io::Result<()> {
@@ -344,7 +344,7 @@ mod tests {
     /// cache so the existing text-shape assertions stay terse.
     async fn query_dataset_cli(
         root: &std::path::Path,
-        filter: Option<(&str, &str)>,
+        filter: Option<crate::shard::FilterClause<'_>>,
         metrics: &[&str],
         aggregate: crate::shard::Aggregate,
         time_range: Option<(i64, i64)>,
@@ -644,7 +644,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            Some(("country", "us")),
+            Some(crate::shard::FilterClause::equals("country", "us")),
             &["clicks"],
             crate::shard::Aggregate::Sum,
             None,

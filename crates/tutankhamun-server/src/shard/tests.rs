@@ -25,7 +25,7 @@ fn write_string_shard(dir: &Path, field: &str, postings: BTreeMap<String, Roarin
 /// existing text-shape assertions stay terse.
 fn query_cli(
     path: &Path,
-    filter: Option<(&str, &str)>,
+    filter: Option<FilterClause<'_>>,
     metrics: &[&str],
     aggregate: Aggregate,
     out: &mut dyn io::Write,
@@ -416,7 +416,7 @@ fn query_shard_multi_metric_with_filter() {
     // us = docs 0, 2, 4: clicks 10+30+50=90, impressions 100+300+500=900.
     let r = query_shard(
         tmp.path(),
-        Some(("country", "us")),
+        Some(FilterClause::equals("country", "us")),
         &["clicks", "impressions"],
     )
     .expect("query_shard multi-metric filtered");
@@ -447,7 +447,7 @@ fn query_sums_metric_filtered_by_term() {
     let mut buf = Vec::new();
     query_cli(
         tmp.path(),
-        Some(("country", "us")),
+        Some(FilterClause::equals("country", "us")),
         &["clicks"],
         Aggregate::Sum,
         &mut buf,
@@ -460,7 +460,7 @@ fn query_sums_metric_filtered_by_term() {
     let mut buf = Vec::new();
     query_cli(
         tmp.path(),
-        Some(("country", "de")),
+        Some(FilterClause::equals("country", "de")),
         &["clicks"],
         Aggregate::Sum,
         &mut buf,
@@ -492,7 +492,7 @@ fn query_missing_filter_term_is_zero() {
     let mut buf = Vec::new();
     query_cli(
         tmp.path(),
-        Some(("country", "fr")),
+        Some(FilterClause::equals("country", "fr")),
         &["clicks"],
         Aggregate::Sum,
         &mut buf,
@@ -546,7 +546,7 @@ fn query_rejects_unknown_filter_field() {
     let mut buf = Vec::new();
     let err = query_cli(
         tmp.path(),
-        Some(("cuontry", "us")),
+        Some(FilterClause::equals("cuontry", "us")),
         &["clicks"],
         Aggregate::Sum,
         &mut buf,
@@ -564,7 +564,7 @@ fn query_rejects_metric_field_as_filter() {
     let mut buf = Vec::new();
     let err = query_cli(
         tmp.path(),
-        Some(("clicks", "10")),
+        Some(FilterClause::equals("clicks", "10")),
         &["clicks"],
         Aggregate::Sum,
         &mut buf,
@@ -714,7 +714,10 @@ fn int_field_range_is_numeric_order() {
     // would slip in under naive lex-on-decimal-string).
     let lo = encode_int_key(-50);
     let hi = encode_int_key(50);
-    let in_range: Vec<RoaringBitmap> = idx.range_bytes(&lo, &hi).map(|(_, bm)| bm).collect();
+    let in_range: Vec<RoaringBitmap> = idx
+        .range_bytes(Some(&lo), Some(&hi))
+        .map(|(_, bm)| bm)
+        .collect();
     assert_eq!(in_range.len(), 2, "should match exactly -5 and 5");
     let mut union = RoaringBitmap::new();
     for bm in in_range {
@@ -750,8 +753,12 @@ fn query_shard_int_field_used_as_both_filter_and_metric() {
 
     // Filter on vendor_id=1 (matches docs 0 and 2), sum both
     // vendor_id (1+1=2) and fare (100+300=400) for those docs.
-    let r = query_shard(tmp.path(), Some(("vendor_id", "1")), &["vendor_id", "fare"])
-        .expect("query_shard");
+    let r = query_shard(
+        tmp.path(),
+        Some(FilterClause::equals("vendor_id", "1")),
+        &["vendor_id", "fare"],
+    )
+    .expect("query_shard");
     assert_eq!(r.matched, 2);
     assert_eq!(r.aggregates[0].sum, 2);
     assert_eq!(r.aggregates[1].sum, 400);
@@ -767,7 +774,7 @@ fn query_shard_int_filter_term_must_parse_as_int() {
 
     let err = query_shard(
         tmp.path(),
-        Some(("vendor_id", "not-a-number")),
+        Some(FilterClause::equals("vendor_id", "not-a-number")),
         &["vendor_id"],
     )
     .expect_err("expected parse error for non-int filter term");
@@ -818,7 +825,8 @@ fn query_shard_min_max_under_filter() {
     w.finalize().expect("finalize");
 
     // g=1 selects docs 0,1,3 -> values 10, -5, 7.
-    let r = query_shard(tmp.path(), Some(("g", "1")), &["v"]).expect("query_shard");
+    let r =
+        query_shard(tmp.path(), Some(FilterClause::equals("g", "1")), &["v"]).expect("query_shard");
     assert_eq!(r.matched, 3);
     let agg = &r.aggregates[0];
     assert_eq!(agg.sum, 12);
@@ -835,7 +843,8 @@ fn query_shard_empty_match_yields_none_min_max() {
         .expect("string");
     w.finalize().expect("finalize");
 
-    let r = query_shard(tmp.path(), Some(("c", "fr")), &["v"]).expect("query_shard");
+    let r = query_shard(tmp.path(), Some(FilterClause::equals("c", "fr")), &["v"])
+        .expect("query_shard");
     assert_eq!(r.matched, 0);
     let agg = &r.aggregates[0];
     assert_eq!(agg.sum, 0);
@@ -873,7 +882,14 @@ fn query_renders_n_a_when_no_match_for_min_max_avg() {
 
     for op in [Aggregate::Min, Aggregate::Max, Aggregate::Avg] {
         let mut buf = Vec::new();
-        query_cli(tmp.path(), Some(("c", "fr")), &["v"], op, &mut buf).expect("query");
+        query_cli(
+            tmp.path(),
+            Some(FilterClause::equals("c", "fr")),
+            &["v"],
+            op,
+            &mut buf,
+        )
+        .expect("query");
         let out = String::from_utf8(buf).expect("utf-8");
         assert!(out.contains("= n/a"), "op={op:?} out={out}");
     }
@@ -904,4 +920,214 @@ fn metric_aggregates_absorb_composes_min_max_avg_across_shards() {
     assert_eq!(acc.sum, 60);
     assert_eq!(acc.min, Some(10));
     assert_eq!(acc.max, Some(40));
+}
+
+#[test]
+fn query_shard_int_range_filter_includes_inclusive_bounds() {
+    // vendor_id values 1, 2, 3, 4, 5; range 2..4 must hit docs whose
+    // vendor_id is 2, 3, or 4 (both ends inclusive).
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 3, 4, 5])
+        .expect("add_int_field");
+    w.add_metric("fare", vec![100, 200, 300, 400, 500])
+        .expect("add_metric");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("vendor_id", Some("2"), Some("4"))),
+        &["fare"],
+    )
+    .expect("query_shard");
+    assert_eq!(r.matched, 3, "vendor_id in {{2, 3, 4}}");
+    assert_eq!(r.aggregates[0].sum, 200 + 300 + 400);
+}
+
+#[test]
+fn query_shard_int_range_open_lower_and_upper() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![-10, 0, 5, 100, 1000])
+        .expect("add_int_field");
+    w.add_metric("m", vec![1, 1, 1, 1, 1]).expect("add_metric");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("v", None, Some("5"))),
+        &["m"],
+    )
+    .expect("open lower");
+    assert_eq!(r.matched, 3, "v in [-inf, 5] = -10, 0, 5");
+
+    let r = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("v", Some("5"), None)),
+        &["m"],
+    )
+    .expect("open upper");
+    assert_eq!(r.matched, 3, "v in [5, +inf] = 5, 100, 1000");
+}
+
+#[test]
+fn query_shard_int_range_with_no_matching_terms_is_zero() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![1, 2, 3]).expect("add_int_field");
+    w.add_metric("m", vec![10, 20, 30]).expect("add_metric");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("v", Some("100"), Some("200"))),
+        &["m"],
+    )
+    .expect("query_shard");
+    assert_eq!(r.matched, 0);
+    assert_eq!(r.aggregates[0].sum, 0);
+    assert!(r.aggregates[0].min.is_none());
+}
+
+#[test]
+fn query_shard_string_lex_range_filter() {
+    // Lex range "b".."d" on a string field. Terms a, b, c, d, e:
+    // hits b, c, d.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut postings = BTreeMap::new();
+    for (i, term) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+        let mut bm = RoaringBitmap::new();
+        bm.insert(u32::try_from(i).expect("doc id fits in u32"));
+        postings.insert((*term).to_string(), bm);
+    }
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("m", vec![1, 1, 1, 1, 1]).expect("metric");
+    w.add_string_field("letter", postings).expect("string");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("letter", Some("b"), Some("d"))),
+        &["m"],
+    )
+    .expect("query_shard");
+    assert_eq!(r.matched, 3, "letter in [b, d]");
+}
+
+#[test]
+fn query_shard_int_range_bound_must_parse_as_int() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 2, 3])
+        .expect("add_int_field");
+    w.finalize().expect("finalize");
+
+    let err = query_shard(
+        tmp.path(),
+        Some(FilterClause::range(
+            "vendor_id",
+            Some("not-a-number"),
+            Some("5"),
+        )),
+        &["vendor_id"],
+    )
+    .expect_err("expected parse error for non-int range bound");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("vendor_id") && msg.contains("not a valid int64"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn query_shard_range_rejects_double_open_filter_clause() {
+    // CLI parser blocks `field=..`, but a programmatic caller can
+    // still construct `FilterClause::range(field, None, None)`.
+    // Engine must hard-fail rather than silently match every doc.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![1, 2, 3]).expect("int");
+    w.add_metric("m", vec![10, 20, 30]).expect("metric");
+    w.finalize().expect("finalize");
+
+    let err = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("v", None, None)),
+        &["m"],
+    )
+    .expect_err("expected at-least-one-bound rejection");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("at least one bound"), "{msg}");
+}
+
+#[test]
+fn query_shard_range_rejects_inverted_bounds() {
+    // `lo > hi` would silently return 0 matches via an empty
+    // FST range; surface as an error instead (matches the
+    // time-range UX, which already rejects `from > to`).
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![1, 2, 3, 4, 5]).expect("int");
+    w.add_metric("m", vec![10, 20, 30, 40, 50]).expect("metric");
+    w.finalize().expect("finalize");
+
+    let err = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("v", Some("4"), Some("2"))),
+        &["m"],
+    )
+    .expect_err("expected inverted-bounds rejection");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("lower bound"), "{msg}");
+
+    // Same check for string fields.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut postings = BTreeMap::new();
+    postings.insert("a".to_string(), bitmap([0]));
+    postings.insert("b".to_string(), bitmap([1]));
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_metric("m", vec![1, 2]).expect("metric");
+    w.add_string_field("c", postings).expect("string");
+    w.finalize().expect("finalize");
+    let err = query_shard(
+        tmp.path(),
+        Some(FilterClause::range("c", Some("d"), Some("b"))),
+        &["m"],
+    )
+    .expect_err("expected inverted-string-bounds rejection");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("lower bound"), "{msg}");
+}
+
+#[test]
+fn write_query_summary_renders_range_clause() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new");
+    w.add_int_field("v", vec![1, 2, 3, 4, 5]).expect("int");
+    w.add_metric("m", vec![10, 20, 30, 40, 50]).expect("metric");
+    w.finalize().expect("finalize");
+
+    let mut buf = Vec::new();
+    query_cli(
+        tmp.path(),
+        Some(FilterClause::range("v", Some("2"), Some("4"))),
+        &["m"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect("query_cli");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("filter:   v = 2..4"), "{out}");
+
+    let mut buf = Vec::new();
+    query_cli(
+        tmp.path(),
+        Some(FilterClause::range("v", Some("3"), None)),
+        &["m"],
+        Aggregate::Sum,
+        &mut buf,
+    )
+    .expect("query_cli");
+    let out = String::from_utf8(buf).expect("utf-8");
+    assert!(out.contains("filter:   v = 3.."), "{out}");
 }

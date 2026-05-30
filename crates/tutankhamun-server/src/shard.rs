@@ -195,21 +195,30 @@ impl InvertedIndex {
         start: &str,
         end_inclusive: &str,
     ) -> impl Iterator<Item = (String, RoaringBitmap)> + '_ {
-        self.range_bytes(start.as_bytes(), end_inclusive.as_bytes())
+        self.range_bytes(Some(start.as_bytes()), Some(end_inclusive.as_bytes()))
             .map(|(k, bm)| (utf8_term(&k), bm))
     }
 
-    /// All byte-keyed terms in `[start, end_inclusive]`, in
-    /// lexicographic byte order, each paired with its doc set. For
+    /// All byte-keyed terms in `[lo, hi_inclusive]`, in lexicographic
+    /// byte order, each paired with its doc set. Either bound may be
+    /// `None` for an open range (`None, Some(hi)` = "everything up to
+    /// hi", `Some(lo), None` = "everything from lo onwards"). For
     /// `Int` fields whose FST keys are [`encode_int_key`]-encoded,
     /// byte order = numeric order, so this gives natural numeric
     /// range semantics.
     pub fn range_bytes(
         &self,
-        start: &[u8],
-        end_inclusive: &[u8],
+        lo: Option<&[u8]>,
+        hi_inclusive: Option<&[u8]>,
     ) -> impl Iterator<Item = (Vec<u8>, RoaringBitmap)> + '_ {
-        let mut stream = self.fst.range().ge(start).le(end_inclusive).into_stream();
+        let mut range = self.fst.range();
+        if let Some(lo) = lo {
+            range = range.ge(lo);
+        }
+        if let Some(hi) = hi_inclusive {
+            range = range.le(hi);
+        }
+        let mut stream = range.into_stream();
         let postings: &[u8] = &self.postings;
         std::iter::from_fn(move || {
             let (k, v) = stream.next()?;
@@ -966,9 +975,64 @@ impl QueryResult {
     }
 }
 
+/// What `--filter` resolves to: a single-term equality or an
+/// inclusive range with optionally open ends. The CLI parser
+/// constructs these; the engine consumes them.
+#[derive(Debug, Clone, Copy)]
+pub struct FilterClause<'a> {
+    pub field: &'a str,
+    pub op: FilterOp<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FilterOp<'a> {
+    /// Exact-term match against the field's inverted index.
+    Equals(&'a str),
+    /// Inclusive range. `None` on either side means unbounded.
+    /// `lo` and `hi` both `None` is rejected upstream — it would
+    /// match every doc, which the user almost certainly didn't mean.
+    Range {
+        lo: Option<&'a str>,
+        hi: Option<&'a str>,
+    },
+}
+
+impl<'a> FilterClause<'a> {
+    #[must_use]
+    pub fn equals(field: &'a str, term: &'a str) -> Self {
+        Self {
+            field,
+            op: FilterOp::Equals(term),
+        }
+    }
+
+    #[must_use]
+    pub fn range(field: &'a str, lo: Option<&'a str>, hi: Option<&'a str>) -> Self {
+        Self {
+            field,
+            op: FilterOp::Range { lo, hi },
+        }
+    }
+}
+
+impl std::fmt::Display for FilterClause<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.op {
+            FilterOp::Equals(term) => write!(f, "{} = {:?}", self.field, term),
+            FilterOp::Range { lo, hi } => write!(
+                f,
+                "{} = {}..{}",
+                self.field,
+                lo.unwrap_or(""),
+                hi.unwrap_or(""),
+            ),
+        }
+    }
+}
+
 /// Open the shard at `path`, optionally restrict to docs matching
-/// `filter = Some((field, term))`, and compute sum/min/max for each
-/// named metric over the resulting doc set. Returns one
+/// `filter = Some(clause)`, and compute sum/min/max for each named
+/// metric over the resulting doc set. Returns one
 /// [`MetricAggregates`] per input metric in declaration order. Avg is
 /// derived at display time from `sum / matched` so it composes
 /// correctly across shards.
@@ -977,7 +1041,7 @@ impl QueryResult {
 /// one(s) to display is the caller's job.
 pub fn query_shard(
     path: &Path,
-    filter: Option<(&str, &str)>,
+    filter: Option<FilterClause<'_>>,
     metrics: &[&str],
 ) -> Result<QueryResult> {
     let shard = DiskShard::open(path)?;
@@ -1002,23 +1066,58 @@ pub fn query_shard(
         })
         .collect::<Result<_>>()?;
 
-    let (matched, aggregates) = if let Some((field, term)) = filter {
+    let (matched, aggregates) = if let Some(clause) = filter {
         // String or Int field — both have an inverted index, but the
         // term encoding differs: String uses UTF-8 bytes directly,
         // Int parses the decimal term and encodes via encode_int_key.
-        let filter_field = require_field(metadata, field, &[FieldKind::String, FieldKind::Int])?;
+        let filter_field =
+            require_field(metadata, clause.field, &[FieldKind::String, FieldKind::Int])?;
         let idx = shard
-            .inverted_index(field)
+            .inverted_index(clause.field)
             .expect("indexed field kind validated above");
-        let bm = match filter_field.kind {
-            FieldKind::String => idx.lookup(term),
-            FieldKind::Int => {
-                let v: i64 = term.parse().with_context(|| {
-                    format!("filter term {term:?} is not a valid int64 for field {field:?}")
-                })?;
-                idx.lookup_bytes(&encode_int_key(v))
+        let bm = match clause.op {
+            FilterOp::Equals(term) => {
+                let key = encode_bound(filter_field.kind, clause.field, Some(term))?
+                    .expect("Some bound yields Some encoded key");
+                idx.lookup_bytes(&key)
             }
-            FieldKind::Metric => unreachable!("require_field rejected non-indexed kind"),
+            FilterOp::Range { lo, hi } => {
+                use roaring::MultiOps;
+                if lo.is_none() && hi.is_none() {
+                    // Reachable only via a programmatic
+                    // `FilterClause::range(_, None, None)`; the CLI
+                    // parser rejects `field=..` upstream. Hard-fail
+                    // so the misuse can't silently match every doc.
+                    bail!(
+                        "range filter for field {field:?} must have at least one bound",
+                        field = clause.field,
+                    );
+                }
+                let lo_bytes = encode_bound(filter_field.kind, clause.field, lo)?;
+                let hi_bytes = encode_bound(filter_field.kind, clause.field, hi)?;
+                // Encoded byte order matches the desired range
+                // semantics for both kinds (UTF-8 lex for String,
+                // numeric via encode_int_key for Int), so a byte
+                // compare catches inverted ranges across both.
+                if let (Some(l), Some(h)) = (&lo_bytes, &hi_bytes)
+                    && l > h
+                {
+                    bail!(
+                        "range filter for field {field:?}: lower bound {lo:?} exceeds upper bound {hi:?}",
+                        field = clause.field,
+                        lo = lo.expect("checked above"),
+                        hi = hi.expect("checked above"),
+                    );
+                }
+                // Tree-reduced k-way union — for wide ranges over
+                // high-cardinality fields this beats pairwise `|=`
+                // because intermediate bitmap sizes stay smaller.
+                let union: RoaringBitmap = idx
+                    .range_bytes(lo_bytes.as_deref(), hi_bytes.as_deref())
+                    .map(|(_, bm)| bm)
+                    .union();
+                if union.is_empty() { None } else { Some(union) }
+            }
         };
         bm.map_or_else(
             || (0u64, vec![MetricAggregates::default(); cols.len()]),
@@ -1043,6 +1142,28 @@ pub fn query_shard(
         matched,
         aggregates,
     })
+}
+
+/// Encode a single filter bound (either side of a range, or the
+/// equality term) for an inverted-index lookup. `None` bound →
+/// `None` byte vec (the open-range case in
+/// [`InvertedIndex::range_bytes`]). String fields use UTF-8 bytes
+/// directly; Int fields parse the bound as i64 and encode via
+/// [`encode_int_key`] so the FST's byte order matches numeric order.
+fn encode_bound(kind: FieldKind, field: &str, bound: Option<&str>) -> Result<Option<Vec<u8>>> {
+    let Some(bound) = bound else {
+        return Ok(None);
+    };
+    match kind {
+        FieldKind::String => Ok(Some(bound.as_bytes().to_vec())),
+        FieldKind::Int => {
+            let v: i64 = bound.parse().with_context(|| {
+                format!("filter value {bound:?} is not a valid int64 for field {field:?}")
+            })?;
+            Ok(Some(encode_int_key(v).to_vec()))
+        }
+        FieldKind::Metric => unreachable!("require_field rejected non-indexed kind"),
+    }
 }
 
 /// Empty iterator yields `MetricAggregates::default()` (sum=0,
@@ -1078,13 +1199,13 @@ fn aggregate_iter(values: impl Iterator<Item = i64>) -> MetricAggregates {
 /// chosen aggregate, padded to the longest metric name.
 pub fn write_query_summary(
     out: &mut dyn io::Write,
-    filter: Option<(&str, &str)>,
+    filter: Option<FilterClause<'_>>,
     metrics: &[&str],
     aggregate: Aggregate,
     result: &QueryResult,
 ) -> io::Result<()> {
-    if let Some((field, term)) = filter {
-        writeln!(out, "filter:   {field} = {term:?}")?;
+    if let Some(clause) = filter {
+        writeln!(out, "filter:   {clause}")?;
         writeln!(
             out,
             "matched:  {} / {} docs",
