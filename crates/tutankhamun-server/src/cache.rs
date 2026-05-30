@@ -28,6 +28,7 @@ pub mod size;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path as StdPath, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
@@ -36,6 +37,7 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 use crate::shard::{Metadata, sha256_file};
 use crate::shard_source::ShardSummary;
@@ -143,15 +145,12 @@ impl Cache {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            let bytes = self
+            let get = self
                 .store
                 .get(&meta.location)
                 .await
-                .context("fetch shard file")?
-                .bytes()
-                .await
-                .context("read shard file body")?;
-            atomic_write(&dest, &bytes)?;
+                .context("fetch shard file")?;
+            stream_to_local(&dest, get.into_stream()).await?;
         }
         Ok(())
     }
@@ -293,17 +292,51 @@ fn dir_size(dir: &StdPath) -> Result<u64> {
     Ok(total)
 }
 
-fn atomic_write(dest: &StdPath, bytes: &[u8]) -> Result<()> {
-    // Append `.tmp.<pid>` rather than `with_extension` (which would
-    // *replace* the existing extension): `country.fst` and
-    // `country.posting` must produce different tmp names.
+/// Stream `chunks` into `dest` via a sibling
+/// `.tmp.<pid>.<call>` file, then atomic-rename into place. Peak
+/// memory is one chunk, not the full object — the multi-GiB OOM
+/// you'd otherwise see fetching a big `metrics.arrow` from object
+/// storage.
+///
+/// Tmp name uses `with_file_name` (not `with_extension`): the
+/// latter would *replace* the extension, so `country.fst` and
+/// `country.posting` would both produce `country.tmp.…`. The
+/// per-call counter then disambiguates concurrent fetches of the
+/// same file within one process — e.g. two `tokio::join!`'d queries
+/// against an uncached shard.
+async fn stream_to_local(
+    dest: &StdPath,
+    mut chunks: futures::stream::BoxStream<'_, object_store::Result<bytes::Bytes>>,
+) -> Result<()> {
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
     let file_name = dest
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("no filename in {}", dest.display()))?;
-    let tmp_name = format!("{}.tmp.{}", file_name.to_string_lossy(), std::process::id());
+    let nonce = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(
+        "{}.tmp.{}.{}",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nonce,
+    );
     let tmp = dest.with_file_name(tmp_name);
-    fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    fs::rename(&tmp, dest)
+
+    // No `sync_all` — fsync per posting file would barrier the
+    // disk hundreds of times for a typical shard. Cache integrity
+    // is recovered on the next fetch (content-hash mismatch
+    // triggers re-download; `download`'s prelude `remove_dir_all`
+    // wipes any half-written tree from a crash).
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .with_context(|| format!("create {}", tmp.display()))?;
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.with_context(|| format!("read remote chunk for {}", dest.display()))?;
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("write chunk to {}", tmp.display()))?;
+    }
+    tokio::fs::rename(&tmp, dest)
+        .await
         .with_context(|| format!("rename {} -> {}", tmp.display(), dest.display()))?;
     Ok(())
 }
@@ -610,5 +643,84 @@ mod tests {
         assert!(safe_join(tmp.path(), "foo/./bar").is_err());
         assert!(safe_join(tmp.path(), "foo\0bar").is_err());
         assert!(safe_join(tmp.path(), "ok/nested").is_ok());
+    }
+
+    #[tokio::test]
+    async fn stream_to_local_round_trips_large_payload() {
+        let size = 6 * 1024 * 1024 + 17;
+        let payload: Vec<u8> = (0..size)
+            .map(|i| u8::try_from(i % 251).expect("< 251"))
+            .collect();
+
+        let registry = StorageRegistry::from_url("memory:///").expect("registry");
+        let store = registry.store();
+        let remote_path = Path::from("big.bin");
+        store
+            .put(&remote_path, PutPayload::from(payload.clone()))
+            .await
+            .expect("seed remote");
+
+        let dest_dir = tempfile::tempdir().expect("dest tmpdir");
+        let dest = dest_dir.path().join("big.bin");
+        let get = store.get(&remote_path).await.expect("get");
+        stream_to_local(&dest, get.into_stream())
+            .await
+            .expect("stream");
+
+        let got = fs::read(&dest).expect("read local");
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn fetch_shard_streams_payload_with_large_metric_column() {
+        // End-to-end: a shard whose metrics.arrow exceeds the
+        // typical buffer scratch (~5 MiB) still round-trips through
+        // the cache without ever materialising the whole file in
+        // memory. Covers the OOM regression we're guarding against.
+        let local_src = tempfile::tempdir().expect("tmpdir");
+        // 700_000 i64 values = 5.6 MiB of metric data; the Arrow IPC
+        // wrapping pushes the file just past 5 MiB.
+        let values: Vec<i64> = (0..700_000_i64).collect();
+        write_local_shard(local_src.path(), values);
+        let metrics_size = fs::metadata(local_src.path().join("metrics.arrow"))
+            .unwrap()
+            .len();
+        assert!(
+            metrics_size > 5 * 1024 * 1024,
+            "metrics.arrow {metrics_size}B should exceed 5 MiB for this regression check",
+        );
+
+        let registry = StorageRegistry::from_url("memory:///").unwrap();
+        let store = registry.store();
+        upload_shard(&*store, "data/shard-000", local_src.path()).await;
+
+        let metadata: Metadata = serde_json::from_slice(
+            &store
+                .get(&Path::from("data/shard-000/metadata.json"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let summary = ShardSummary {
+            location: Path::from("data/shard-000"),
+            metadata,
+        };
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(
+            cache_dir.path().to_path_buf(),
+            Arc::clone(&store),
+            "memory:///".to_string(),
+            100 * 1024 * 1024,
+        )
+        .unwrap();
+
+        let local = cache.fetch_shard(&summary).await.expect("fetch");
+        let cached_size = fs::metadata(local.join("metrics.arrow")).unwrap().len();
+        assert_eq!(cached_size, metrics_size, "byte-for-byte parity");
     }
 }
