@@ -8,14 +8,33 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
-use object_store::ObjectStore;
 use object_store::path::Path as ObjPath;
+use object_store::{ObjectStore, PutPayload, WriteMultipart};
 use roaring::RoaringBitmap;
+use tokio::io::AsyncReadExt;
 
 use crate::shard::{DiskShardWriter, FieldKind, METADATA_FILE};
+
+/// Files smaller than this go through a single `put`; larger files
+/// use `put_multipart` so we never buffer the full payload in
+/// memory. The threshold matches S3's 5 MiB minimum per non-final
+/// multipart part (going multipart on smaller files would just add
+/// round-trips for no gain).
+const SINGLE_PUT_THRESHOLD: u64 = 5 * 1024 * 1024;
+
+const STREAM_CHUNK_SIZE: usize = 5 * 1024 * 1024;
+
+const DEFAULT_UPLOAD_CONCURRENCY: usize = 8;
+
+/// Cap on concurrent multipart parts in flight for any one file.
+/// `WriteMultipart::write` spawns a fresh upload task on every full
+/// chunk without applying backpressure; without this cap a 5 GiB
+/// shard would launch ~1024 simultaneous part PUTs.
+const MAX_PARTS_IN_FLIGHT: usize = 8;
 
 /// What to extract from each row, by column name.
 #[derive(Debug, Clone)]
@@ -121,28 +140,46 @@ impl IngestDestination {
 }
 
 /// Upload every shard under `local_root` to `url`, preserving the
-/// directory layout. Within each shard, every payload file uploads
-/// before `metadata.json` so the shard isn't discoverable until it's
-/// complete (the discovery code's "look for metadata.json" check).
+/// directory layout. Shards upload concurrently (capped by
+/// [`upload_concurrency`]); within each shard, every payload file
+/// uploads before `metadata.json` so the shard isn't discoverable
+/// until it's complete (the discovery code's "look for
+/// metadata.json" check).
 ///
 /// "Shard" means any directory under `local_root` that directly
 /// contains a `metadata.json`. Handles both `--shard-by none` (one
 /// shard at the root) and `--shard-by daily`/`hourly` (one shard per
 /// bucket subdir).
 pub async fn upload_ingest_tree(local_root: &Path, url: &str) -> Result<()> {
+    use futures::stream::{StreamExt, TryStreamExt};
+
     let registry = crate::storage::StorageRegistry::from_url(url)?;
     let store = registry.store();
-    for shard_dir in find_shard_dirs(local_root)? {
-        let remote_prefix = shard_dir
+    let shard_dirs = find_shard_dirs(local_root)?;
+    let concurrency = upload_concurrency();
+
+    futures::stream::iter(shard_dirs.into_iter().map(|shard_dir| {
+        let store = Arc::clone(&store);
+        let rel = shard_dir
             .strip_prefix(local_root)
             .expect("find_shard_dirs returns paths under root")
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("/");
-        upload_one_shard(&*store, &shard_dir, &remote_prefix).await?;
-    }
-    Ok(())
+        async move { upload_one_shard(&*store, &shard_dir, &rel).await }
+    }))
+    .buffer_unordered(concurrency)
+    .try_for_each(|()| async { Ok(()) })
+    .await
+}
+
+fn upload_concurrency() -> usize {
+    std::env::var("T9N_UPLOAD_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_UPLOAD_CONCURRENCY)
 }
 
 fn find_shard_dirs(root: &Path) -> Result<Vec<PathBuf>> {
@@ -206,12 +243,58 @@ async fn upload_one_shard(
 }
 
 async fn upload_file(store: &dyn ObjectStore, local: &Path, remote: &ObjPath) -> Result<()> {
-    use object_store::PutPayload;
-    let bytes = std::fs::read(local).with_context(|| format!("read {}", local.display()))?;
-    store
-        .put(remote, PutPayload::from(bytes))
+    let metadata = tokio::fs::metadata(local)
         .await
-        .with_context(|| format!("upload {} -> {remote}", local.display()))?;
+        .with_context(|| format!("stat {}", local.display()))?;
+    if metadata.len() < SINGLE_PUT_THRESHOLD {
+        let bytes = tokio::fs::read(local)
+            .await
+            .with_context(|| format!("read {}", local.display()))?;
+        store
+            .put(remote, PutPayload::from(bytes))
+            .await
+            .with_context(|| format!("upload {} -> {remote}", local.display()))?;
+        return Ok(());
+    }
+    let upload = store
+        .put_multipart(remote)
+        .await
+        .with_context(|| format!("start multipart {} -> {remote}", local.display()))?;
+    let mut writer = WriteMultipart::new_with_chunk_size(upload, STREAM_CHUNK_SIZE);
+    // Drive the read/spawn loop in an inner block: on any error we
+    // must call `writer.abort()` explicitly because S3/GCS don't
+    // auto-clean a multipart upload when the writer is just dropped
+    // — the parts stay billed until a lifecycle rule reaps them.
+    let drive: Result<()> = async {
+        let mut file = tokio::fs::File::open(local)
+            .await
+            .with_context(|| format!("open {}", local.display()))?;
+        let mut buf = vec![0u8; STREAM_CHUNK_SIZE];
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .with_context(|| format!("read {}", local.display()))?;
+            if n == 0 {
+                break;
+            }
+            writer
+                .wait_for_capacity(MAX_PARTS_IN_FLIGHT)
+                .await
+                .with_context(|| format!("multipart backpressure {}", local.display()))?;
+            writer.write(&buf[..n]);
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(err) = drive {
+        let _ = writer.abort().await;
+        return Err(err);
+    }
+    writer
+        .finish()
+        .await
+        .with_context(|| format!("finish multipart {} -> {remote}", local.display()))?;
     Ok(())
 }
 
@@ -1085,5 +1168,57 @@ mod tests {
             }
             crate::shard_source::DatasetQueryOutcome::NoShards => panic!("expected scan"),
         }
+    }
+
+    #[tokio::test]
+    async fn upload_file_round_trip_above_multipart_threshold() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let local = tmp.path().join("big.bin");
+        let size = usize::try_from(SINGLE_PUT_THRESHOLD).expect("fits") + 1024;
+        let payload: Vec<u8> = (0..size)
+            .map(|i| u8::try_from(i % 251).expect("< 251"))
+            .collect();
+        tokio::fs::write(&local, &payload).await.expect("write big");
+
+        let remote = tempfile::tempdir().expect("remote tmpdir");
+        let url = tempdir_url(&remote);
+        let registry = crate::storage::StorageRegistry::from_url(&url).expect("registry");
+        let store = registry.store();
+
+        upload_file(&*store, &local, &ObjPath::from("big.bin"))
+            .await
+            .expect("upload");
+
+        let got = tokio::fs::read(remote.path().join("big.bin"))
+            .await
+            .expect("read back");
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn upload_file_round_trip_below_multipart_threshold() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let local = tmp.path().join("small.bin");
+        let payload: Vec<u8> = (0..1024_usize)
+            .map(|i| u8::try_from(i % 251).expect("< 251"))
+            .collect();
+        tokio::fs::write(&local, &payload)
+            .await
+            .expect("write small");
+
+        let remote = tempfile::tempdir().expect("remote tmpdir");
+        let url = tempdir_url(&remote);
+        let registry = crate::storage::StorageRegistry::from_url(&url).expect("registry");
+        let store = registry.store();
+
+        upload_file(&*store, &local, &ObjPath::from("small.bin"))
+            .await
+            .expect("upload");
+
+        let got = tokio::fs::read(remote.path().join("small.bin"))
+            .await
+            .expect("read back");
+        assert_eq!(got, payload);
     }
 }
