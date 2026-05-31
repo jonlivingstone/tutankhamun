@@ -57,10 +57,13 @@ enum Command {
         /// `n/a` when no docs matched.
         #[arg(long, value_enum, default_value_t = Aggregate::Sum)]
         aggregate: Aggregate,
-        /// Optional `<field>=<term>` restriction (applied to every
-        /// shard).
-        #[arg(long)]
-        filter: Option<String>,
+        /// `<field>=<value>` restriction. Repeatable — multiple
+        /// `--filter`s AND together. `<value>` is either an exact
+        /// term (`country=us`) or an inclusive range
+        /// (`vendor_id=100..200`, with either end optionally open:
+        /// `vendor_id=100..`, `vendor_id=..200`).
+        #[arg(long = "filter")]
+        filters: Vec<String>,
         /// Inclusive lower bound of the time window — only shards
         /// whose time range intersects `[from, to]` are scanned.
         /// Accepts `YYYY-MM-DD` (start-of-day UTC), unix epoch
@@ -197,9 +200,12 @@ enum ShardCommand {
         /// `sum`, `min`, `max`, `avg`.
         #[arg(long, value_enum, default_value_t = Aggregate::Sum)]
         aggregate: Aggregate,
-        /// Optional `<field>=<term>` restriction.
-        #[arg(long)]
-        filter: Option<String>,
+        /// `<field>=<value>` restriction. Repeatable — multiple
+        /// `--filter`s AND together. `<value>` is either an exact
+        /// term (`country=us`) or an inclusive range
+        /// (`vendor_id=100..200`, with either end optionally open).
+        #[arg(long = "filter")]
+        filters: Vec<String>,
     },
 }
 
@@ -235,7 +241,7 @@ fn main() -> anyhow::Result<()> {
             source,
             metrics,
             aggregate,
-            filter,
+            filters,
             from,
             to,
             cache_dir,
@@ -244,7 +250,7 @@ fn main() -> anyhow::Result<()> {
             source,
             metrics,
             *aggregate,
-            filter.as_deref(),
+            filters,
             from.as_deref(),
             to.as_deref(),
             cache_dir.as_deref(),
@@ -314,7 +320,7 @@ fn run_query(
     source: &str,
     metrics: &[String],
     aggregate: Aggregate,
-    filter: Option<&str>,
+    filters: &[String],
     from: Option<&str>,
     to: Option<&str>,
     cache_dir: Option<&std::path::Path>,
@@ -324,7 +330,7 @@ fn run_query(
 
     // clap's `required = true` on `metrics` guarantees non-empty.
     let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
-    let parsed = filter.map(parse_filter).transpose()?;
+    let parsed_filters = parse_filters(filters)?;
     let time_range = parse_time_range(from, to)?;
     let url = shard_source::resolve_source_url(source)?;
     let cache_dir = resolve_cache_dir(cache_dir);
@@ -339,13 +345,19 @@ fn run_query(
     let output = runtime.block_on(shard_source::query_dataset(
         &url,
         &cache,
-        parsed,
+        &parsed_filters,
         &metric_refs,
         time_range,
     ))?;
     let stdout = io::stdout();
     let mut out = stdout.lock();
-    shard_source::render_dataset_query_output(&mut out, &output, parsed, &metric_refs, aggregate)?;
+    shard_source::render_dataset_query_output(
+        &mut out,
+        &output,
+        &parsed_filters,
+        &metric_refs,
+        aggregate,
+    )?;
     Ok(())
 }
 
@@ -505,19 +517,32 @@ fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
             path,
             metrics,
             aggregate,
-            filter,
+            filters,
         } => {
             // clap's `required = true` on `metrics` guarantees non-empty.
             let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
-            let parsed = filter.as_deref().map(parse_filter).transpose()?;
-            let result = shard::query_shard(path, parsed, &metric_refs)?;
+            let parsed_filters = parse_filters(filters)?;
+            let result = shard::query_shard(path, &parsed_filters, &metric_refs)?;
             let stdout = io::stdout();
             let mut out = stdout.lock();
             writeln!(out, "shard:    {}", path.display())?;
-            shard::write_query_summary(&mut out, parsed, &metric_refs, *aggregate, &result)?;
+            shard::write_query_summary(
+                &mut out,
+                &parsed_filters,
+                &metric_refs,
+                *aggregate,
+                &result,
+            )?;
             Ok(())
         }
     }
+}
+
+/// Parse every `--filter` argument in `raw` into [`FilterClause`]s in
+/// the same order. Borrows from `raw` — caller keeps it alive for the
+/// duration of the query.
+fn parse_filters(raw: &[String]) -> anyhow::Result<Vec<shard::FilterClause<'_>>> {
+    raw.iter().map(|s| parse_filter(s)).collect()
 }
 
 /// Parse a `--filter` argument into a structured [`FilterClause`].

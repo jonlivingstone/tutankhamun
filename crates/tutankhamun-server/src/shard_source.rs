@@ -241,7 +241,7 @@ pub enum DatasetQueryOutcome {
 pub async fn query_dataset(
     url: &str,
     cache: &crate::cache::Cache,
-    filter: Option<crate::shard::FilterClause<'_>>,
+    filters: &[crate::shard::FilterClause<'_>],
     metrics: &[&str],
     time_range: Option<(i64, i64)>,
 ) -> Result<DatasetQueryOutput> {
@@ -283,7 +283,7 @@ pub async fn query_dataset(
             .fetch_shard(summary)
             .await
             .with_context(|| format!("cache fetch {}", summary.location))?;
-        let r = crate::shard::query_shard(&local_dir, filter, metrics)
+        let r = crate::shard::query_shard(&local_dir, filters, metrics)
             .with_context(|| format!("query {}", summary.location))?;
         total.num_docs += r.num_docs;
         total.matched += r.matched;
@@ -308,7 +308,7 @@ pub async fn query_dataset(
 pub fn render_dataset_query_output(
     out: &mut dyn std::io::Write,
     output: &DatasetQueryOutput,
-    filter: Option<crate::shard::FilterClause<'_>>,
+    filters: &[crate::shard::FilterClause<'_>],
     metrics: &[&str],
     aggregate: crate::shard::Aggregate,
 ) -> std::io::Result<()> {
@@ -328,7 +328,7 @@ pub fn render_dataset_query_output(
             result,
         } => {
             writeln!(out, "shards:   {shards_scanned} scanned")?;
-            crate::shard::write_query_summary(out, filter, metrics, aggregate, result)
+            crate::shard::write_query_summary(out, filters, metrics, aggregate, result)
         }
     }
 }
@@ -344,7 +344,7 @@ mod tests {
     /// cache so the existing text-shape assertions stay terse.
     async fn query_dataset_cli(
         root: &std::path::Path,
-        filter: Option<crate::shard::FilterClause<'_>>,
+        filters: &[crate::shard::FilterClause<'_>],
         metrics: &[&str],
         aggregate: crate::shard::Aggregate,
         time_range: Option<(i64, i64)>,
@@ -359,8 +359,8 @@ mod tests {
             url.clone(),
             u64::MAX,
         )?;
-        let output = query_dataset(&url, &cache, filter, metrics, time_range).await?;
-        render_dataset_query_output(out, &output, filter, metrics, aggregate)?;
+        let output = query_dataset(&url, &cache, filters, metrics, time_range).await?;
+        render_dataset_query_output(out, &output, filters, metrics, aggregate)?;
         std::mem::forget(cache_dir);
         Ok(())
     }
@@ -644,7 +644,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            Some(crate::shard::FilterClause::equals("country", "us")),
+            &[crate::shard::FilterClause::equals("country", "us")],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             None,
@@ -672,7 +672,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             None,
@@ -693,7 +693,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             None,
@@ -714,7 +714,7 @@ mod tests {
         let mut buf = Vec::new();
         let err = query_dataset_cli(
             &file_path,
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             None,
@@ -753,7 +753,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             Some((86_400, 200_000)),
@@ -776,7 +776,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             Some((3 * 86_400, i64::MAX)),
@@ -797,7 +797,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             Some((i64::MIN, 86_400 + 60)),
@@ -818,7 +818,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             Some((10 * 86_400, 11 * 86_400)),
@@ -854,7 +854,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks", "impressions"],
             crate::shard::Aggregate::Sum,
             None,
@@ -881,7 +881,7 @@ mod tests {
         let mut buf = Vec::new();
         let err = query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             Some((200_000, 86_400)),
@@ -902,7 +902,7 @@ mod tests {
         let mut buf = Vec::new();
         query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["clicks"],
             crate::shard::Aggregate::Sum,
             None,
@@ -924,7 +924,7 @@ mod tests {
         let mut buf = Vec::new();
         let err = query_dataset_cli(
             tmp.path(),
-            None,
+            &[],
             &["no_such_metric"],
             crate::shard::Aggregate::Sum,
             None,

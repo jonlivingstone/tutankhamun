@@ -1031,17 +1031,17 @@ impl std::fmt::Display for FilterClause<'_> {
 }
 
 /// Open the shard at `path`, optionally restrict to docs matching
-/// `filter = Some(clause)`, and compute sum/min/max for each named
-/// metric over the resulting doc set. Returns one
-/// [`MetricAggregates`] per input metric in declaration order. Avg is
-/// derived at display time from `sum / matched` so it composes
-/// correctly across shards.
+/// every clause in `filters` (AND semantics; empty slice = match
+/// all), and compute sum/min/max for each named metric over the
+/// resulting doc set. Returns one [`MetricAggregates`] per input
+/// metric in declaration order. Avg is derived at display time from
+/// `sum / matched` so it composes correctly across shards.
 ///
 /// All three aggregates are computed in a single scan; picking which
 /// one(s) to display is the caller's job.
 pub fn query_shard(
     path: &Path,
-    filter: Option<FilterClause<'_>>,
+    filters: &[FilterClause<'_>],
     metrics: &[&str],
 ) -> Result<QueryResult> {
     let shard = DiskShard::open(path)?;
@@ -1066,75 +1066,23 @@ pub fn query_shard(
         })
         .collect::<Result<_>>()?;
 
-    let (matched, aggregates) = if let Some(clause) = filter {
-        // String or Int field — both have an inverted index, but the
-        // term encoding differs: String uses UTF-8 bytes directly,
-        // Int parses the decimal term and encodes via encode_int_key.
-        let filter_field =
-            require_field(metadata, clause.field, &[FieldKind::String, FieldKind::Int])?;
-        let idx = shard
-            .inverted_index(clause.field)
-            .expect("indexed field kind validated above");
-        let bm = match clause.op {
-            FilterOp::Equals(term) => {
-                let key = encode_bound(filter_field.kind, clause.field, Some(term))?
-                    .expect("Some bound yields Some encoded key");
-                idx.lookup_bytes(&key)
-            }
-            FilterOp::Range { lo, hi } => {
-                use roaring::MultiOps;
-                if lo.is_none() && hi.is_none() {
-                    // Reachable only via a programmatic
-                    // `FilterClause::range(_, None, None)`; the CLI
-                    // parser rejects `field=..` upstream. Hard-fail
-                    // so the misuse can't silently match every doc.
-                    bail!(
-                        "range filter for field {field:?} must have at least one bound",
-                        field = clause.field,
-                    );
-                }
-                let lo_bytes = encode_bound(filter_field.kind, clause.field, lo)?;
-                let hi_bytes = encode_bound(filter_field.kind, clause.field, hi)?;
-                // Encoded byte order matches the desired range
-                // semantics for both kinds (UTF-8 lex for String,
-                // numeric via encode_int_key for Int), so a byte
-                // compare catches inverted ranges across both.
-                if let (Some(l), Some(h)) = (&lo_bytes, &hi_bytes)
-                    && l > h
-                {
-                    bail!(
-                        "range filter for field {field:?}: lower bound {lo:?} exceeds upper bound {hi:?}",
-                        field = clause.field,
-                        lo = lo.expect("checked above"),
-                        hi = hi.expect("checked above"),
-                    );
-                }
-                // Tree-reduced k-way union — for wide ranges over
-                // high-cardinality fields this beats pairwise `|=`
-                // because intermediate bitmap sizes stay smaller.
-                let union: RoaringBitmap = idx
-                    .range_bytes(lo_bytes.as_deref(), hi_bytes.as_deref())
-                    .map(|(_, bm)| bm)
-                    .union();
-                if union.is_empty() { None } else { Some(union) }
-            }
-        };
-        bm.map_or_else(
-            || (0u64, vec![MetricAggregates::default(); cols.len()]),
-            |bm| {
-                let aggs: Vec<MetricAggregates> = cols
-                    .iter()
-                    .map(|col| aggregate_iter(bm.iter().map(|d| col[d as usize])))
-                    .collect();
-                (bm.len(), aggs)
-            },
-        )
-    } else {
-        let aggs: Vec<MetricAggregates> = cols
-            .iter()
-            .map(|col| aggregate_iter(col.iter().copied()))
-            .collect();
-        (metadata.num_docs, aggs)
+    let combined = combine_filters(&shard, metadata, filters)?;
+    let (matched, aggregates) = match combined {
+        FilterResult::All => {
+            let aggs: Vec<MetricAggregates> = cols
+                .iter()
+                .map(|col| aggregate_iter(col.iter().copied()))
+                .collect();
+            (metadata.num_docs, aggs)
+        }
+        FilterResult::Empty => (0u64, vec![MetricAggregates::default(); cols.len()]),
+        FilterResult::Bitmap(bm) => {
+            let aggs: Vec<MetricAggregates> = cols
+                .iter()
+                .map(|col| aggregate_iter(bm.iter().map(|d| col[d as usize])))
+                .collect();
+            (bm.len(), aggs)
+        }
     };
 
     Ok(QueryResult {
@@ -1142,6 +1090,103 @@ pub fn query_shard(
         matched,
         aggregates,
     })
+}
+
+/// Outcome of intersecting every filter clause: either no filter was
+/// supplied (match every doc), some clause matched no docs (whole
+/// result is empty, short-circuiting the rest), or a concrete doc set.
+enum FilterResult {
+    All,
+    Empty,
+    Bitmap(RoaringBitmap),
+}
+
+fn combine_filters(
+    shard: &DiskShard,
+    metadata: &Metadata,
+    filters: &[FilterClause<'_>],
+) -> Result<FilterResult> {
+    use roaring::MultiOps;
+
+    if filters.is_empty() {
+        return Ok(FilterResult::All);
+    }
+    let mut resolved: Vec<RoaringBitmap> = Vec::with_capacity(filters.len());
+    for clause in filters {
+        match resolve_filter(shard, metadata, clause)? {
+            Some(bm) => resolved.push(bm),
+            None => return Ok(FilterResult::Empty),
+        }
+    }
+    // Tree-reduced k-way intersection — beats pairwise `&=` when
+    // bitmaps differ in size (smallest pair reduced first).
+    let intersection: RoaringBitmap = resolved.into_iter().intersection();
+    Ok(if intersection.is_empty() {
+        FilterResult::Empty
+    } else {
+        FilterResult::Bitmap(intersection)
+    })
+}
+
+/// Resolve one filter clause to its matched doc set, or `None` if no
+/// docs match (a clause whose term/range hits zero terms in the
+/// inverted index).
+fn resolve_filter(
+    shard: &DiskShard,
+    metadata: &Metadata,
+    clause: &FilterClause<'_>,
+) -> Result<Option<RoaringBitmap>> {
+    // String or Int field — both have an inverted index, but the
+    // term encoding differs: String uses UTF-8 bytes directly, Int
+    // parses the decimal term and encodes via encode_int_key.
+    let filter_field = require_field(metadata, clause.field, &[FieldKind::String, FieldKind::Int])?;
+    let idx = shard
+        .inverted_index(clause.field)
+        .expect("indexed field kind validated above");
+    match clause.op {
+        FilterOp::Equals(term) => {
+            let key = encode_bound(filter_field.kind, clause.field, Some(term))?
+                .expect("Some bound yields Some encoded key");
+            Ok(idx.lookup_bytes(&key))
+        }
+        FilterOp::Range { lo, hi } => {
+            use roaring::MultiOps;
+            if lo.is_none() && hi.is_none() {
+                // Reachable only via a programmatic
+                // `FilterClause::range(_, None, None)`; the CLI
+                // parser rejects `field=..` upstream. Hard-fail so
+                // the misuse can't silently match every doc.
+                bail!(
+                    "range filter for field {field:?} must have at least one bound",
+                    field = clause.field,
+                );
+            }
+            let lo_bytes = encode_bound(filter_field.kind, clause.field, lo)?;
+            let hi_bytes = encode_bound(filter_field.kind, clause.field, hi)?;
+            // Encoded byte order matches the desired range semantics
+            // for both kinds (UTF-8 lex for String, numeric via
+            // encode_int_key for Int), so a byte compare catches
+            // inverted ranges across both.
+            if let (Some(l), Some(h)) = (&lo_bytes, &hi_bytes)
+                && l > h
+            {
+                bail!(
+                    "range filter for field {field:?}: lower bound {lo:?} exceeds upper bound {hi:?}",
+                    field = clause.field,
+                    lo = lo.expect("checked above"),
+                    hi = hi.expect("checked above"),
+                );
+            }
+            // Tree-reduced k-way union — for wide ranges over
+            // high-cardinality fields this beats pairwise `|=`
+            // because intermediate bitmap sizes stay smaller.
+            let union: RoaringBitmap = idx
+                .range_bytes(lo_bytes.as_deref(), hi_bytes.as_deref())
+                .map(|(_, bm)| bm)
+                .union();
+            Ok(if union.is_empty() { None } else { Some(union) })
+        }
+    }
 }
 
 /// Encode a single filter bound (either side of a range, or the
@@ -1199,20 +1244,22 @@ fn aggregate_iter(values: impl Iterator<Item = i64>) -> MetricAggregates {
 /// chosen aggregate, padded to the longest metric name.
 pub fn write_query_summary(
     out: &mut dyn io::Write,
-    filter: Option<FilterClause<'_>>,
+    filters: &[FilterClause<'_>],
     metrics: &[&str],
     aggregate: Aggregate,
     result: &QueryResult,
 ) -> io::Result<()> {
-    if let Some(clause) = filter {
-        writeln!(out, "filter:   {clause}")?;
+    if filters.is_empty() {
+        writeln!(out, "matched:  all {} docs", result.num_docs)?;
+    } else {
+        for clause in filters {
+            writeln!(out, "filter:   {clause}")?;
+        }
         writeln!(
             out,
             "matched:  {} / {} docs",
             result.matched, result.num_docs
         )?;
-    } else {
-        writeln!(out, "matched:  all {} docs", result.num_docs)?;
     }
     let widest = metrics.iter().map(|m| m.len()).max().unwrap_or(0);
     let op_name = match aggregate {

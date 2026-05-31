@@ -1158,7 +1158,7 @@ mod tests {
         )
         .expect("cache");
 
-        let output = crate::shard_source::query_dataset(&url, &cache, None, &["fare"], None)
+        let output = crate::shard_source::query_dataset(&url, &cache, &[], &["fare"], None)
             .await
             .expect("query");
         match output.outcome {
