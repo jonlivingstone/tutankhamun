@@ -58,7 +58,7 @@ pub struct PrefixStats {
     /// is used for objects that sit directly at the backend root.
     pub prefix: String,
     pub objects: usize,
-    pub bytes: usize,
+    pub bytes: u64,
 }
 
 /// One-level-deep scan of `store`, returning per-prefix counts suitable
@@ -70,7 +70,7 @@ pub async fn summarize(store: &dyn ObjectStore) -> anyhow::Result<Vec<PrefixStat
     let mut stats = Vec::with_capacity(root.common_prefixes.len() + 1);
 
     if !root.objects.is_empty() {
-        let bytes: usize = root.objects.iter().map(|o| o.size).sum();
+        let bytes: u64 = root.objects.iter().map(|o| o.size).sum();
         stats.push(PrefixStats {
             prefix: "(root)".to_string(),
             objects: root.objects.len(),
@@ -80,7 +80,7 @@ pub async fn summarize(store: &dyn ObjectStore) -> anyhow::Result<Vec<PrefixStat
 
     let sub_futs = root.common_prefixes.iter().map(|prefix| async move {
         let sub = store.list_with_delimiter(Some(prefix)).await?;
-        let bytes: usize = sub.objects.iter().map(|o| o.size).sum();
+        let bytes: u64 = sub.objects.iter().map(|o| o.size).sum();
         Ok::<_, anyhow::Error>(PrefixStats {
             prefix: prefix.to_string(),
             objects: sub.objects.len(),
@@ -102,7 +102,7 @@ pub async fn check(store: &dyn ObjectStore, prefix: Option<&str>) -> anyhow::Res
     let mut stream = store.list(prefix_path.as_ref());
 
     let mut count = 0usize;
-    let mut total_bytes: usize = 0;
+    let mut total_bytes: u64 = 0;
     while let Some(meta) = stream.next().await {
         let meta = meta?;
         count += 1;

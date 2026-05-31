@@ -10,4 +10,5 @@ pub mod runtime;
 pub mod shard;
 pub mod shard_source;
 pub mod shutdown;
+pub mod sql;
 pub mod storage;

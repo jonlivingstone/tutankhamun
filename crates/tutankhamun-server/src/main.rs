@@ -131,6 +131,27 @@ enum Command {
         #[arg(long, value_enum, default_value_t = ShardByArg::None)]
         shard_by: ShardByArg,
     },
+    /// Run a SQL query over a dataset via `DataFusion` and print the
+    /// result table. The dataset is registered as a table named `t`.
+    Sql {
+        /// Where the shards live. Accepts a local directory path or
+        /// any `object_store` URL (`s3://`, `gs://`, `az://`,
+        /// `file://`, `memory://`). Bare paths are treated as
+        /// `file://`.
+        source: String,
+        /// The SQL query. Reference the dataset as table `t`, e.g.
+        /// `SELECT country, sum(fare) FROM t WHERE vendor_id > 2
+        /// GROUP BY country`.
+        query: String,
+        /// Directory for the local shard cache. Same default and
+        /// semantics as `t9n query --cache-dir`.
+        #[arg(long, env = "T9N_CACHE_DIR")]
+        cache_dir: Option<PathBuf>,
+        /// Hard cap on resident cache bytes. Same forms as
+        /// `t9n query --cache-size` (`10GB`, `1.5TB`, `50%`).
+        #[arg(long, env = "T9N_CACHE_SIZE", default_value = "10GB")]
+        cache_size: String,
+    },
 }
 
 /// CLI-facing shard-by aliases. Maps to the engine's duration-based
@@ -268,6 +289,12 @@ fn main() -> anyhow::Result<()> {
         } => run_ingest(
             input, output, time, metrics, strings, ints, *delimiter, *shard_by,
         ),
+        Command::Sql {
+            source,
+            query,
+            cache_dir,
+            cache_size,
+        } => run_sql(source, query, cache_dir.as_deref(), cache_size),
     }
 }
 
@@ -359,6 +386,47 @@ fn run_query(
         aggregate,
     )?;
     Ok(())
+}
+
+/// Run a SQL `query` over the dataset at `source` via `DataFusion`,
+/// registering it as table `t`, and print the result as a table.
+fn run_sql(
+    source: &str,
+    query: &str,
+    cache_dir: Option<&std::path::Path>,
+    cache_size: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    use datafusion::prelude::SessionContext;
+    use std::sync::Arc;
+    use tutankhamun_server::cache::Cache;
+    use tutankhamun_server::sql::TutankhamunTableProvider;
+
+    let url = shard_source::resolve_source_url(source)?;
+    let cache_dir = resolve_cache_dir(cache_dir);
+    let size_cap = tutankhamun_server::cache::size::parse_cache_size(cache_size, &cache_dir)
+        .context("parse --cache-size")?;
+    let registry = StorageRegistry::from_url(&url)?;
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let cache = Arc::new(Cache::open(
+            cache_dir,
+            registry.store(),
+            url.clone(),
+            size_cap,
+        )?);
+        let provider = TutankhamunTableProvider::try_new(url, cache).await?;
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(provider))
+            .context("register table t")?;
+        let batches = ctx.sql(query).await?.collect().await?;
+        let rendered = arrow::util::pretty::pretty_format_batches(&batches)?;
+        println!("{rendered}");
+        anyhow::Ok(())
+    })
 }
 
 /// Turn a user-supplied `source` (bare path or `object_store` URL)
@@ -654,7 +722,7 @@ async fn log_storage_scan(store: &dyn object_store::ObjectStore) {
                 info!(prefix = %s.prefix, objects = s.objects, bytes = s.bytes, "dataset");
             }
             let total_objects: usize = stats.iter().map(|s| s.objects).sum();
-            let total_bytes: usize = stats.iter().map(|s| s.bytes).sum();
+            let total_bytes: u64 = stats.iter().map(|s| s.bytes).sum();
             info!(
                 prefixes = stats.len(),
                 total_objects, total_bytes, "storage scan complete"

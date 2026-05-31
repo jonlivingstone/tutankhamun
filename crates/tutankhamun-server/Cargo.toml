@@ -42,6 +42,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 fs2 = { workspace = true }
 tempfile = { workspace = true }
+datafusion = "50"
 
 [dev-dependencies]
 tower = { workspace = true }

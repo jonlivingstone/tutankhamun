@@ -50,7 +50,7 @@ serde = { version = "1", features = ["derive"] }
 directories = "5"
 
 # Object storage (S3 / GCS / Azure / S3-compatible / local / HTTP / in-memory)
-object_store = { version = "0.11", features = ["aws", "azure", "gcp", "http"] }
+object_store = { version = "0.12", features = ["aws", "azure", "gcp", "http"] }
 url = "2"
 futures = "0.3"
 async-trait = "0.1"
@@ -79,10 +79,6 @@ fs2 = "0.4"
 
 # Dev-only
 tempfile = "3"
-
-# Internal crates
-tutankhamun-server = { path = "crates/tutankhamun-server" }
-tutankhamun-client = { path = "crates/tutankhamun-client" }
 
 [profile.release]
 lto = "thin"

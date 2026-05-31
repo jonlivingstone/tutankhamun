@@ -45,6 +45,7 @@ use crate::shard_source::ShardSummary;
 const SHARD_KEY_LEN: usize = 16;
 
 /// Hot-storage cache backed by a local directory.
+#[derive(Debug)]
 pub struct Cache {
     dir: PathBuf,
     store: Arc<dyn ObjectStore>,
@@ -53,12 +54,13 @@ pub struct Cache {
     state: Mutex<CacheState>,
 }
 
+#[derive(Debug)]
 struct CacheState {
     total_bytes: u64,
     shards: HashMap<String, ShardEntry>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ShardEntry {
     local_dir: PathBuf,
     size_bytes: u64,

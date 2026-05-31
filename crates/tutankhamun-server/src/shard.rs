@@ -1095,10 +1095,28 @@ pub fn query_shard(
 /// Outcome of intersecting every filter clause: either no filter was
 /// supplied (match every doc), some clause matched no docs (whole
 /// result is empty, short-circuiting the rest), or a concrete doc set.
-enum FilterResult {
+/// Public form of the engine's per-shard filter-resolution result.
+/// Used internally by [`query_shard`] for aggregate dispatch and
+/// externally by the SQL `TableProvider` to drive row-set
+/// materialisation.
+#[derive(Debug)]
+pub enum FilterResult {
+    /// No filter supplied — every doc matches.
     All,
+    /// Filter matched zero docs (or some clause hit zero terms in
+    /// the index and short-circuited the intersection).
     Empty,
+    /// Concrete matched doc set.
     Bitmap(RoaringBitmap),
+}
+
+/// Resolve every clause in `filters` against `shard`, AND-intersect
+/// the per-clause bitmaps, and return the [`FilterResult`] dispatch
+/// shape. Empty `filters` slice → `All`; any clause that hits zero
+/// terms short-circuits the whole result to `Empty`.
+pub fn matched_doc_set(shard: &DiskShard, filters: &[FilterClause<'_>]) -> Result<FilterResult> {
+    let metadata = shard.metadata();
+    combine_filters(shard, metadata, filters)
 }
 
 fn combine_filters(
