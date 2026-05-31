@@ -148,11 +148,14 @@ directly.
 - [ ] `arrow.flight.protocol.FlightService` registration — §1.2
 - [ ] `DoGet(Ticket)` for FTGS result streaming as Arrow record
       batches — §1.2
+- [x] DataFusion embedded as a dependency — §3.2
+- [x] Tutankhamun `TableProvider` implementation (Tier 1: projection
+      + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
+- [ ] Time-range shard pruning in the SQL scan (prune shards by a
+      predicate on the time column before fetch) — §3.2
+- [ ] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
+      FTGS scan (Tier 2/3) — §3.2
 - [ ] FlightSQL service implementation — §3.2
-- [ ] DataFusion embedded as a dependency — §3.2
-- [ ] Tutankhamun `TableProvider` implementation — §3.2
-- [ ] Filter / projection / aggregation pushdown from DataFusion
-      → Tutankhamun scan — §3.2
 - [ ] Session-aware SQL execution — DataFusion planner reuses
       session state when new query's filter refines previous — §3.2
 - [ ] Session-affinity metadata header
