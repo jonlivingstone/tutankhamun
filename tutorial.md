@@ -111,6 +111,16 @@ cargo run --release --bin t9n -- query \
 # shards 31; matched 1734 / 56075; sum 1,467,974
 ```
 
+`--filter` is repeatable — multiple clauses AND together. Members
+starting at Hoboken Terminal:
+
+```sh
+cargo run --release --bin t9n -- query \
+    .local/storage/citibike/jc-202301 \
+    --filter start_station_id=HB101 --filter member_casual=member \
+    --metric trip_seconds
+```
+
 ## 5. Your own data
 
 Run `cargo run --release --bin t9n -- ingest --help` to see the
