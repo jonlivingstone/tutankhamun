@@ -64,16 +64,21 @@ pub(crate) fn expr_to_pushed_filter(expr: &Expr) -> Option<PushedFilter> {
         _ => return None,
     };
 
-    let term = scalar_to_string(literal)?;
-    // Strict `<` / `>` widen to inclusive `<=` / `>=` (the FST range
-    // is inclusive-only), so they're marked inexact: the scan over-
-    // returns the boundary value and DataFusion re-applies the strict
-    // predicate. `=`, `<=`, `>=` map exactly.
+    let Rendered { term, lossless } = render_literal(literal)?;
+    // A filter is exact (DataFusion skips re-checking) only when both:
+    //  - the operator maps without widening — `=`, `<=`, `>=` do;
+    //    strict `<` / `>` widen to inclusive bounds (the FST range is
+    //    inclusive-only) and over-return the boundary value; and
+    //  - the literal rendered losslessly — a sub-second timestamp
+    //    floored to whole seconds (the time field's granularity) can't
+    //    be honored exactly.
+    // Inexact filters still prune at scan time; DataFusion re-applies
+    // the original predicate to drop the extra rows.
     match op {
         Operator::Eq => Some(PushedFilter {
             field,
             op: PushedOp::Equals(term),
-            exact: true,
+            exact: lossless,
         }),
         Operator::GtEq | Operator::Gt => Some(PushedFilter {
             field,
@@ -81,7 +86,7 @@ pub(crate) fn expr_to_pushed_filter(expr: &Expr) -> Option<PushedFilter> {
                 lo: Some(term),
                 hi: None,
             },
-            exact: op == Operator::GtEq,
+            exact: lossless && op == Operator::GtEq,
         }),
         Operator::LtEq | Operator::Lt => Some(PushedFilter {
             field,
@@ -89,7 +94,7 @@ pub(crate) fn expr_to_pushed_filter(expr: &Expr) -> Option<PushedFilter> {
                 lo: None,
                 hi: Some(term),
             },
-            exact: op == Operator::LtEq,
+            exact: lossless && op == Operator::LtEq,
         }),
         _ => None,
     }
@@ -106,24 +111,57 @@ fn flip(op: Operator) -> Option<Operator> {
     })
 }
 
+/// A scalar literal rendered as the text the engine's per-field-kind
+/// parser expects, plus whether that render was lossless.
+struct Rendered {
+    term: String,
+    /// `true` when `term` reproduces the literal exactly. Only a
+    /// sub-second timestamp floored to whole seconds sets this
+    /// `false`; every other scalar renders losslessly.
+    lossless: bool,
+}
+
 /// Render a scalar literal as the text the engine's per-field-kind
 /// parser expects. Strings borrow their UTF-8; integers format to
 /// decimal text (the same form `t9n query --filter` accepts).
 /// Returns `None` for null / list / struct / non-text-renderable
 /// scalars.
-fn scalar_to_string(v: &ScalarValue) -> Option<String> {
+fn render_literal(v: &ScalarValue) -> Option<Rendered> {
+    // Convert a sub-second timestamp to whole seconds, flooring with
+    // `div_euclid`; `lossless` is true only when the literal already
+    // sat on a second boundary. The time field has second
+    // granularity, so a finer bound can't be represented exactly:
+    // DataFusion re-applies the original predicate (range filters
+    // from `<`/`>` are already reported inexact, and equality on a
+    // finer literal simply won't match a whole-second column).
+    let secs = |n: i64, per_sec: i64| Rendered {
+        term: n.div_euclid(per_sec).to_string(),
+        lossless: n.rem_euclid(per_sec) == 0,
+    };
+    let lossless = |term: String| Rendered {
+        term,
+        lossless: true,
+    };
     match v {
-        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(s.clone()),
-        ScalarValue::Int8(Some(n)) => Some(n.to_string()),
-        ScalarValue::Int16(Some(n)) => Some(n.to_string()),
-        ScalarValue::Int32(Some(n)) => Some(n.to_string()),
-        ScalarValue::Int64(Some(n)) => Some(n.to_string()),
-        ScalarValue::UInt8(Some(n)) => Some(n.to_string()),
-        ScalarValue::UInt16(Some(n)) => Some(n.to_string()),
-        ScalarValue::UInt32(Some(n)) => Some(n.to_string()),
+        ScalarValue::Utf8(Some(s)) | ScalarValue::LargeUtf8(Some(s)) => Some(lossless(s.clone())),
+        ScalarValue::Int8(Some(n)) => Some(lossless(n.to_string())),
+        ScalarValue::Int16(Some(n)) => Some(lossless(n.to_string())),
+        ScalarValue::Int32(Some(n)) => Some(lossless(n.to_string())),
+        // Whole-second timestamps render exactly like an Int64 (the
+        // time field is stored as epoch seconds); the sub-second
+        // variants below floor to seconds.
+        ScalarValue::Int64(Some(n)) | ScalarValue::TimestampSecond(Some(n), _) => {
+            Some(lossless(n.to_string()))
+        }
+        ScalarValue::UInt8(Some(n)) => Some(lossless(n.to_string())),
+        ScalarValue::UInt16(Some(n)) => Some(lossless(n.to_string())),
+        ScalarValue::UInt32(Some(n)) => Some(lossless(n.to_string())),
         // UInt64 may exceed i64; the engine's int parser catches
         // out-of-range values with a clear error.
-        ScalarValue::UInt64(Some(n)) => Some(n.to_string()),
+        ScalarValue::UInt64(Some(n)) => Some(lossless(n.to_string())),
+        ScalarValue::TimestampMillisecond(Some(n), _) => Some(secs(*n, 1_000)),
+        ScalarValue::TimestampMicrosecond(Some(n), _) => Some(secs(*n, 1_000_000)),
+        ScalarValue::TimestampNanosecond(Some(n), _) => Some(secs(*n, 1_000_000_000)),
         _ => None,
     }
 }

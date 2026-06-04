@@ -71,6 +71,14 @@ pub struct Metadata {
     /// shards written with `format_version` 1.
     #[serde(default)]
     pub content_hashes: std::collections::BTreeMap<String, String>,
+    /// Name of the field (an `Int` field in `fields`) that holds each
+    /// doc's time as epoch seconds — the `--time` column at ingest.
+    /// `None` for shards written before per-doc time was stored; those
+    /// still carry the shard-level `time_range_*` but expose no
+    /// per-row time column. The SQL layer presents this field as an
+    /// Arrow `Timestamp`.
+    #[serde(default)]
+    pub time_field: Option<String>,
 }
 
 impl Metadata {
@@ -485,6 +493,7 @@ pub struct DiskShardWriter {
     forward_cols: Vec<ForwardCol>,
     string_fields: Vec<(String, BTreeMap<String, RoaringBitmap>)>,
     num_docs: Option<u64>,
+    time_field: Option<String>,
 }
 
 /// One forward-column field, used for both `Metric` and `Int` kinds.
@@ -505,7 +514,16 @@ impl DiskShardWriter {
             forward_cols: Vec::new(),
             string_fields: Vec::new(),
             num_docs: None,
+            time_field: None,
         })
+    }
+
+    /// Record which field holds each doc's time (an `Int` field added
+    /// separately via [`add_int_field`]). Stamped into
+    /// [`Metadata::time_field`] at finalize so the query layer can
+    /// present it as a timestamp and prune shards by it.
+    pub fn set_time_field(&mut self, name: &str) {
+        self.time_field = Some(name.to_string());
     }
 
     /// Add a metric (`Int64`) column — aggregatable, not filterable.
@@ -653,6 +671,7 @@ impl DiskShardWriter {
             time_range_end: self.time_range.1,
             fields,
             content_hashes: BTreeMap::new(),
+            time_field: self.time_field.clone(),
         };
 
         let arrow_fields: Vec<Field> = self

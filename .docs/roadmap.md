@@ -151,7 +151,7 @@ directly.
 - [x] DataFusion embedded as a dependency — §3.2
 - [x] Tutankhamun `TableProvider` implementation (Tier 1: projection
       + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
-- [ ] Time-range shard pruning in the SQL scan (prune shards by a
+- [x] Time-range shard pruning in the SQL scan (prune shards by a
       predicate on the time column before fetch) — §3.2
 - [ ] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
       FTGS scan (Tier 2/3) — §3.2

@@ -5,7 +5,7 @@ use std::any::Any;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::Result as DfResult;
@@ -130,20 +130,43 @@ impl TableProvider for TutankhamunTableProvider {
 fn arrow_schema_from_metadata(metadata: &Metadata) -> SchemaRef {
     // Every declared field is exposed to DataFusion: Metric/Int as
     // Int64 (read from forward columns), String as Utf8
-    // (reconstructed per doc from the inverted index at scan time).
-    // String reconstruction is O(num_docs) per shard per field —
-    // acceptable for Tier 1; cheaper paths arrive with the FTGS
-    // work.
+    // (reconstructed per doc from the inverted index at scan time),
+    // and the time field as Timestamp(Second) so SQL can filter it
+    // with date/timestamp literals. The time field is itself an Int
+    // field on disk (epoch seconds); only its presentation type
+    // differs. String reconstruction is O(num_docs) per shard per
+    // field — acceptable for Tier 1; cheaper paths arrive with the
+    // FTGS work.
+    let time_field = metadata.time_field.as_deref();
     let fields: Vec<Field> = metadata
         .fields
         .iter()
-        .map(|f| match f.kind {
-            // Forward columns are dense — every doc has an int value,
-            // so these are non-nullable.
-            FieldKind::Metric | FieldKind::Int => Field::new(&f.name, DataType::Int64, false),
-            // A string field is sparse: a doc with no term for it
-            // reconstructs to NULL, so the column is nullable.
-            FieldKind::String => Field::new(&f.name, DataType::Utf8, true),
+        .map(|f| {
+            if Some(f.name.as_str()) == time_field {
+                // Epoch-seconds Int field presented as a timestamp.
+                // Nanosecond, not Second, because DataFusion's
+                // `TIMESTAMP '...'` literals default to nanosecond
+                // precision: matching the column unit avoids an
+                // injected `CAST(col AS Timestamp(ns))` around the
+                // predicate (which both blocks our column-side
+                // pushdown and, in this arrow version, mis-evaluates).
+                // The exec scales the stored epoch-seconds up to
+                // nanoseconds when building the array. Non-nullable:
+                // every doc has a time value.
+                return Field::new(
+                    &f.name,
+                    DataType::Timestamp(TimeUnit::Nanosecond, None),
+                    false,
+                );
+            }
+            match f.kind {
+                // Forward columns are dense — every doc has an int
+                // value, so these are non-nullable.
+                FieldKind::Metric | FieldKind::Int => Field::new(&f.name, DataType::Int64, false),
+                // A string field is sparse: a doc with no term for it
+                // reconstructs to NULL, so the column is nullable.
+                FieldKind::String => Field::new(&f.name, DataType::Utf8, true),
+            }
         })
         .collect();
     Arc::new(Schema::new(fields))

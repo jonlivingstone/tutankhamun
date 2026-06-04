@@ -376,6 +376,7 @@ mod tests {
                 kind: FieldKind::Metric,
             }],
             content_hashes: std::collections::BTreeMap::default(),
+            time_field: None,
         }
     }
 
@@ -520,6 +521,7 @@ mod tests {
                 time_range_end: 100,
                 fields: vec![],
                 content_hashes: std::collections::BTreeMap::default(),
+                time_field: None,
             },
         )
         .await;

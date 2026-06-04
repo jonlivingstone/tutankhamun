@@ -394,7 +394,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
         let key = opts.shard_by.bucket_key(t);
         let bucket = buckets
             .entry(key)
-            .or_insert_with(|| BucketBuilder::new(&numeric_proto, &strings_proto));
+            .or_insert_with(|| BucketBuilder::new(&numeric_proto, &strings_proto, &opts.time));
         bucket.push_row(&row, line, t)?;
         total_rows += 1;
     }
@@ -450,13 +450,18 @@ struct StringCol {
 struct BucketBuilder {
     numeric: Vec<NumericCol>,
     strings: Vec<StringCol>,
+    /// Name of the time column (the `--time` header). Stored as an
+    /// `Int` field at finalize so per-doc time is range-filterable.
+    time_name: String,
+    /// Parsed epoch-seconds time of each doc, in doc-id order.
+    time_values: Vec<i64>,
     time_min: i64,
     time_max: i64,
     doc_id: u32,
 }
 
 impl BucketBuilder {
-    fn new(numeric_proto: &[NumericCol], strings_proto: &[StringCol]) -> Self {
+    fn new(numeric_proto: &[NumericCol], strings_proto: &[StringCol], time_name: &str) -> Self {
         Self {
             numeric: numeric_proto
                 .iter()
@@ -475,6 +480,8 @@ impl BucketBuilder {
                     postings: BTreeMap::new(),
                 })
                 .collect(),
+            time_name: time_name.to_string(),
+            time_values: Vec::new(),
             time_min: i64::MAX,
             time_max: i64::MIN,
             doc_id: 0,
@@ -484,6 +491,7 @@ impl BucketBuilder {
     fn push_row(&mut self, row: &csv::StringRecord, line: u64, t: i64) -> Result<()> {
         self.time_min = self.time_min.min(t);
         self.time_max = self.time_max.max(t);
+        self.time_values.push(t);
 
         for col in &mut self.numeric {
             let raw = row
@@ -530,6 +538,13 @@ impl BucketBuilder {
         let num_docs = u64::from(self.doc_id);
         let mut writer = DiskShardWriter::new(output_dir, (self.time_min, self.time_max))
             .with_context(|| format!("create writer at {}", output_dir.display()))?;
+        // The time column is stored as an Int field (forward column +
+        // order-preserving index) so per-doc time-range filters push
+        // down, and is marked as the shard's time field.
+        writer
+            .add_int_field(&self.time_name, self.time_values)
+            .with_context(|| format!("add time field {:?}", self.time_name))?;
+        writer.set_time_field(&self.time_name);
         for col in self.numeric {
             match col.kind {
                 FieldKind::Metric => writer
@@ -633,7 +648,7 @@ pub fn parse_date_only(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shard::{DiskShard, FieldKind, Shard};
+    use crate::shard::{DiskShard, Shard};
 
     fn write_csv(dir: &Path, contents: &str) -> std::path::PathBuf {
         let path = dir.join("input.csv");
@@ -714,8 +729,14 @@ mod tests {
             .iter()
             .map(|f| f.name.as_str())
             .collect();
-        assert_eq!(names, vec!["a", "c"]);
-        assert!(matches!(shard.metadata().fields[0].kind, FieldKind::Metric));
+        // Declared metrics kept, undeclared `b`/`d` dropped, and the
+        // time column `pickup` stored as a field (the new time field).
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"c"));
+        assert!(names.contains(&"pickup"));
+        assert!(!names.contains(&"b"));
+        assert!(!names.contains(&"d"));
+        assert_eq!(shard.metadata().time_field.as_deref(), Some("pickup"));
     }
 
     #[test]

@@ -54,6 +54,7 @@ fn metadata_roundtrips_through_serde_json() {
             },
         ],
         content_hashes: std::collections::BTreeMap::default(),
+        time_field: None,
     };
     let bytes = serde_json::to_vec(&m).unwrap();
     let back: Metadata = serde_json::from_slice(&bytes).unwrap();

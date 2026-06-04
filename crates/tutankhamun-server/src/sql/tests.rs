@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
 use roaring::RoaringBitmap;
 use tempfile::TempDir;
@@ -369,4 +370,143 @@ async fn scan_runs_under_current_thread_runtime() {
         .unwrap()
         .value(0);
     assert_eq!(total, 2100);
+}
+
+/// Single shard with a `ts` time field (epoch seconds) + a `fare`
+/// metric. 5 docs at 2023-01-01 00:00, 01:00, 02:00, 03:00, 04:00.
+fn write_time_dataset(root: &Path) {
+    // 2023-01-01T00:00:00Z = 1672531200.
+    let base = 1_672_531_200_i64;
+    let times: Vec<i64> = (0..5).map(|h| base + h * 3600).collect();
+    let shard = root.join("day");
+    let mut w = DiskShardWriter::new(&shard, (times[0], times[4])).expect("new");
+    w.add_int_field("ts", times).expect("ts");
+    w.add_metric("fare", vec![10, 20, 30, 40, 50])
+        .expect("fare");
+    w.set_time_field("ts");
+    w.finalize().expect("finalize");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_field_presented_as_timestamp() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_time_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    // The time field's Arrow type is Timestamp(Second), not Int64.
+    let ts_field = provider
+        .schema()
+        .field_with_name("ts")
+        .expect("ts in schema")
+        .clone();
+    assert!(
+        matches!(
+            ts_field.data_type(),
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _)
+        ),
+        "ts should be Timestamp(Second), got {:?}",
+        ts_field.data_type()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_range_filter_with_timestamp_literals() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_time_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    // [01:00, 03:00) → docs at 01:00 and 02:00 → fare 20 + 30 = 50.
+    let df = ctx
+        .sql(
+            "SELECT sum(fare) FROM t \
+             WHERE ts >= TIMESTAMP '2023-01-01T01:00:00' \
+               AND ts <  TIMESTAMP '2023-01-01T03:00:00'",
+        )
+        .await
+        .unwrap();
+    let total = df.collect().await.unwrap()[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 50);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn select_time_field_returns_timestamps() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_time_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    let df = ctx
+        .sql("SELECT ts FROM t ORDER BY ts LIMIT 1")
+        .await
+        .unwrap();
+    let batches = df.collect().await.unwrap();
+    let col = batches[0].column(0);
+    assert!(
+        matches!(
+            col.data_type(),
+            arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _)
+        ),
+        "projected ts column should be Timestamp(Second)"
+    );
+    let ts = col
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+        .unwrap();
+    // 2023-01-01T00:00:00Z = 1672531200 s = 1672531200e9 ns.
+    assert_eq!(ts.value(0), 1_672_531_200_000_000_000);
+}
+
+/// Two single-doc shards in different days, each with a `ts` time
+/// field. Used to exercise cross-shard time pruning: a filter that
+/// selects one day must not surface the other day's row.
+fn write_two_day_dataset(root: &Path) {
+    // 2023-01-01T00:00:00Z and 2023-01-02T00:00:00Z.
+    let day1 = 1_672_531_200_i64;
+    let day2 = day1 + 86_400;
+    for (name, t, fare) in [("d1", day1, 11_i64), ("d2", day2, 22_i64)] {
+        let shard = root.join(name);
+        let mut w = DiskShardWriter::new(&shard, (t, t)).expect("new");
+        w.add_int_field("ts", vec![t]).expect("ts");
+        w.add_metric("fare", vec![fare]).expect("fare");
+        w.set_time_field("ts");
+        w.finalize().expect("finalize");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_filter_selects_one_shard_across_a_two_day_dataset() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_day_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = SessionContext::new();
+    ctx.register_table("t", Arc::new(provider)).unwrap();
+
+    // Only Jan 1 is in window — the Jan 2 shard is pruned before
+    // fetch, and its fare (22) must not appear in the sum.
+    let df = ctx
+        .sql(
+            "SELECT sum(fare) FROM t \
+             WHERE ts >= TIMESTAMP '2023-01-01T00:00:00' \
+               AND ts <  TIMESTAMP '2023-01-02T00:00:00'",
+        )
+        .await
+        .unwrap();
+    let total = df.collect().await.unwrap()[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(total, 11);
 }
