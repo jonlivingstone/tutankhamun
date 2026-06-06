@@ -172,8 +172,9 @@ directly.
       optimizer rule → `FtgsAggExec`, including the `String` NULL group; the
       global path reuses `aggregate_docs` over the filtered set → one row with
       SQL empty-input semantics (count/approx → 0, sum/min/max → NULL);
-      unsupported shapes fall back to DataFusion. Remaining: `approx_distinct`
-      on a `String` arg (hash index terms, no forward column); multi-column
+      `approx_distinct` works on `String` args too, hashing the inverted-index
+      terms (no forward column) so the sketch still merges across shards;
+      unsupported shapes fall back to DataFusion. Remaining: multi-column
       GROUP BY via regroups; AVG)
 - [ ] FlightSQL service implementation — §3.2
 - [ ] Session-aware SQL execution — DataFusion planner reuses
@@ -223,8 +224,9 @@ directly.
 - [x] Pick crate strategy — `hyperloglogplus` + `tdigest` + custom
       theta (pure Rust; no C++ toolchain) — §3.1
 - [~] `approx_count_distinct(field, [precision])` (HLL) — §3.1
-      (pushed through the SQL `GROUP BY` path via the `StatValue`
-      seam; optional `precision` arg still to add)
+      (pushed through the SQL `GROUP BY`/global paths via the `StatValue`
+      seam, over `Int`/`Metric` forward columns or `String` index terms;
+      optional `precision` arg still to add)
 - [ ] `approx_percentile(field, p, [compression])` (t-digest) —
       §3.1
 - [ ] `approx_top_k(field, k, [capacity])` (Count-Min + heavy

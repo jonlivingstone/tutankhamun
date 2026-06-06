@@ -768,7 +768,7 @@ async fn approx_distinct_mixed_with_scalar_keeps_column_order() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn approx_distinct_on_string_column_falls_back() {
+async fn approx_distinct_on_string_column_pushes_down() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     write_two_shard_dataset(tmp.path());
     let (provider, _cache_dir) = provider_for(tmp.path()).await;
@@ -776,14 +776,35 @@ async fn approx_distinct_on_string_column_falls_back() {
     let ctx = super::session_context();
     ctx.register_table("trips", Arc::new(provider)).unwrap();
 
-    // approx_distinct over a String column has no forward column to read,
-    // so it isn't pushed — DataFusion computes it over the row scan.
-    let sql = "SELECT vendor_id, approx_distinct(country) FROM trips GROUP BY vendor_id";
-    assert!(!physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    // A String column has no forward column; approx_distinct sources its
+    // values from the inverted index terms, so it now pushes down.
+    let sql = "SELECT vendor_id, approx_distinct(country) FROM trips \
+               GROUP BY vendor_id ORDER BY vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    // vendor 1 docs A{0,2}=us,us → 1; vendor 2 docs A{1,3}=de,de → 1;
+    // vendor 3 docs B{0,1}=us,de → 2.
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![vec![1, 1], vec![2, 1], vec![3, 2]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_approx_distinct_string_unions_across_shards() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // "us" and "de" each appear in BOTH shards. Hashing term bytes means
+    // the sketches union to the true 2 distinct — not 4, as a per-shard
+    // sum of exact counts would give.
+    let sql = "SELECT approx_distinct(country) FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
 
     let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
-    // vendor 1 docs A{0,2} both "us" → 1 distinct country.
-    assert!(rows.iter().any(|r| r == &vec![1, 1]));
+    assert_eq!(rows, vec![vec![2]]);
 }
 
 // ---- global (no GROUP BY) aggregate pushdown ----

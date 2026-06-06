@@ -39,8 +39,9 @@ use crate::shard::{FieldKind, Shard, decode_int_key, require_field, utf8_term};
 use crate::sketches::Hll;
 
 /// A stat the caller wants accumulated per group, named against the
-/// shard's columns. `Sum`/`Min`/`Max`/`ApproxCountDistinct` read a
-/// `Metric`/`Int` forward column; `Count` needs none.
+/// shard's columns. `Sum`/`Min`/`Max` read a `Metric`/`Int` forward
+/// column; `ApproxCountDistinct` reads a forward column too, or a
+/// `String` field's inverted-index terms; `Count` needs no column.
 #[derive(Debug, Clone, Copy)]
 pub enum StatSpec<'a> {
     Count,
@@ -122,11 +123,35 @@ pub struct FtgsRow {
 /// inner loop is a flat array write and a sketch variant can pick a
 /// different storage type without touching the loop.
 enum Stat<'a> {
-    Count { slots: Vec<i64> },
-    Sum { col: &'a [i64], slots: Vec<i64> },
-    Min { col: &'a [i64], slots: Vec<i64> },
-    Max { col: &'a [i64], slots: Vec<i64> },
-    Hll { col: &'a [i64], sketches: Vec<Hll> },
+    Count {
+        slots: Vec<i64>,
+    },
+    Sum {
+        col: &'a [i64],
+        slots: Vec<i64>,
+    },
+    Min {
+        col: &'a [i64],
+        slots: Vec<i64>,
+    },
+    Max {
+        col: &'a [i64],
+        slots: Vec<i64>,
+    },
+    Hll {
+        col: &'a [i64],
+        sketches: Vec<Hll>,
+    },
+    /// `approx_distinct` over a `String` column, which has no forward
+    /// column: `doc_term[doc]` indexes the doc's term in `terms` (or
+    /// `None` when the doc has no value — a SQL NULL, counted by no
+    /// distinct). Hashing the term bytes (not the per-shard index)
+    /// keeps the sketch mergeable across shards.
+    HllBytes {
+        doc_term: Vec<Option<u32>>,
+        terms: Vec<Box<[u8]>>,
+        sketches: Vec<Hll>,
+    },
 }
 
 impl<'a> Stat<'a> {
@@ -154,10 +179,23 @@ impl<'a> Stat<'a> {
                 col: column(name)?,
                 slots: vec![i64::MIN; num_groups],
             },
-            StatSpec::ApproxCountDistinct(name) => Stat::Hll {
-                col: column(name)?,
-                sketches: vec![Hll::default(); num_groups],
-            },
+            // `Int`/`Metric` have a dense forward column; `String` does
+            // not, so it sources term bytes from the inverted index.
+            StatSpec::ApproxCountDistinct(name) => {
+                if let Some(col) = shard.forward_column(name) {
+                    Stat::Hll {
+                        col,
+                        sketches: vec![Hll::default(); num_groups],
+                    }
+                } else {
+                    let (doc_term, terms) = term_map(shard, name)?;
+                    Stat::HllBytes {
+                        doc_term,
+                        terms,
+                        sketches: vec![Hll::default(); num_groups],
+                    }
+                }
+            }
         })
     }
 
@@ -169,6 +207,15 @@ impl<'a> Stat<'a> {
             Stat::Min { col, slots } => slots[group] = slots[group].min(col[doc]),
             Stat::Max { col, slots } => slots[group] = slots[group].max(col[doc]),
             Stat::Hll { col, sketches } => sketches[group].insert(col[doc]),
+            Stat::HllBytes {
+                doc_term,
+                terms,
+                sketches,
+            } => {
+                if let Some(t) = doc_term[doc] {
+                    sketches[group].insert_bytes(&terms[t as usize]);
+                }
+            }
         }
     }
 
@@ -188,9 +235,36 @@ impl<'a> Stat<'a> {
             Stat::Max { slots, .. } => {
                 StatValue::Scalar(std::mem::replace(&mut slots[group], i64::MIN))
             }
-            Stat::Hll { sketches, .. } => StatValue::Hll(std::mem::take(&mut sketches[group])),
+            Stat::Hll { sketches, .. } | Stat::HllBytes { sketches, .. } => {
+                StatValue::Hll(std::mem::take(&mut sketches[group]))
+            }
         }
     }
+}
+
+/// A `String` column's reverse map: per doc, the index into the term
+/// table of the term covering it (`None` = no value), plus the term
+/// bytes themselves (allocated once each, indexed by `doc_term`).
+type TermMap = (Vec<Option<u32>>, Vec<Box<[u8]>>);
+
+/// Build a doc→term reverse map for a `String` field (no forward
+/// column): walk its inverted index once, allocating each term's bytes
+/// exactly once in `terms` and recording, per doc, the term that covers
+/// it. Docs with no term map to `None`. `O(num_docs)` work per shard.
+fn term_map(shard: &dyn Shard, name: &str) -> Result<TermMap> {
+    let index = shard.inverted_index(name).with_context(|| {
+        format!("stat field {name:?} has neither a forward column nor an inverted index")
+    })?;
+    let mut doc_term: Vec<Option<u32>> = vec![None; usize::try_from(shard.num_docs())?];
+    let mut terms: Vec<Box<[u8]>> = Vec::new();
+    for (term_bytes, bitmap) in index.range_bytes(None, None) {
+        let term_idx = u32::try_from(terms.len())?;
+        terms.push(term_bytes.into_boxed_slice());
+        for doc in &bitmap {
+            doc_term[doc as usize] = Some(term_idx);
+        }
+    }
+    Ok((doc_term, terms))
 }
 
 /// Run an FTGS scan over one shard.

@@ -287,15 +287,20 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
         // COUNT(*) only — args are empty or a literal. COUNT(col) (which
         // skips NULLs) isn't equivalent to FTGS's per-group doc count.
         "count" if args.iter().all(|a| matches!(a, Expr::Literal(..))) => Some(OwnedStat::Count),
-        // All read one bare `Metric`/`Int` forward column.
+        // `sum`/`min`/`max` read one bare `Metric`/`Int` forward column;
+        // `approx_distinct` also takes a `String`, hashing its index terms.
         name @ ("sum" | "min" | "max" | "approx_distinct") => {
             let [Expr::Column(c)] = args.as_slice() else {
                 return None;
             };
-            if !matches!(
-                prov.field_kind(&c.name)?,
-                FieldKind::Metric | FieldKind::Int
-            ) {
+            let kind = prov.field_kind(&c.name)?;
+            let ok = match name {
+                "approx_distinct" => {
+                    matches!(kind, FieldKind::Metric | FieldKind::Int | FieldKind::String)
+                }
+                _ => matches!(kind, FieldKind::Metric | FieldKind::Int),
+            };
+            if !ok {
                 return None;
             }
             let col = c.name.clone();
