@@ -247,7 +247,7 @@ impl InvertedIndex {
 /// FST stores keys as raw bytes; we only ever insert valid UTF-8 (the
 /// `add_string_field` API takes `String` keys), so an invalid sequence
 /// here means the shard file is corrupt.
-fn utf8_term(bytes: &[u8]) -> String {
+pub(crate) fn utf8_term(bytes: &[u8]) -> String {
     std::str::from_utf8(bytes)
         .expect("FST term is not valid UTF-8 — shard file corrupt")
         .to_owned()
@@ -1343,7 +1343,7 @@ fn format_aggregate(op: Aggregate, agg: &MetricAggregates, matched: u64) -> Stri
 /// on success; produces a uniform error message on either
 /// missing-field or wrong-kind failures so callers can rely on
 /// consistent CLI output.
-fn require_field<'a>(
+pub(crate) fn require_field<'a>(
     metadata: &'a Metadata,
     name: &str,
     accept: &[FieldKind],

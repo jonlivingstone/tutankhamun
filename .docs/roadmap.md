@@ -110,11 +110,13 @@ directly.
 
 ## Engine — FTGS
 
-- [ ] Four-level cursor (`next_field` / `next_term` / `next_group`
+- [x] Four-level cursor (`next_field` / `next_term` / `next_group`
       / `group_stats`) — §2.6
-- [ ] Critical loop: doc-ID batch → group lookup callback →
+- [x] Critical loop: doc-ID batch → group lookup callback →
       stat accumulation into `term_grp_stats[stat][group]` — §2.6
-- [ ] Ordering-invariant enforcement (terms sorted, groups
+      (extensible `Stat` seam: scalar sum/count/min/max; mergeable
+      sketches land as new variants)
+- [x] Ordering-invariant enforcement (terms sorted, groups
       ascending, fields in declaration order) — §2.6
 - [ ] Per-shard FTGS execution (single-threaded per shard, run
       via Rayon) — §2.6, §2.3
