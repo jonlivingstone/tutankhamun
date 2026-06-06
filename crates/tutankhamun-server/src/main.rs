@@ -154,9 +154,8 @@ enum Command {
     },
 }
 
-/// CLI-facing shard-by aliases. Maps to the engine's duration-based
-/// [`ShardBy`] in `run_ingest`; future aliases / explicit-duration
-/// support are CLI-only changes.
+/// CLI-facing shard-by aliases, mapped to the engine's duration-based
+/// [`ShardBy`] in `run_ingest`.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 enum ShardByArg {
     #[default]

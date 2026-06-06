@@ -1,7 +1,7 @@
 //! `BitTree` — a hierarchical bitset for marking a sparse set of
 //! non-negative integers and draining them in ascending order.
 //!
-//! Ported from Imhotep's `BitTree`. The FTGS group lookup (§2.5) marks
+//! The FTGS group lookup (§2.5) marks
 //! the groups a term's postings fall into, then the caller drains them
 //! sorted to drive `group_stats`; the §2.6 shard merge reuses the same
 //! structure. Each level above the leaf summarises 64 words of the
@@ -25,7 +25,7 @@ impl BitTree {
     /// out-of-bounds word access.
     #[must_use]
     pub fn new(size: usize) -> Self {
-        // Level count mirrors Imhotep: floor(log2(size-1))/6 + 1. The
+        // Level count is floor(log2(size-1))/6 + 1. The
         // `/6` is one level per 64× (2⁶) fan-out; the `size <= 1` guard
         // avoids `ilog2(0)`. This guarantees the top level collapses to
         // a single word.

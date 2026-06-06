@@ -5,7 +5,6 @@
 //! shard, fetch through the cache, resolve the pushed filters into a
 //! matched-doc set via [`crate::shard::matched_doc_set`], and assemble
 //! one record batch per shard from the projected forward columns.
-//! Streaming-per-shard and per-shard partitioning are Tier 2 work.
 
 use std::any::Any;
 use std::fmt;
@@ -132,9 +131,8 @@ impl ExecutionPlan for TutankhamunExec {
 /// scheduler (it panics on the current-thread runtime the CLI builds);
 /// a separate thread sidesteps both — correct under any ambient flavor
 /// or none. Single-partition, so the one-thread-per-scan cost is
-/// bounded; Tier 2 streaming will replace this with a real
-/// `RecordBatchStream`. The future is built inside the thread (`make`),
-/// so only it crosses the thread boundary, not the future.
+/// bounded. The future is built inside the thread (`make`), so only it
+/// crosses the thread boundary, not the future.
 fn block_on_scan<T, Fut>(make: impl FnOnce() -> Fut + Send) -> DfResult<T>
 where
     Fut: Future<Output = anyhow::Result<T>>,

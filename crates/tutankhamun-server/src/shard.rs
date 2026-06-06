@@ -17,8 +17,8 @@
 //!
 //! [`DiskShardWriter`] always emits a single record batch with no
 //! compression. [`DiskShard::open`] rejects files that violate this
-//! invariant. Cold-tier compressed shards are a future addition that
-//! goes through a different reader.
+//! invariant, which is what keeps forward-column reads mmap-friendly
+//! and zero-copy.
 //!
 //! # The "files are immutable post-rename" invariant (inverted index)
 //!

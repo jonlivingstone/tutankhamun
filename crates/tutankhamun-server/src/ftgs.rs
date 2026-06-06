@@ -5,8 +5,7 @@
 //! assignment ([`GroupLookup`], set by prior regroups) and a set of
 //! group-by fields, it walks each field's term dictionary and, for
 //! every `(field, term)`, emits the requested stats per group. This is
-//! the four-level cursor — field → term → group → stat — preserved
-//! from Imhotep.
+//! the four-level cursor — field → term → group → stat.
 //!
 //! Output ordering is deterministic, which [`merge_ftgs`] relies on:
 //! fields in the caller's order, terms ascending (the FST is sorted by
@@ -17,16 +16,15 @@
 //! `String`) — and is rendered to a display string only at the output
 //! edge via [`render_term`].
 //!
-//! ## Extending the stats
+//! ## Stats
 //!
 //! Stats live behind the [`Stat`] enum (accumulation) and
-//! [`StatSpec::combine`] (cross-shard merge) so new operators are
-//! additive. This pass implements the cheap scalar operators (sum /
-//! count / min / max), each one `i64` per group. The heavier mergeable
-//! sketches — `approx_percentile` (t-digest), `approx_count_distinct`
-//! (HLL), `theta` (§3.1) — arrive as new variants whose accumulator
-//! owns its own storage (e.g. `Vec<TDigest>`); the critical loop and
-//! `FtgsRow` do not change.
+//! [`StatSpec::combine`] (cross-shard merge), each operator a variant.
+//! The scalar operators (sum / count / min / max) hold one `i64` per
+//! group. A mergeable sketch — `approx_percentile` (t-digest),
+//! `approx_count_distinct` (HLL), `theta` (§3.1) — is a variant whose
+//! accumulator owns its own storage (e.g. `Vec<TDigest>`); the critical
+//! loop and `FtgsRow` are agnostic to which variant a stat is.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -84,8 +82,8 @@ pub struct FtgsRow {
 
 /// Live per-group accumulator for one stat. Each variant owns its own
 /// `slots` (one per group) seeded to the operator's identity, so the
-/// inner loop is a flat array write and a future sketch variant can
-/// pick a different storage type without touching the loop.
+/// inner loop is a flat array write and a sketch variant can pick a
+/// different storage type without touching the loop.
 enum Stat<'a> {
     Count { slots: Vec<i64> },
     Sum { col: &'a [i64], slots: Vec<i64> },

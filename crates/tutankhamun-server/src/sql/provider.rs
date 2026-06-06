@@ -166,9 +166,7 @@ fn arrow_schema_from_metadata(metadata: &Metadata) -> SchemaRef {
     // and the time field as Timestamp(Nanosecond) so SQL can filter it
     // with date/timestamp literals. The time field is itself an Int
     // field on disk (epoch seconds); only its presentation type
-    // differs. String reconstruction is O(num_docs) per shard per
-    // field — acceptable for Tier 1; cheaper paths arrive with the
-    // FTGS work.
+    // differs. String reconstruction is O(num_docs) per shard per field.
     let time_field = metadata.time_field.as_deref();
     let fields: Vec<Field> = metadata
         .fields

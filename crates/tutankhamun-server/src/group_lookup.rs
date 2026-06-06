@@ -6,9 +6,8 @@
 //! (the `Constant` backing, zero bytes per doc); regroups widen the
 //! backing in place as group cardinality grows. The backing is
 //! specialized by the widest group ID it must hold so many concurrent
-//! sessions stay within bounded memory — the single largest reason
-//! Imhotep scaled, preserved here as a Rust `enum` so the compiler
-//! checks each backing swap.
+//! sessions stay within bounded memory, and is a Rust `enum` so the
+//! compiler checks each backing swap.
 //!
 //! | Backing    | Max group ID | Bytes / doc |
 //! |------------|--------------|-------------|
@@ -110,9 +109,8 @@ impl GroupLookup {
     /// Widen the backing in place so it can store group IDs up to and
     /// including `max_group_id`, preserving every doc's current group.
     /// A no-op when the current mutable backing already suffices;
-    /// `Constant` always upgrades, since it can't be mutated. Mirrors
-    /// the grow path of Imhotep's `GroupLookupFactory.resize` —
-    /// shrinking back down is a later optimization.
+    /// `Constant` always upgrades, since it can't be mutated. The
+    /// backing only grows; it never shrinks back down.
     pub fn ensure_capacity(&mut self, max_group_id: u32) {
         let needs_upgrade = match &self.backing {
             Backing::Constant(_) => true,

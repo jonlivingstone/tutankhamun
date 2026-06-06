@@ -1,5 +1,5 @@
-//! Tier 2 `GROUP BY` pushdown: a `DataFusion` optimizer rule that
-//! rewrites `Aggregate(TableScan(TutankhamunTableProvider))` into an
+//! Single-column `GROUP BY` pushdown: a `DataFusion` optimizer rule
+//! that rewrites `Aggregate(TableScan(TutankhamunTableProvider))` into an
 //! [`FtgsAggregate`] extension node, planned to an [`FtgsAggExec`] that
 //! runs the aggregation through FTGS instead of materializing every row.
 //!
@@ -14,7 +14,7 @@
 //!
 //! `Int` grouping only, by design: `Int`/`Metric` forward columns are
 //! dense, so an `Int` group column has no NULL group. A sparse `String`
-//! column would need an explicit NULL-group pass (a follow-up).
+//! column would need an explicit NULL-group pass.
 
 use std::cmp::Ordering;
 use std::fmt;

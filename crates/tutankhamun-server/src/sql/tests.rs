@@ -212,7 +212,7 @@ async fn projection_only_requested_columns() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn string_field_selectable_via_reverse_lookup() {
-    // Tier 1: String columns are exposed as Utf8 in the schema and
+    // String columns are exposed as Utf8 in the schema and
     // reconstructed per-doc from the inverted index at scan time.
     // SELECT country returns the right value for every doc.
     let tmp = tempfile::tempdir().expect("tmpdir");
@@ -511,7 +511,7 @@ async fn time_filter_selects_one_shard_across_a_two_day_dataset() {
     assert_eq!(total, 11);
 }
 
-// ---- Tier 2: single-column GROUP BY pushdown into FTGS ----
+// ---- single-column GROUP BY pushdown into FTGS ----
 
 /// Physical plan of `sql` under `ctx`, rendered for substring checks
 /// (e.g. asserting `FtgsAggExec` is or isn't present).
