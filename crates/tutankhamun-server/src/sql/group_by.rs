@@ -67,6 +67,7 @@ pub(crate) enum OwnedStat {
     Sum(String),
     Min(String),
     Max(String),
+    ApproxCountDistinct(String),
 }
 
 impl OwnedStat {
@@ -76,6 +77,7 @@ impl OwnedStat {
             OwnedStat::Sum(c) => StatSpec::Sum(c),
             OwnedStat::Min(c) => StatSpec::Min(c),
             OwnedStat::Max(c) => StatSpec::Max(c),
+            OwnedStat::ApproxCountDistinct(c) => StatSpec::ApproxCountDistinct(c),
         }
     }
 }
@@ -88,15 +90,22 @@ impl OwnedStat {
 pub(crate) struct FtgsAggregate {
     url: String,
     cache: Arc<Cache>,
-    group_col: String,
+    /// The single grouping column, or `None` for a global aggregate
+    /// (no `GROUP BY`) — one row over the whole filtered set.
+    group_col: Option<String>,
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
     schema: DFSchemaRef,
 }
 
 impl FtgsAggregate {
-    fn identity(&self) -> (&str, &str, &[OwnedStat], &[PushedFilter]) {
-        (&self.url, &self.group_col, &self.stats, &self.filters)
+    fn identity(&self) -> (&str, Option<&str>, &[OwnedStat], &[PushedFilter]) {
+        (
+            &self.url,
+            self.group_col.as_deref(),
+            &self.stats,
+            &self.filters,
+        )
     }
 }
 
@@ -151,7 +160,7 @@ impl UserDefinedLogicalNodeCore for FtgsAggregate {
         write!(
             f,
             "FtgsAggregate: group_by=[{}], stats={}, filters={}",
-            self.group_col,
+            self.group_col.as_deref().unwrap_or(""),
             self.stats.len(),
             self.filters.len()
         )
@@ -214,18 +223,23 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
         return Ok(None);
     };
 
-    // Exactly one grouping column, filterable (`String` or `Int`, i.e.
-    // carries an inverted index whose terms drive the cursor).
-    let [Expr::Column(col)] = agg.group_expr.as_slice() else {
-        return Ok(None);
+    // No grouping column → a global aggregate (one row over the whole
+    // filtered set). Exactly one column → grouped; it must be filterable
+    // (`String`/`Int`, i.e. carries the inverted index the cursor walks).
+    // Two or more columns fall back (needs regroups).
+    let group_col = match agg.group_expr.as_slice() {
+        [] => None,
+        [Expr::Column(col)] => {
+            if !matches!(
+                prov.field_kind(&col.name),
+                Some(FieldKind::String | FieldKind::Int)
+            ) {
+                return Ok(None);
+            }
+            Some(col.name.clone())
+        }
+        _ => return Ok(None),
     };
-    let group_col = col.name.clone();
-    if !matches!(
-        prov.field_kind(&group_col),
-        Some(FieldKind::String | FieldKind::Int)
-    ) {
-        return Ok(None);
-    }
 
     // Every aggregate must map to a supported scalar stat.
     let mut stats = Vec::with_capacity(agg.aggr_expr.len());
@@ -273,7 +287,8 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
         // COUNT(*) only — args are empty or a literal. COUNT(col) (which
         // skips NULLs) isn't equivalent to FTGS's per-group doc count.
         "count" if args.iter().all(|a| matches!(a, Expr::Literal(..))) => Some(OwnedStat::Count),
-        name @ ("sum" | "min" | "max") => {
+        // All read one bare `Metric`/`Int` forward column.
+        name @ ("sum" | "min" | "max" | "approx_distinct") => {
             let [Expr::Column(c)] = args.as_slice() else {
                 return None;
             };
@@ -287,7 +302,8 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
             Some(match name {
                 "sum" => OwnedStat::Sum(col),
                 "min" => OwnedStat::Min(col),
-                _ => OwnedStat::Max(col),
+                "max" => OwnedStat::Max(col),
+                _ => OwnedStat::ApproxCountDistinct(col),
             })
         }
         _ => None,

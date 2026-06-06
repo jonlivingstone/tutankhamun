@@ -530,20 +530,28 @@ async fn physical_plan(ctx: &SessionContext, sql: &str) -> String {
     )
 }
 
-/// All-`Int64` result rows in batch order.
+/// Numeric result rows in batch order, reading `Int64` or `UInt64`
+/// columns as `i64`.
 fn int_rows(batches: &[arrow::array::RecordBatch]) -> Vec<Vec<i64>> {
     batches
         .iter()
         .flat_map(|b| {
-            let cols: Vec<&arrow::array::Int64Array> = (0..b.num_columns())
+            let cols: Vec<Vec<i64>> = (0..b.num_columns())
                 .map(|i| {
-                    b.column(i)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int64Array>()
-                        .unwrap()
+                    let c = b.column(i);
+                    if let Some(a) = c.as_any().downcast_ref::<arrow::array::Int64Array>() {
+                        a.values().to_vec()
+                    } else if let Some(a) = c.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+                        a.values()
+                            .iter()
+                            .map(|&v| i64::try_from(v).unwrap())
+                            .collect()
+                    } else {
+                        panic!("expected an Int64/UInt64 column");
+                    }
                 })
                 .collect();
-            (0..b.num_rows()).map(move |r| cols.iter().map(|c| c.value(r)).collect())
+            (0..b.num_rows()).map(move |r| cols.iter().map(|c| c[r]).collect())
         })
         .collect()
 }
@@ -715,4 +723,140 @@ async fn avg_falls_back_to_datafusion() {
         .unwrap();
     // vendor 1 fares {100,300} → avg 200.
     assert!((avg.value(0) - 200.0).abs() < 1e-9);
+}
+
+// ---- approx_count_distinct (HLL) pushdown ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_distinct_pushes_down() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT vendor_id, approx_distinct(fare) FROM trips \
+               GROUP BY vendor_id ORDER BY vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    // Each vendor's fares are distinct (small → HLL exact): vendor 1
+    // {100,300}=2, vendor 2 {200,400}=2, vendor 3 {500,600}=2.
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![vec![1, 2], vec![2, 2], vec![3, 2]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_distinct_mixed_with_scalar_keeps_column_order() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT vendor_id, sum(fare), approx_distinct(fare) FROM trips \
+               GROUP BY vendor_id ORDER BY vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    // Columns: vendor, sum, approx-distinct. vendor 1: 100+300=400, 2 distinct.
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(
+        rows,
+        vec![vec![1, 400, 2], vec![2, 600, 2], vec![3, 1100, 2]]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_distinct_on_string_column_falls_back() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // approx_distinct over a String column has no forward column to read,
+    // so it isn't pushed — DataFusion computes it over the row scan.
+    let sql = "SELECT vendor_id, approx_distinct(country) FROM trips GROUP BY vendor_id";
+    assert!(!physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    // vendor 1 docs A{0,2} both "us" → 1 distinct country.
+    assert!(rows.iter().any(|r| r == &vec![1, 1]));
+}
+
+// ---- global (no GROUP BY) aggregate pushdown ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_aggregate_pushes_down() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // No GROUP BY → one row over the whole dataset.
+    let sql = "SELECT count(*), sum(fare), min(fare), max(fare), approx_distinct(fare) FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    // fares {100,200,300,400,500,600}: count 6, sum 2100, min 100,
+    // max 600, 6 distinct.
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![vec![6, 2100, 100, 600, 6]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_aggregate_with_where_filter() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // vendor_id = 1 → docs A{0,2}, fare {100,300}.
+    let sql = "SELECT count(*), sum(fare) FROM trips WHERE vendor_id = 1";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![vec![2, 400]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_aggregate_empty_input_has_sql_null_semantics() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // No matching docs → one row: count/approx 0, sum NULL.
+    let sql = "SELECT count(*) AS n, sum(fare) AS s, approx_distinct(fare) AS d \
+               FROM trips WHERE country = 'zz'";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let b = &batches[0];
+    assert_eq!(b.num_rows(), 1);
+    let count = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let sum = b
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let distinct = b
+        .column(2)
+        .as_any()
+        .downcast_ref::<arrow::array::UInt64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 0);
+    assert!(sum.is_null(0), "sum over empty input is NULL");
+    assert_eq!(distinct.value(0), 0);
 }

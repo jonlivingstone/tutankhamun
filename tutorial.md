@@ -19,22 +19,48 @@ and `python3` on `PATH`.
 cargo build --release --bin t9n
 ```
 
-## 2. Ingest real data
+## 2. Get the data
 
-The bundled seed script downloads a month of Jersey City Citi Bike
-trip data, adds a `trip_seconds` column (computed from
-`ended_at - started_at` so there's an integer metric to sum
-against), and ingests it as a shard:
+The fetch script downloads a month of Jersey City Citi Bike trip data
+and adds a `trip_seconds` column (computed from `ended_at - started_at`,
+so there's an integer metric to aggregate). It leaves a ready-to-ingest
+CSV — it does **not** ingest, so the next step stays yours:
 
 ```sh
-scripts/seed_citibike.sh
+scripts/fetch_citibike.sh
 ```
 
 ```
-shard ready at: .local/storage/citibike/jc-202301
+data ready: .local/seed-cache/JC-202301-citibike-tripdata-with-duration.csv
 ```
 
-## 3. Look at what you have
+## 3. Ingest it
+
+Now you ingest. You tell `t9n` what each column *is*: the `--time`
+column that drives bucketing, the int64 `--metric` columns you'll
+aggregate, and the `--string` columns you'll filter on.
+`--shard-by daily` writes one immutable shard per day:
+
+```sh
+cargo run --release --bin t9n -- ingest \
+    .local/seed-cache/JC-202301-citibike-tripdata-with-duration.csv \
+    --output .local/storage/citibike/jc-202301 \
+    --time started_at \
+    --metric trip_seconds \
+    --string rideable_type --string member_casual \
+    --string start_station_id --string end_station_id \
+    --shard-by daily
+```
+
+```
+wrote 56075 docs to .local/storage/citibike/jc-202301
+```
+
+That column split *is* the storage model: metrics are summable but not
+filterable; string fields are inverted-indexed for filtering but not
+summable; the time column buckets rows into shards.
+
+## 4. Look at what you have
 
 The seed produces one shard per day, so the dataset is a directory
 of 31 daily shards. Inspect one of them:
@@ -58,7 +84,7 @@ schema:
 Each daily shard has the same schema; only the time range and per-shard
 row counts vary.
 
-## 4. Ask questions
+## 5. Aggregate with the `query` verb
 
 The `query` verb fans out across every shard under the directory and
 sums the per-shard results. Total time spent riding in January:
@@ -121,7 +147,71 @@ cargo run --release --bin t9n -- query \
     --metric trip_seconds
 ```
 
-## 5. Your own data
+## 6. Query with SQL
+
+`t9n sql` registers the dataset as a table named `t` and runs the query
+through DataFusion. `WHERE` filters and single-column `GROUP BY` (with
+`count` / `sum` / `min` / `max` / `approx_distinct`) push down into the
+engine's scan where they can; anything else DataFusion computes over the
+returned rows — either way you get the same answer.
+
+Trips and total ride time by rider type:
+
+```sh
+cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
+    "SELECT member_casual, count(*) AS trips, sum(trip_seconds) AS total
+     FROM t GROUP BY member_casual ORDER BY member_casual"
+```
+
+```
++---------------+-------+----------+
+| member_casual | trips | total    |
++---------------+-------+----------+
+| casual        | 12433 | 14903291 |
+| member        | 43642 | 24776477 |
++---------------+-------+----------+
+```
+
+`approx_distinct` is a HyperLogLog estimate — roughly how many distinct
+start stations each rider type used, without keeping every value:
+
+```sh
+cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
+    "SELECT member_casual, approx_distinct(start_station_id) AS stations
+     FROM t GROUP BY member_casual ORDER BY member_casual"
+```
+
+```
++---------------+----------+
+| member_casual | stations |
++---------------+----------+
+| casual        |       81 |
+| member        |       82 |
++---------------+----------+
+```
+
+Most popular bike type:
+
+```sh
+cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
+    "SELECT rideable_type, count(*) AS trips
+     FROM t GROUP BY rideable_type ORDER BY trips DESC"
+```
+
+```
++---------------+-------+
+| rideable_type | trips |
++---------------+-------+
+| classic_bike  | 43959 |
+| electric_bike | 12016 |
+| docked_bike   |   100 |
++---------------+-------+
+```
+
+Run `cargo run --release --bin t9n -- sql --help` for cache and
+source-URL options.
+
+## 7. Your own data
 
 Run `cargo run --release --bin t9n -- ingest --help` to see the
 full flag set. Time columns can be unix epoch seconds, RFC 3339,
@@ -132,9 +222,9 @@ For a dataset that's already split into multiple shards under a
 directory, `t9n query <dir> --metric ... [--filter ...]` fans out
 across all of them and prints one aggregate.
 
-Both `t9n query` and `t9n ingest --output` accept an object-storage
-URL — `s3://`, `gs://`, `az://`, or `file://` — instead of a local
-path. On query, shards are downloaded into
+`t9n query`, `t9n sql`, and `t9n ingest --output` all accept an
+object-storage URL — `s3://`, `gs://`, `az://`, or `file://` — instead
+of a local path. On read, shards are downloaded into
 `~/Library/Caches/tutankhamun` (or the platform equivalent) on
 first read and reused from there on subsequent runs; override the
 cache location with `--cache-dir` and its size with
@@ -149,7 +239,8 @@ partial uploads stay invisible to readers.
 - [`.docs/roadmap.md`](.docs/roadmap.md) — what's shipped and
   what's coming.
 
-Honesty notes for early adopters: the production query surface
-(gRPC, sessions, FTGS, Python client) isn't built yet. The CLI
-verbs above are how you exercise the storage and query format
-today.
+Honesty notes for early adopters: the production wire surface — gRPC
+sessions, Arrow Flight streaming, the Python client — isn't built yet.
+The CLI verbs above (`ingest`, `query`, `sql`) are how you exercise the
+engine today; `t9n sql`'s `GROUP BY` already runs through the FTGS
+aggregation core.

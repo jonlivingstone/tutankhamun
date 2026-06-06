@@ -36,57 +36,85 @@ use crate::bit_tree::BitTree;
 use crate::group_lookup::GroupLookup;
 use crate::runtime;
 use crate::shard::{FieldKind, Shard, decode_int_key, require_field, utf8_term};
+use crate::sketches::Hll;
 
 /// A stat the caller wants accumulated per group, named against the
-/// shard's columns. `Sum`/`Min`/`Max` read a `Metric`/`Int` forward
-/// column; `Count` needs none.
+/// shard's columns. `Sum`/`Min`/`Max`/`ApproxCountDistinct` read a
+/// `Metric`/`Int` forward column; `Count` needs none.
 #[derive(Debug, Clone, Copy)]
 pub enum StatSpec<'a> {
     Count,
     Sum(&'a str),
     Min(&'a str),
     Max(&'a str),
+    ApproxCountDistinct(&'a str),
 }
 
 impl StatSpec<'_> {
-    /// Merge two shards' finalized values of this stat for the same
-    /// `(field, term, group)`. The cross-shard counterpart to
-    /// [`Stat::update`]: additive stats sum, `Min`/`Max` fold. Mergeable
-    /// sketch stats (§3.1) combine their own accumulators and widen the
-    /// output type, as noted on [`FtgsRow`].
+    /// Merge two scalar stat values for the same `(field, term, group)`:
+    /// additive stats sum, `Min`/`Max` fold. The sketch stat
+    /// (`ApproxCountDistinct`) merges its accumulator instead — see
+    /// [`combine_stats`] — so it never reaches here.
     #[must_use]
     pub fn combine(self, a: i64, b: i64) -> i64 {
         match self {
             StatSpec::Count | StatSpec::Sum(_) => a + b,
             StatSpec::Min(_) => a.min(b),
             StatSpec::Max(_) => a.max(b),
+            StatSpec::ApproxCountDistinct(_) => unreachable!("sketch combines its accumulator"),
         }
     }
 }
 
-/// Combine `other`'s stats into `acc` in place — the per-column
-/// [`StatSpec::combine`] applied across two finalized stat rows. The
-/// cross-shard merge of any two groups' stats.
-pub fn combine_stats(acc: &mut [i64], other: &[i64], specs: &[StatSpec]) {
-    for (i, &b) in other.iter().enumerate() {
-        acc[i] = specs[i].combine(acc[i], b);
+/// A stat's per-group accumulator value, carried through the cross-shard
+/// merge un-finalized so mergeable sketches can be unioned (you can't
+/// combine two finalized cardinalities). [`finalize`](Self::finalize)
+/// produces the output `i64`.
+#[derive(Debug, Clone)]
+pub enum StatValue {
+    /// `Count`/`Sum`/`Min`/`Max` — the value is already the result.
+    Scalar(i64),
+    /// `ApproxCountDistinct` — a `HyperLogLog`, finalized to an estimate.
+    Hll(Hll),
+}
+
+impl StatValue {
+    #[must_use]
+    pub fn finalize(&self) -> i64 {
+        match self {
+            StatValue::Scalar(v) => *v,
+            StatValue::Hll(h) => h.estimate(),
+        }
+    }
+}
+
+/// Combine `other`'s stats into `acc` in place — the cross-shard merge of
+/// two groups' accumulators. Scalars fold via [`StatSpec::combine`];
+/// sketches union their registers. Both sides come from the same `specs`,
+/// so the variants always match.
+pub fn combine_stats(acc: &mut [StatValue], other: &[StatValue], specs: &[StatSpec]) {
+    for (i, b) in other.iter().enumerate() {
+        match (&mut acc[i], b) {
+            (StatValue::Scalar(a), StatValue::Scalar(b)) => *a = specs[i].combine(*a, *b),
+            (StatValue::Hll(a), StatValue::Hll(b)) => a.merge(b),
+            _ => unreachable!("stat variants match across shards (same specs)"),
+        }
     }
 }
 
 /// One output row: the requested stats for a single `(field, term,
 /// group)`. `term` is the raw order-preserving FST key — the canonical
 /// sort order the merge compares by; render it for display with
-/// [`render_term`] and the field's `FieldKind`. `stats[i]` is the
-/// finalized value of the i-th [`StatSpec`] over the docs that carry
-/// `term` and fall in `group`. Every stat we emit today finalizes to one
-/// `i64`; a binary-valued sketch (raw `theta`, §3.1) widens this to a
-/// stat-value enum when it lands.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// [`render_term`] and the field's `FieldKind`. `stats[i]` is the i-th
+/// [`StatSpec`]'s accumulator over the docs that carry `term` and fall in
+/// `group`, carried un-finalized for the merge; call
+/// [`StatValue::finalize`] at output.
+#[derive(Debug, Clone)]
 pub struct FtgsRow {
     pub field: String,
     pub term: Box<[u8]>,
     pub group: u32,
-    pub stats: Vec<i64>,
+    pub stats: Vec<StatValue>,
 }
 
 /// Live per-group accumulator for one stat. Each variant owns its own
@@ -98,6 +126,7 @@ enum Stat<'a> {
     Sum { col: &'a [i64], slots: Vec<i64> },
     Min { col: &'a [i64], slots: Vec<i64> },
     Max { col: &'a [i64], slots: Vec<i64> },
+    Hll { col: &'a [i64], sketches: Vec<Hll> },
 }
 
 impl<'a> Stat<'a> {
@@ -125,6 +154,10 @@ impl<'a> Stat<'a> {
                 col: column(name)?,
                 slots: vec![i64::MIN; num_groups],
             },
+            StatSpec::ApproxCountDistinct(name) => Stat::Hll {
+                col: column(name)?,
+                sketches: vec![Hll::default(); num_groups],
+            },
         })
     }
 
@@ -135,27 +168,27 @@ impl<'a> Stat<'a> {
             Stat::Sum { col, slots } => slots[group] += col[doc],
             Stat::Min { col, slots } => slots[group] = slots[group].min(col[doc]),
             Stat::Max { col, slots } => slots[group] = slots[group].max(col[doc]),
+            Stat::Hll { col, sketches } => sketches[group].insert(col[doc]),
         }
     }
 
-    /// Finalized value of `group`'s slot for output.
-    fn value(&self, group: usize) -> i64 {
+    /// Take `group`'s accumulated value for output, leaving the slot at
+    /// the operator's identity so the buffer is reusable for the next
+    /// term. Moving the sketch out (rather than cloning) keeps this off
+    /// the per-row hot path; only the groups a term touched are taken, so
+    /// the cost scales with groups seen, not the group count.
+    fn take_value(&mut self, group: usize) -> StatValue {
         match self {
-            Stat::Count { slots }
-            | Stat::Sum { slots, .. }
-            | Stat::Min { slots, .. }
-            | Stat::Max { slots, .. } => slots[group],
-        }
-    }
-
-    /// Restore `group`'s slot to the operator's identity, so the buffer
-    /// is reusable for the next term. Only the groups a term touched are
-    /// reset, so the cost scales with groups seen, not the group count.
-    fn reset(&mut self, group: usize) {
-        match self {
-            Stat::Count { slots } | Stat::Sum { slots, .. } => slots[group] = 0,
-            Stat::Min { slots, .. } => slots[group] = i64::MAX,
-            Stat::Max { slots, .. } => slots[group] = i64::MIN,
+            Stat::Count { slots } | Stat::Sum { slots, .. } => {
+                StatValue::Scalar(std::mem::take(&mut slots[group]))
+            }
+            Stat::Min { slots, .. } => {
+                StatValue::Scalar(std::mem::replace(&mut slots[group], i64::MAX))
+            }
+            Stat::Max { slots, .. } => {
+                StatValue::Scalar(std::mem::replace(&mut slots[group], i64::MIN))
+            }
+            Stat::Hll { sketches, .. } => StatValue::Hll(std::mem::take(&mut sketches[group])),
         }
     }
 }
@@ -225,10 +258,10 @@ pub fn ftgs_scan(
             // merge's sort order. Rendered to a string only at output.
             let term: Box<[u8]> = key.into();
             for &g in &drained {
-                let row_stats = accumulators.iter().map(|s| s.value(g as usize)).collect();
-                for stat in &mut accumulators {
-                    stat.reset(g as usize);
-                }
+                let row_stats = accumulators
+                    .iter_mut()
+                    .map(|s| s.take_value(g as usize))
+                    .collect();
                 rows.push(FtgsRow {
                     field: field.to_string(),
                     term: term.clone(),
@@ -250,7 +283,7 @@ pub fn aggregate_docs(
     shard: &dyn Shard,
     docs: impl Iterator<Item = u32>,
     stats: &[StatSpec],
-) -> Result<Vec<i64>> {
+) -> Result<Vec<StatValue>> {
     let mut accumulators: Vec<Stat> = stats
         .iter()
         .map(|spec| Stat::new(*spec, shard, 1))
@@ -260,7 +293,7 @@ pub fn aggregate_docs(
             stat.update(0, doc as usize);
         }
     }
-    Ok(accumulators.iter().map(|s| s.value(0)).collect())
+    Ok(accumulators.iter_mut().map(|s| s.take_value(0)).collect())
 }
 
 /// Render a raw FST key ([`FtgsRow::term`]) as its display term: `Int`

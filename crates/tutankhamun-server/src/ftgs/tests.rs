@@ -4,7 +4,7 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 use tempfile::TempDir;
 
-use super::{FtgsRow, StatSpec, ftgs_scan, ftgs_scan_merge, merge_ftgs, render_term};
+use super::{FtgsRow, StatSpec, StatValue, ftgs_scan, ftgs_scan_merge, merge_ftgs, render_term};
 use crate::group_lookup::GroupLookup;
 use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
 
@@ -89,7 +89,7 @@ fn rendered(rows: &[FtgsRow]) -> Vec<(String, String, u32, Vec<i64>)> {
                 r.field.clone(),
                 render_term(kind_of(&r.field), &r.term),
                 r.group,
-                r.stats.clone(),
+                r.stats.iter().map(StatValue::finalize).collect(),
             )
         })
         .collect()
@@ -178,7 +178,9 @@ fn count_min_max_operators() {
             .find(|r| render_term(kind_of(&r.field), &r.term) == term && r.group == group)
             .unwrap()
             .stats
-            .clone()
+            .iter()
+            .map(StatValue::finalize)
+            .collect::<Vec<i64>>()
     };
 
     // (US, g1) = docs {0,1}: count 2, sum 30, min 10, max 20.
@@ -347,5 +349,53 @@ fn single_shard_merge_equals_scan() {
         &["country"],
         &[StatSpec::Sum("revenue")],
     );
-    assert_eq!(merged, scanned);
+    assert_eq!(rendered(&merged), rendered(&scanned));
+}
+
+#[test]
+fn approx_count_distinct_per_group() {
+    let (_tmp, shard) = setup();
+    let rows = ftgs_scan(
+        &shard,
+        &groups_5(),
+        &["country"],
+        &[StatSpec::ApproxCountDistinct("revenue")],
+    )
+    .unwrap();
+
+    // revenue per (country, group); distinct counts are exact in HLL's
+    // sparse regime. UK g1 = doc4 {50} = 1; UK g2 = doc2 {30} = 1;
+    // US g1 = docs0,1 {10,20} = 2; US g2 = doc3 {40} = 1.
+    assert_eq!(
+        rendered(&rows),
+        vec![
+            row("country", "UK", 1, &[1]),
+            row("country", "UK", 2, &[1]),
+            row("country", "US", 1, &[2]),
+            row("country", "US", 2, &[1]),
+        ]
+    );
+}
+
+#[test]
+fn approx_count_distinct_unions_sketches_across_shards() {
+    let (t1, t2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    // Same country term in both shards, overlapping revenue values.
+    let s1 = write_country_shard(t1.path(), &["us", "us", "us"], vec![10, 20, 30]);
+    let s2 = write_country_shard(t2.path(), &["us", "us", "us"], vec![20, 30, 40]);
+    let (g1, g2) = (
+        GroupLookup::all_in_one_group(3),
+        GroupLookup::all_in_one_group(3),
+    );
+    let shards: [(&dyn Shard, &GroupLookup); 2] = [(&s1, &g1), (&s2, &g2)];
+    let merged = crate::ftgs::ftgs_scan_merge(
+        &shards,
+        &["country"],
+        &[StatSpec::ApproxCountDistinct("revenue")],
+    )
+    .unwrap();
+
+    // Union of {10,20,30} and {20,30,40} = {10,20,30,40} = 4 distinct —
+    // merging the HLL registers, not the per-shard counts (3 + 3 ≠ 4).
+    assert_eq!(rendered(&merged), vec![row("country", "us", 1, &[4])]);
 }

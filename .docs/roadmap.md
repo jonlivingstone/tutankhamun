@@ -167,10 +167,14 @@ directly.
       predicate on the time column before fetch) — §3.2
 - [~] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
       FTGS scan (Tier 2/3) — §3.2
-      (single-column `Int`/`String` GROUP BY + COUNT(*)/SUM/MIN/MAX
-      pushed via an optimizer rule → `FtgsAggExec`, including the
-      `String` NULL group; unsupported shapes fall back to DataFusion.
-      Remaining: multi-column GROUP BY via regroups, AVG)
+      (single-column `Int`/`String` GROUP BY *and* global no-GROUP-BY
+      aggregates + COUNT(*)/SUM/MIN/MAX/approx_count_distinct pushed via an
+      optimizer rule → `FtgsAggExec`, including the `String` NULL group; the
+      global path reuses `aggregate_docs` over the filtered set → one row with
+      SQL empty-input semantics (count/approx → 0, sum/min/max → NULL);
+      unsupported shapes fall back to DataFusion. Remaining: `approx_distinct`
+      on a `String` arg (hash index terms, no forward column); multi-column
+      GROUP BY via regroups; AVG)
 - [ ] FlightSQL service implementation — §3.2
 - [ ] Session-aware SQL execution — DataFusion planner reuses
       session state when new query's filter refines previous — §3.2
@@ -216,9 +220,11 @@ directly.
 
 ## Approximate aggregations
 
-- [ ] Pick crate strategy — `datasketches-rs` OR
-      `hyperloglogplus` + `tdigest` + custom theta — §3.1
-- [ ] `approx_count_distinct(field, [precision])` (HLL) — §3.1
+- [x] Pick crate strategy — `hyperloglogplus` + `tdigest` + custom
+      theta (pure Rust; no C++ toolchain) — §3.1
+- [~] `approx_count_distinct(field, [precision])` (HLL) — §3.1
+      (pushed through the SQL `GROUP BY` path via the `StatValue`
+      seam; optional `precision` arg still to add)
 - [ ] `approx_percentile(field, p, [compression])` (t-digest) —
       §3.1
 - [ ] `approx_top_k(field, k, [capacity])` (Count-Min + heavy
@@ -226,10 +232,12 @@ directly.
 - [ ] `theta(field, [nominal_entries])` returning Arrow `Binary`
       — §3.1
 - [ ] `theta_intersect(a, b)` — §3.1
-- [ ] Sketch merge in the FTGS merge path (sketches are
-      mergeable by construction) — §3.1
-- [ ] Sketches as Arrow record-batch columns (int64 for scalars,
-      `Binary` for raw thetas) — §3.1
+- [~] Sketch merge in the FTGS merge path (sketches are
+      mergeable by construction) — §3.1 (HLL registers union via
+      the `StatValue`/`combine_stats` seam; t-digest/theta extend it)
+- [~] Sketches as Arrow record-batch columns (int64 for scalars,
+      `Binary` for raw thetas) — §3.1 (HLL estimate emitted as a
+      `UInt64` column; `Binary` arrives with theta)
 
 ## Observability
 

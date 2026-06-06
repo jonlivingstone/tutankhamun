@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Download a month of Jersey City Citi Bike trip data, preprocess it
-# (compute `trip_seconds`), and ingest it as a Tutankhamun shard.
+# Fetch a month of Jersey City Citi Bike trip data and preprocess it
+# (compute a `trip_seconds` metric column). Leaves a ready-to-ingest CSV
+# and prints the `t9n ingest` command — it does not ingest itself, so the
+# tutorial's ingest step stays explicit.
 #
 # Usage:
-#   scripts/seed_citibike.sh                # default: 202301
-#   scripts/seed_citibike.sh 202302         # other month
-#   CACHE_DIR=/tmp/cb OUT_DIR=/tmp/cb-shard scripts/seed_citibike.sh
+#   scripts/fetch_citibike.sh               # default: 202301
+#   scripts/fetch_citibike.sh 202302        # other month
+#   CACHE_DIR=/tmp/cb scripts/fetch_citibike.sh
 #
 # Files are cached under .local/seed-cache so re-runs skip the
 # download + preprocessing steps.
@@ -14,13 +16,8 @@ set -euo pipefail
 
 MONTH="${1:-202301}"
 CACHE_DIR="${CACHE_DIR:-.local/seed-cache}"
-OUT_DIR="${OUT_DIR:-.local/storage/citibike/jc-$MONTH}"
 
-# Rustup puts cargo on PATH via shell init files; pull it in explicitly
-# so the script works from non-interactive shells too.
-[[ -f "$HOME/.cargo/env" ]] && source "$HOME/.cargo/env"
-
-for tool in curl unzip python3 cargo; do
+for tool in curl unzip python3; do
     command -v "$tool" >/dev/null || { echo "error: $tool not found in PATH"; exit 1; }
 done
 
@@ -69,27 +66,17 @@ with open(sys.argv[1]) as fin, open(sys.argv[2], "w") as fout:
 PY
 fi
 
-echo ">>> ingesting into $OUT_DIR (one shard per day)"
-cargo run --release --quiet --bin t9n -- ingest "$CSV_DUR" \
-    --output "$OUT_DIR" \
-    --time started_at \
-    --metric trip_seconds \
-    --string rideable_type \
-    --string member_casual \
-    --string start_station_id \
-    --string end_station_id \
-    --shard-by daily
-
 cat <<EOF
 
-dataset ready at: $OUT_DIR
-  (one shard per day: $OUT_DIR/YYYY-MM-DD/)
+data ready: $CSV_DUR
 
-try:
-  cargo run --release --bin t9n -- shard inspect $OUT_DIR/2023-01-01
-  cargo run --release --bin t9n -- query $OUT_DIR --metric trip_seconds
-  cargo run --release --bin t9n -- query $OUT_DIR \\
-      --filter member_casual=member --metric trip_seconds
-  cargo run --release --bin t9n -- query $OUT_DIR \\
-      --filter rideable_type=electric_bike --metric trip_seconds
+ingest it (one immutable shard per day) with:
+
+  cargo run --release --bin t9n -- ingest $CSV_DUR \\
+      --output .local/storage/citibike/jc-$MONTH \\
+      --time started_at \\
+      --metric trip_seconds \\
+      --string rideable_type --string member_casual \\
+      --string start_station_id --string end_station_id \\
+      --shard-by daily
 EOF

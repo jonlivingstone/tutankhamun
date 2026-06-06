@@ -15,6 +15,7 @@ use anyhow::Context as _;
 
 use arrow::array::{
     ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, StringArray, TimestampNanosecondArray,
+    UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::Result as DfResult;
@@ -32,7 +33,9 @@ use roaring::RoaringBitmap;
 use super::group_by::OwnedStat;
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::cache::Cache;
-use crate::ftgs::{FtgsRow, StatSpec, aggregate_docs, combine_stats, ftgs_scan_merge, render_term};
+use crate::ftgs::{
+    FtgsRow, StatSpec, StatValue, aggregate_docs, combine_stats, ftgs_scan_merge, render_term,
+};
 use crate::group_lookup::GroupLookup;
 use crate::shard::{
     DiskShard, FieldKind, FilterClause, FilterResult, Shard, decode_int_key, matched_doc_set,
@@ -372,18 +375,20 @@ fn string_column(
     Ok(Arc::new(StringArray::from(values)))
 }
 
-/// `ExecutionPlan` for a pushed-down single-column `GROUP BY` (§3.2).
-/// Runs the aggregation through FTGS per shard and merges, emitting one
+/// `ExecutionPlan` for a pushed-down aggregate (§3.2). Runs the
+/// aggregation through FTGS per shard and merges, emitting one
 /// pre-aggregated record batch instead of materializing every row.
+/// `group_col` is the single grouping column, or `None` for a global
+/// aggregate (no `GROUP BY` — one row over the whole filtered set).
 #[derive(Debug)]
 pub(crate) struct FtgsAggExec {
     url: String,
     cache: Arc<Cache>,
-    group_col: String,
+    group_col: Option<String>,
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
-    /// Output schema: the group column, then one `Int64` column per
-    /// stat — matching the `Aggregate`'s output that this replaces.
+    /// Output schema, matching the `Aggregate` this replaces: the group
+    /// column (if any) followed by one column per stat.
     schema: SchemaRef,
     plan_properties: PlanProperties,
 }
@@ -392,7 +397,7 @@ impl FtgsAggExec {
     pub(crate) fn new(
         url: String,
         cache: Arc<Cache>,
-        group_col: String,
+        group_col: Option<String>,
         stats: Vec<OwnedStat>,
         filters: Vec<PushedFilter>,
         schema: SchemaRef,
@@ -420,7 +425,7 @@ impl DisplayAs for FtgsAggExec {
         write!(
             f,
             "FtgsAggExec: group_by={}, stats={}, pushed_filters={}",
-            self.group_col,
+            self.group_col.as_deref().unwrap_or("(global)"),
             self.stats.len(),
             self.filters.len()
         )
@@ -460,7 +465,7 @@ impl ExecutionPlan for FtgsAggExec {
             aggregate_batch(
                 &self.url,
                 &self.cache,
-                &self.group_col,
+                self.group_col.as_deref(),
                 &self.stats,
                 &self.filters,
                 &self.schema,
@@ -477,14 +482,32 @@ impl ExecutionPlan for FtgsAggExec {
 async fn aggregate_batch(
     url: &str,
     cache: &Cache,
-    group_col: &str,
+    group_col: Option<&str>,
     stats: &[OwnedStat],
     filters: &[PushedFilter],
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
     let shards = fetch_selected_shards(url, cache, filters).await?;
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
+    match group_col {
+        Some(col) => aggregate_grouped(&shards, col, &stat_specs, stats.len(), schema),
+        None => reshape_global(
+            global_stats(&shards, &stat_specs)?.as_deref(),
+            stats,
+            schema,
+        ),
+    }
+}
 
+/// Single-column `GROUP BY`: one output row per `(term, group)`, plus a
+/// trailing NULL group for `String` columns (docs with no term).
+fn aggregate_grouped(
+    shards: &[(DiskShard, FilterResult)],
+    group_col: &str,
+    stat_specs: &[StatSpec],
+    num_stats: usize,
+    schema: &SchemaRef,
+) -> anyhow::Result<RecordBatch> {
     // A `String` group column can be sparse: filtered docs with no term
     // for it form the SQL NULL group. `Int` columns are dense, so they
     // never have one — skip the extra pass entirely.
@@ -495,8 +518,8 @@ async fn aggregate_batch(
     // contributes no shard. For a `String` column we also aggregate the
     // no-term docs into a NULL group, combined across shards.
     let mut pairs: Vec<(&DiskShard, GroupLookup)> = Vec::with_capacity(shards.len());
-    let mut null_stats: Option<Vec<i64>> = None;
-    for (shard, selection) in &shards {
+    let mut null_stats: Option<Vec<StatValue>> = None;
+    for (shard, selection) in shards {
         let num_docs = usize::try_from(shard.num_docs())?;
         let filtered: Option<&RoaringBitmap> = match selection {
             FilterResult::Empty => continue,
@@ -526,9 +549,9 @@ async fn aggregate_batch(
                 Some(bm) => bm.clone() - covered,
             };
             if !null_docs.is_empty() {
-                let shard_null = aggregate_docs(shard, null_docs.iter(), &stat_specs)?;
+                let shard_null = aggregate_docs(shard, null_docs.iter(), stat_specs)?;
                 match null_stats.as_mut() {
-                    Some(acc) => combine_stats(acc, &shard_null, &stat_specs),
+                    Some(acc) => combine_stats(acc, &shard_null, stat_specs),
                     None => null_stats = Some(shard_null),
                 }
             }
@@ -539,8 +562,31 @@ async fn aggregate_batch(
 
     let refs: Vec<(&dyn Shard, &GroupLookup)> =
         pairs.iter().map(|(s, g)| (*s as &dyn Shard, g)).collect();
-    let rows = ftgs_scan_merge(&refs, &[group_col], &stat_specs)?;
-    reshape_aggregate(&rows, stats.len(), schema, null_stats.as_deref())
+    let rows = ftgs_scan_merge(&refs, &[group_col], stat_specs)?;
+    reshape_aggregate(&rows, num_stats, schema, null_stats.as_deref())
+}
+
+/// Global aggregate (no `GROUP BY`): aggregate each shard's whole
+/// filtered doc set as one group and combine across shards. `None` means
+/// no shard had a matching doc (empty input).
+fn global_stats(
+    shards: &[(DiskShard, FilterResult)],
+    stat_specs: &[StatSpec],
+) -> anyhow::Result<Option<Vec<StatValue>>> {
+    let mut acc: Option<Vec<StatValue>> = None;
+    for (shard, selection) in shards {
+        let num_docs = u32::try_from(shard.num_docs())?;
+        let shard_stats = match selection {
+            FilterResult::Empty => continue,
+            FilterResult::All => aggregate_docs(shard, 0..num_docs, stat_specs)?,
+            FilterResult::Bitmap(bm) => aggregate_docs(shard, bm.iter(), stat_specs)?,
+        };
+        match acc.as_mut() {
+            Some(a) => combine_stats(a, &shard_stats, stat_specs),
+            None => acc = Some(shard_stats),
+        }
+    }
+    Ok(acc)
 }
 
 /// Union of all of `col`'s postings in `shard` — the docs that carry
@@ -565,7 +611,7 @@ fn reshape_aggregate(
     rows: &[FtgsRow],
     num_stats: usize,
     schema: &SchemaRef,
-    null_stats: Option<&[i64]>,
+    null_stats: Option<&[StatValue]>,
 ) -> anyhow::Result<RecordBatch> {
     let num_rows = rows.len() + usize::from(null_stats.is_some());
 
@@ -591,14 +637,57 @@ fn reshape_aggregate(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + num_stats);
     arrays.push(group);
     for s in 0..num_stats {
-        let mut col: Vec<i64> = rows.iter().map(|r| r.stats[s]).collect();
+        let mut col: Vec<Option<i64>> = rows.iter().map(|r| Some(r.stats[s].finalize())).collect();
         if let Some(ns) = null_stats {
-            col.push(ns[s]);
+            col.push(Some(ns[s].finalize()));
         }
-        arrays.push(Arc::new(Int64Array::from(col)));
+        arrays.push(stat_array(schema.field(s + 1).data_type(), col)?);
     }
 
     let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        arrays,
+        &options,
+    )?)
+}
+
+/// Build a stat column in the type the aggregate's output schema
+/// declares, each `None` rendering a SQL NULL. Cardinalities are
+/// non-negative, so the `UInt64` widening can't lose a value.
+fn stat_array(dtype: &DataType, vals: Vec<Option<i64>>) -> anyhow::Result<ArrayRef> {
+    Ok(match dtype {
+        DataType::Int64 => Arc::new(Int64Array::from(vals)),
+        DataType::UInt64 => Arc::new(UInt64Array::from(
+            vals.into_iter()
+                .map(|v| v.map(|x| u64::try_from(x).expect("cardinality is non-negative")))
+                .collect::<Vec<Option<u64>>>(),
+        )),
+        other => anyhow::bail!("unsupported aggregate output type {other:?}"),
+    })
+}
+
+/// The single row of a global aggregate: each stat finalized to its
+/// column type, or — when the input was empty (`stats` is `None`) — the
+/// SQL empty-input value, which is `0` for `COUNT`/`approx_distinct` and
+/// NULL for `SUM`/`MIN`/`MAX`.
+fn reshape_global(
+    stats: Option<&[StatValue]>,
+    owned: &[OwnedStat],
+    schema: &SchemaRef,
+) -> anyhow::Result<RecordBatch> {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(owned.len());
+    for (s, spec) in owned.iter().enumerate() {
+        let value = match stats {
+            Some(st) => Some(st[s].finalize()),
+            None => match spec {
+                OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
+                OwnedStat::Sum(_) | OwnedStat::Min(_) | OwnedStat::Max(_) => None,
+            },
+        };
+        arrays.push(stat_array(schema.field(s).data_type(), vec![value])?);
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(1));
     Ok(RecordBatch::try_new_with_options(
         Arc::clone(schema),
         arrays,
