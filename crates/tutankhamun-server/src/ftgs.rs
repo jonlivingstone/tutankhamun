@@ -39,8 +39,8 @@ use crate::shard::{FieldKind, Shard, decode_int_key, require_field, utf8_term};
 use crate::sketches::Hll;
 
 /// A stat the caller wants accumulated per group, named against the
-/// shard's columns. `Sum`/`Min`/`Max` read a `Metric`/`Int` forward
-/// column; `ApproxCountDistinct` reads a forward column too, or a
+/// shard's columns. `Sum`/`Min`/`Max`/`Avg` read a `Metric`/`Int`
+/// forward column; `ApproxCountDistinct` reads a forward column too, or a
 /// `String` field's inverted-index terms; `Count` needs no column.
 #[derive(Debug, Clone, Copy)]
 pub enum StatSpec<'a> {
@@ -48,21 +48,24 @@ pub enum StatSpec<'a> {
     Sum(&'a str),
     Min(&'a str),
     Max(&'a str),
+    Avg(&'a str),
     ApproxCountDistinct(&'a str),
 }
 
 impl StatSpec<'_> {
     /// Merge two scalar stat values for the same `(field, term, group)`:
-    /// additive stats sum, `Min`/`Max` fold. The sketch stat
-    /// (`ApproxCountDistinct`) merges its accumulator instead — see
-    /// [`combine_stats`] — so it never reaches here.
+    /// additive stats sum, `Min`/`Max` fold. The non-scalar stats
+    /// (`Avg`'s `(sum, count)`, `ApproxCountDistinct`'s sketch) merge their
+    /// own accumulator instead — see [`combine_stats`] — so never reach here.
     #[must_use]
     pub fn combine(self, a: i64, b: i64) -> i64 {
         match self {
             StatSpec::Count | StatSpec::Sum(_) => a + b,
             StatSpec::Min(_) => a.min(b),
             StatSpec::Max(_) => a.max(b),
-            StatSpec::ApproxCountDistinct(_) => unreachable!("sketch combines its accumulator"),
+            StatSpec::Avg(_) | StatSpec::ApproxCountDistinct(_) => {
+                unreachable!("non-scalar stat combines its own accumulator")
+            }
         }
     }
 }
@@ -75,16 +78,35 @@ impl StatSpec<'_> {
 pub enum StatValue {
     /// `Count`/`Sum`/`Min`/`Max` — the value is already the result.
     Scalar(i64),
+    /// `Avg` — running `(sum, count)`, both additive across shards,
+    /// finalized to a `f64` quotient. Carried un-finalized because an
+    /// average isn't additive (you can't average two averages).
+    Avg { sum: i64, count: i64 },
     /// `ApproxCountDistinct` — a `HyperLogLog`, finalized to an estimate.
     Hll(Hll),
 }
 
 impl StatValue {
+    /// The `i64` result for a scalar/sketch stat. `Avg` finalizes to a
+    /// `f64` instead — see [`avg_f64`](Self::avg_f64).
     #[must_use]
     pub fn finalize(&self) -> i64 {
         match self {
             StatValue::Scalar(v) => *v,
             StatValue::Hll(h) => h.estimate(),
+            StatValue::Avg { .. } => unreachable!("avg finalizes to f64, not i64"),
+        }
+    }
+
+    /// The `f64` result for an `Avg` stat (`sum / count`). The caller
+    /// reaches this only for a `Float64` output column, where `count >= 1`
+    /// by construction (a group exists because it has a doc).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn avg_f64(&self) -> f64 {
+        match self {
+            StatValue::Avg { sum, count } => *sum as f64 / *count as f64,
+            _ => unreachable!("avg_f64 on a non-avg stat"),
         }
     }
 }
@@ -97,6 +119,10 @@ pub fn combine_stats(acc: &mut [StatValue], other: &[StatValue], specs: &[StatSp
     for (i, b) in other.iter().enumerate() {
         match (&mut acc[i], b) {
             (StatValue::Scalar(a), StatValue::Scalar(b)) => *a = specs[i].combine(*a, *b),
+            (StatValue::Avg { sum, count }, StatValue::Avg { sum: s, count: c }) => {
+                *sum += *s;
+                *count += *c;
+            }
             (StatValue::Hll(a), StatValue::Hll(b)) => a.merge(b),
             _ => unreachable!("stat variants match across shards (same specs)"),
         }
@@ -137,6 +163,11 @@ enum Stat<'a> {
     Max {
         col: &'a [i64],
         slots: Vec<i64>,
+    },
+    Avg {
+        col: &'a [i64],
+        sum: Vec<i64>,
+        count: Vec<i64>,
     },
     Hll {
         col: &'a [i64],
@@ -179,6 +210,11 @@ impl<'a> Stat<'a> {
                 col: column(name)?,
                 slots: vec![i64::MIN; num_groups],
             },
+            StatSpec::Avg(name) => Stat::Avg {
+                col: column(name)?,
+                sum: vec![0; num_groups],
+                count: vec![0; num_groups],
+            },
             // `Int`/`Metric` have a dense forward column; `String` does
             // not, so it sources term bytes from the inverted index.
             StatSpec::ApproxCountDistinct(name) => {
@@ -206,6 +242,10 @@ impl<'a> Stat<'a> {
             Stat::Sum { col, slots } => slots[group] += col[doc],
             Stat::Min { col, slots } => slots[group] = slots[group].min(col[doc]),
             Stat::Max { col, slots } => slots[group] = slots[group].max(col[doc]),
+            Stat::Avg { col, sum, count } => {
+                sum[group] += col[doc];
+                count[group] += 1;
+            }
             Stat::Hll { col, sketches } => sketches[group].insert(col[doc]),
             Stat::HllBytes {
                 doc_term,
@@ -235,6 +275,10 @@ impl<'a> Stat<'a> {
             Stat::Max { slots, .. } => {
                 StatValue::Scalar(std::mem::replace(&mut slots[group], i64::MIN))
             }
+            Stat::Avg { sum, count, .. } => StatValue::Avg {
+                sum: std::mem::take(&mut sum[group]),
+                count: std::mem::take(&mut count[group]),
+            },
             Stat::Hll { sketches, .. } | Stat::HllBytes { sketches, .. } => {
                 StatValue::Hll(std::mem::take(&mut sketches[group]))
             }

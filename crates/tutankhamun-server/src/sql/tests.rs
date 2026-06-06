@@ -703,7 +703,7 @@ async fn group_by_string_with_where_filter() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn avg_falls_back_to_datafusion() {
+async fn avg_grouped_by_int_pushes_down() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     write_two_shard_dataset(tmp.path());
     let (provider, _cache_dir) = provider_for(tmp.path()).await;
@@ -711,18 +711,15 @@ async fn avg_falls_back_to_datafusion() {
     let ctx = super::session_context();
     ctx.register_table("trips", Arc::new(provider)).unwrap();
 
-    // AVG isn't a pushed stat → fallback (correct via DataFusion).
     let sql = "SELECT vendor_id, avg(fare) FROM trips GROUP BY vendor_id ORDER BY vendor_id";
-    assert!(!physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
 
+    // vendor 1 {100,300}→200; vendor 2 {200,400}→300; vendor 3 {500,600}→550.
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    let avg = batches[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Float64Array>()
-        .unwrap();
-    // vendor 1 fares {100,300} → avg 200.
-    assert!((avg.value(0) - 200.0).abs() < 1e-9);
+    assert_eq!(
+        f64_col(&batches[0], 1),
+        vec![Some(200.0), Some(300.0), Some(550.0)]
+    );
 }
 
 // ---- approx_count_distinct (HLL) pushdown ----
@@ -880,4 +877,69 @@ async fn global_aggregate_empty_input_has_sql_null_semantics() {
     assert_eq!(count.value(0), 0);
     assert!(sum.is_null(0), "sum over empty input is NULL");
     assert_eq!(distinct.value(0), 0);
+}
+
+// ---- AVG ----
+
+/// The `Float64` values of `batch` column `col`, `None` for NULL.
+fn f64_col(batch: &arrow::array::RecordBatch, col: usize) -> Vec<Option<f64>> {
+    let a = batch
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .expect("expected a Float64 column");
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i)))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn avg_global_pushes_down() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // fares {100,200,300,400,500,600} → mean 2100/6 = 350.0.
+    let sql = "SELECT avg(fare) FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(f64_col(&batches[0], 0), vec![Some(350.0)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn avg_grouped_pushes_down() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // us = {100,300,500}/3 = 300.0; de = {200,400,600}/3 = 400.0.
+    let sql = "SELECT country, avg(fare) FROM trips GROUP BY country ORDER BY country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(f64_col(&batches[0], 1), vec![Some(400.0), Some(300.0)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn avg_empty_input_is_null() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // No matching docs → one row, AVG NULL (not 0).
+    let sql = "SELECT avg(fare) FROM trips WHERE country = 'zz'";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(f64_col(&batches[0], 0), vec![None]);
 }

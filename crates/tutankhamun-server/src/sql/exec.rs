@@ -14,8 +14,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 
 use arrow::array::{
-    ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, StringArray, TimestampNanosecondArray,
-    UInt64Array,
+    ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    TimestampNanosecondArray, UInt64Array,
 };
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::Result as DfResult;
@@ -637,11 +637,24 @@ fn reshape_aggregate(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + num_stats);
     arrays.push(group);
     for s in 0..num_stats {
-        let mut col: Vec<Option<i64>> = rows.iter().map(|r| Some(r.stats[s].finalize())).collect();
-        if let Some(ns) = null_stats {
-            col.push(Some(ns[s].finalize()));
-        }
-        arrays.push(stat_array(schema.field(s + 1).data_type(), col)?);
+        let dtype = schema.field(s + 1).data_type();
+        let array = if matches!(dtype, DataType::Float64) {
+            // `AVG` → one f64 per group; the NULL group is just another group.
+            let mut col: Vec<Option<f64>> =
+                rows.iter().map(|r| Some(r.stats[s].avg_f64())).collect();
+            if let Some(ns) = null_stats {
+                col.push(Some(ns[s].avg_f64()));
+            }
+            float_array(col)
+        } else {
+            let mut col: Vec<Option<i64>> =
+                rows.iter().map(|r| Some(r.stats[s].finalize())).collect();
+            if let Some(ns) = null_stats {
+                col.push(Some(ns[s].finalize()));
+            }
+            stat_array(dtype, col)?
+        };
+        arrays.push(array);
     }
 
     let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
@@ -667,10 +680,15 @@ fn stat_array(dtype: &DataType, vals: Vec<Option<i64>>) -> anyhow::Result<ArrayR
     })
 }
 
+/// A `Float64` stat column — the output type of `AVG` — each `None` a NULL.
+fn float_array(vals: Vec<Option<f64>>) -> ArrayRef {
+    Arc::new(Float64Array::from(vals))
+}
+
 /// The single row of a global aggregate: each stat finalized to its
 /// column type, or — when the input was empty (`stats` is `None`) — the
 /// SQL empty-input value, which is `0` for `COUNT`/`approx_distinct` and
-/// NULL for `SUM`/`MIN`/`MAX`.
+/// NULL for `SUM`/`MIN`/`MAX`/`AVG`.
 fn reshape_global(
     stats: Option<&[StatValue]>,
     owned: &[OwnedStat],
@@ -678,14 +696,22 @@ fn reshape_global(
 ) -> anyhow::Result<RecordBatch> {
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(owned.len());
     for (s, spec) in owned.iter().enumerate() {
-        let value = match stats {
-            Some(st) => Some(st[s].finalize()),
-            None => match spec {
-                OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
-                OwnedStat::Sum(_) | OwnedStat::Min(_) | OwnedStat::Max(_) => None,
-            },
+        let dtype = schema.field(s).data_type();
+        let array = if matches!(dtype, DataType::Float64) {
+            // `AVG`: present → sum/count; empty input → NULL.
+            float_array(vec![stats.map(|st| st[s].avg_f64())])
+        } else {
+            let value = match stats {
+                Some(st) => Some(st[s].finalize()),
+                None => match spec {
+                    OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
+                    OwnedStat::Sum(_) | OwnedStat::Min(_) | OwnedStat::Max(_) => None,
+                    OwnedStat::Avg(_) => unreachable!("avg output is Float64"),
+                },
+            };
+            stat_array(dtype, vec![value])?
         };
-        arrays.push(stat_array(schema.field(s).data_type(), vec![value])?);
+        arrays.push(array);
     }
     let options = RecordBatchOptions::new().with_row_count(Some(1));
     Ok(RecordBatch::try_new_with_options(

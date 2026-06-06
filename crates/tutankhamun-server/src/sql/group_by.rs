@@ -67,6 +67,7 @@ pub(crate) enum OwnedStat {
     Sum(String),
     Min(String),
     Max(String),
+    Avg(String),
     ApproxCountDistinct(String),
 }
 
@@ -77,6 +78,7 @@ impl OwnedStat {
             OwnedStat::Sum(c) => StatSpec::Sum(c),
             OwnedStat::Min(c) => StatSpec::Min(c),
             OwnedStat::Max(c) => StatSpec::Max(c),
+            OwnedStat::Avg(c) => StatSpec::Avg(c),
             OwnedStat::ApproxCountDistinct(c) => StatSpec::ApproxCountDistinct(c),
         }
     }
@@ -287,10 +289,21 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
         // COUNT(*) only — args are empty or a literal. COUNT(col) (which
         // skips NULLs) isn't equivalent to FTGS's per-group doc count.
         "count" if args.iter().all(|a| matches!(a, Expr::Literal(..))) => Some(OwnedStat::Count),
-        // `sum`/`min`/`max` read one bare `Metric`/`Int` forward column;
-        // `approx_distinct` also takes a `String`, hashing its index terms.
-        name @ ("sum" | "min" | "max" | "approx_distinct") => {
-            let [Expr::Column(c)] = args.as_slice() else {
+        // `sum`/`min`/`max`/`avg` read one bare `Metric`/`Int` forward
+        // column; `approx_distinct` also takes a `String`, hashing its terms.
+        name @ ("sum" | "min" | "max" | "avg" | "approx_distinct") => {
+            let [arg] = args.as_slice() else {
+                return None;
+            };
+            // `avg(int)` arrives as `avg(CAST(col AS Float64))`; peel the
+            // cast DataFusion inserts so the i64 column underneath is summed.
+            // Only for `avg` — keeping the others bare-column-only preserves
+            // `Float64 output <=> AVG` for the reshape's type dispatch.
+            let col_expr = match arg {
+                Expr::Cast(cast) if name == "avg" => cast.expr.as_ref(),
+                other => other,
+            };
+            let Expr::Column(c) = col_expr else {
                 return None;
             };
             let kind = prov.field_kind(&c.name)?;
@@ -308,6 +321,7 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
                 "sum" => OwnedStat::Sum(col),
                 "min" => OwnedStat::Min(col),
                 "max" => OwnedStat::Max(col),
+                "avg" => OwnedStat::Avg(col),
                 _ => OwnedStat::ApproxCountDistinct(col),
             })
         }
