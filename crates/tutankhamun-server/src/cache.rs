@@ -19,9 +19,11 @@
 //! written under `format_version` 1 carry no hashes and load
 //! unvalidated.
 //!
-//! No cross-process locking. Two concurrent `t9n` invocations
-//! sharing a cache dir may race on a fresh download; the second
-//! writer wins. Acceptable for the single-user CLI today.
+//! Concurrent `fetch_shard` calls for the *same* shard serialize on a
+//! per-shard lock, so the second caller waits for the first's download
+//! and then reads a complete dir. There is no *cross-process* locking:
+//! two `t9n` invocations sharing a cache dir may still race on a fresh
+//! download; the second writer wins. Acceptable for the single-user CLI.
 
 pub mod size;
 
@@ -44,6 +46,13 @@ use crate::shard_source::ShardSummary;
 
 const SHARD_KEY_LEN: usize = 16;
 
+/// Per-shard fetch locks, bucketed by the shard key so concurrent
+/// `fetch_shard` calls for the same shard serialize (the first downloads,
+/// the rest wait then find the complete dir). A fixed array avoids a
+/// growing per-key map; an occasional bucket collision just serializes two
+/// unrelated fetches, which is negligible for I/O-bound downloads.
+const FETCH_LOCK_BUCKETS: usize = 256;
+
 /// Hot-storage cache backed by a local directory.
 #[derive(Debug)]
 pub struct Cache {
@@ -52,6 +61,7 @@ pub struct Cache {
     store_identity: String,
     size_cap: u64,
     state: Mutex<CacheState>,
+    fetch_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
@@ -90,6 +100,9 @@ impl Cache {
             store_identity,
             size_cap,
             state: Mutex::new(state),
+            fetch_locks: (0..FETCH_LOCK_BUCKETS)
+                .map(|_| tokio::sync::Mutex::new(()))
+                .collect(),
         })
     }
 
@@ -100,6 +113,11 @@ impl Cache {
     pub async fn fetch_shard(&self, summary: &ShardSummary) -> Result<PathBuf> {
         let key = self.shard_key(&summary.location);
         let local_dir = self.dir.join(&key);
+
+        // Serialize concurrent fetches of this shard: the first downloads,
+        // any other waits here and then validates the now-complete dir
+        // below — so no one observes a half-written shard directory.
+        let _fetch_guard = self.fetch_locks[bucket(&key)].lock().await;
 
         if validate_local(&local_dir, &summary.metadata).is_err() {
             self.download(&summary.location, &local_dir).await?;
@@ -207,6 +225,14 @@ impl Cache {
     fn total_bytes(&self) -> u64 {
         self.state.lock().expect("cache state mutex").total_bytes
     }
+}
+
+/// Map a shard key to a fetch-lock bucket by its first two hex digits
+/// (the digest's leading byte) — uniform, since the key is a hash. Any
+/// deterministic mapping is safe, so the fallbacks just pin a malformed
+/// key to bucket 0 rather than panicking.
+fn bucket(key: &str) -> usize {
+    usize::from_str_radix(key.get(..2).unwrap_or("00"), 16).unwrap_or(0) % FETCH_LOCK_BUCKETS
 }
 
 fn validate_local(dir: &StdPath, metadata: &Metadata) -> Result<()> {
@@ -724,5 +750,62 @@ mod tests {
         let local = cache.fetch_shard(&summary).await.expect("fetch");
         let cached_size = fs::metadata(local.join("metrics.arrow")).unwrap().len();
         assert_eq!(cached_size, metrics_size, "byte-for-byte parity");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_fetch_of_same_cold_shard_never_sees_partial_dir() {
+        // Many tasks racing to fetch the *same* cold shard must all
+        // succeed: the per-shard fetch lock means the first downloads
+        // and the rest wait, then validate a complete dir — none ever
+        // observes a half-written directory (the `… missing` race).
+        let local_src = tempfile::tempdir().unwrap();
+        write_local_shard(local_src.path(), vec![1, 2, 3, 4, 5]);
+
+        let registry = StorageRegistry::from_url("memory:///").unwrap();
+        let store = registry.store();
+        upload_shard(&*store, "data/shard-000", local_src.path()).await;
+
+        let metadata: Metadata = serde_json::from_slice(
+            &store
+                .get(&Path::from("data/shard-000/metadata.json"))
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let summary = ShardSummary {
+            location: Path::from("data/shard-000"),
+            metadata,
+        };
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            Cache::open(
+                cache_dir.path().to_path_buf(),
+                Arc::clone(&store),
+                "memory:///".to_string(),
+                100 * 1024 * 1024,
+            )
+            .unwrap(),
+        );
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..16 {
+            let cache = Arc::clone(&cache);
+            let summary = summary.clone();
+            set.spawn(async move { cache.fetch_shard(&summary).await });
+        }
+
+        let mut dirs = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            let dir = joined.unwrap().expect("concurrent fetch must succeed");
+            assert!(dir.join("metadata.json").is_file());
+            assert!(dir.join("metrics.arrow").is_file());
+            dirs.push(dir);
+        }
+        assert_eq!(dirs.len(), 16);
+        assert!(dirs.iter().all(|d| *d == dirs[0]), "all resolve same dir");
     }
 }

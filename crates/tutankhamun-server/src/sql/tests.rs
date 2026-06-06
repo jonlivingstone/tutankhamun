@@ -1377,15 +1377,6 @@ async fn theta_intersect_counts_cohort_overlap() {
     let ctx = super::session_context();
     ctx.register_table("trips", Arc::new(provider)).unwrap();
 
-    // Warm the shard cache with one scan first: the two scalar subqueries
-    // below otherwise fetch the same cold shard concurrently and race.
-    ctx.sql("SELECT count(*) FROM trips")
-        .await
-        .unwrap()
-        .collect()
-        .await
-        .unwrap();
-
     // vendors with country=us = {1,3}; country=de = {2,3}; overlap = {3} → 1.
     let sql = "SELECT theta_intersect(
         (SELECT theta(vendor_id) FROM trips WHERE country = 'us'),
