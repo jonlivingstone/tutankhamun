@@ -187,6 +187,46 @@ fn approx_percentile_merges_across_shards() {
     assert!((30..=40).contains(&p50), "merged p50 = {p50}");
 }
 
+/// Decode a `StatValue::TopK`'s value-key bytes to `(String, count)`.
+fn topk_rendered(stat: &StatValue) -> Vec<(String, i64)> {
+    let StatValue::TopK { items, .. } = stat else {
+        panic!("expected TopK");
+    };
+    items
+        .iter()
+        .map(|(b, c)| (render_term(FieldKind::String, b), *c))
+        .collect()
+}
+
+#[test]
+fn approx_top_k_counts_terms() {
+    let (_tmp, shard) = setup();
+    // country: US 3 (docs 0,1,3), UK 2 (docs 2,4) → count desc.
+    let out = aggregate_docs(&shard, 0..5, &[StatSpec::TopK("country", 2, 100)]).unwrap();
+    assert_eq!(
+        topk_rendered(&out[0]),
+        vec![("US".to_string(), 3), ("UK".to_string(), 2)]
+    );
+}
+
+#[test]
+fn approx_top_k_merges_across_shards() {
+    let tmp = TempDir::new().unwrap();
+    let s1 = write_country_shard(&tmp.path().join("a"), &["US", "US", "UK"], vec![0, 0, 0]);
+    let s2 = write_country_shard(&tmp.path().join("b"), &["UK", "UK", "US"], vec![0, 0, 0]);
+
+    let spec = [StatSpec::TopK("country", 2, 100)];
+    let mut a = aggregate_docs(&s1, 0..3, &spec).unwrap();
+    let b = aggregate_docs(&s2, 0..3, &spec).unwrap();
+    combine_stats(&mut a, &b, &spec);
+
+    // US 3, UK 3 → tie broken by value asc ("UK" < "US").
+    assert_eq!(
+        topk_rendered(&a[0]),
+        vec![("UK".to_string(), 3), ("US".to_string(), 3)]
+    );
+}
+
 #[test]
 fn group_zero_is_excluded() {
     let (_tmp, shard) = setup();

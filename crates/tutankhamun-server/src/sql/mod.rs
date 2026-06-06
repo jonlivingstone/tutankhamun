@@ -17,6 +17,7 @@
 //!
 //! See `.docs/tutankhamun.md` §3.2 for the design.
 
+pub mod approx_top_k;
 pub mod exec;
 pub mod group_by;
 pub mod provider;

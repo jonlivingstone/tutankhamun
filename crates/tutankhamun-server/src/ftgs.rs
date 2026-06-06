@@ -27,7 +27,7 @@
 //! loop and `FtgsRow` are agnostic to which variant a stat is.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 use anyhow::{Context as _, Result, bail};
 use rayon::prelude::*;
@@ -35,7 +35,7 @@ use rayon::prelude::*;
 use crate::bit_tree::BitTree;
 use crate::group_lookup::GroupLookup;
 use crate::runtime;
-use crate::shard::{FieldKind, Shard, decode_int_key, require_field, utf8_term};
+use crate::shard::{FieldKind, Shard, decode_int_key, encode_int_key, require_field, utf8_term};
 use crate::sketches::{Hll, TDigest};
 
 /// A stat the caller wants accumulated per group, named against the
@@ -53,6 +53,9 @@ pub enum StatSpec<'a> {
     Avg(&'a str),
     ApproxCountDistinct(&'a str),
     ApproxPercentile(&'a str, f64, usize),
+    /// `approx_top_k`: column, `k`, and the per-shard `capacity` retained
+    /// for the merge.
+    TopK(&'a str, usize, usize),
 }
 
 impl StatSpec<'_> {
@@ -69,7 +72,8 @@ impl StatSpec<'_> {
             StatSpec::Max(_) => a.max(b),
             StatSpec::Avg(_)
             | StatSpec::ApproxCountDistinct(_)
-            | StatSpec::ApproxPercentile(..) => {
+            | StatSpec::ApproxPercentile(..)
+            | StatSpec::TopK(..) => {
                 unreachable!("non-scalar stat combines its own accumulator")
             }
         }
@@ -93,6 +97,24 @@ pub enum StatValue {
     /// `ApproxPercentile` — a `t-digest` plus the quantile to query at
     /// finalize. Carried un-finalized so digests merge across shards.
     TDigest { digest: TDigest, percentile: f64 },
+    /// `approx_top_k` — the top-`capacity` `(value-key bytes, count)` pairs
+    /// (value bytes are the FTGS term-key encoding), count-descending. `k`
+    /// rides along for the final truncation at output.
+    TopK {
+        items: Vec<(Box<[u8]>, i64)>,
+        k: usize,
+        capacity: usize,
+    },
+}
+
+/// Sort `(value-key, count)` pairs count-descending, value-key ascending
+/// (a deterministic tiebreak — byte order matches numeric order for `Int`
+/// keys and lexical order for `String`), and keep the top `n`.
+fn top_k_sorted(map: HashMap<Box<[u8]>, i64>, n: usize) -> Vec<(Box<[u8]>, i64)> {
+    let mut entries: Vec<(Box<[u8]>, i64)> = map.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(n);
+    entries
 }
 
 impl StatValue {
@@ -110,6 +132,7 @@ impl StatValue {
                 digest.quantile(*percentile).round() as i64
             }
             StatValue::Avg { .. } => unreachable!("avg finalizes to f64, not i64"),
+            StatValue::TopK { .. } => unreachable!("top-k reshapes to a list, not i64"),
         }
     }
 
@@ -141,6 +164,21 @@ pub fn combine_stats(acc: &mut [StatValue], other: &[StatValue], specs: &[StatSp
             (StatValue::Hll(a), StatValue::Hll(b)) => a.merge(b),
             (StatValue::TDigest { digest: a, .. }, StatValue::TDigest { digest: b, .. }) => {
                 a.merge(b);
+            }
+            (
+                StatValue::TopK {
+                    items: a, capacity, ..
+                },
+                StatValue::TopK { items: b, .. },
+            ) => {
+                let mut map: HashMap<Box<[u8]>, i64> = HashMap::with_capacity(a.len() + b.len());
+                for (val, c) in a.drain(..) {
+                    *map.entry(val).or_default() += c;
+                }
+                for (val, c) in b {
+                    *map.entry(val.clone()).or_default() += *c;
+                }
+                *a = top_k_sorted(map, *capacity);
             }
             _ => unreachable!("stat variants match across shards (same specs)"),
         }
@@ -210,6 +248,24 @@ enum Stat<'a> {
         max_size: usize,
         buffers: Vec<Vec<f64>>,
     },
+    /// `approx_top_k` over a forward (`Int`/`Metric`) column: count per
+    /// `i64` value, resolved to its `encode_int_key` bytes at `take_value`.
+    TopKInt {
+        col: &'a [i64],
+        k: usize,
+        capacity: usize,
+        counts: Vec<HashMap<i64, i64>>,
+    },
+    /// `approx_top_k` over a `String` column: count per term index (via the
+    /// doc→term map), resolved to term bytes at `take_value`. A doc with no
+    /// term (SQL NULL) is counted by no value.
+    TopKBytes {
+        doc_term: Vec<Option<u32>>,
+        terms: Vec<Box<[u8]>>,
+        k: usize,
+        capacity: usize,
+        counts: Vec<HashMap<u32, i64>>,
+    },
 }
 
 impl<'a> Stat<'a> {
@@ -265,6 +321,27 @@ impl<'a> Stat<'a> {
                 max_size,
                 buffers: vec![Vec::new(); num_groups],
             },
+            // `Int`/`Metric` count via the forward column; `String` counts
+            // per term index from the inverted index.
+            StatSpec::TopK(name, k, capacity) => {
+                if let Some(col) = shard.forward_column(name) {
+                    Stat::TopKInt {
+                        col,
+                        k,
+                        capacity,
+                        counts: vec![HashMap::new(); num_groups],
+                    }
+                } else {
+                    let (doc_term, terms) = term_map(shard, name)?;
+                    Stat::TopKBytes {
+                        doc_term,
+                        terms,
+                        k,
+                        capacity,
+                        counts: vec![HashMap::new(); num_groups],
+                    }
+                }
+            }
         })
     }
 
@@ -291,6 +368,14 @@ impl<'a> Stat<'a> {
                 }
             }
             Stat::ApproxPercentile { col, buffers, .. } => buffers[group].push(col[doc] as f64),
+            Stat::TopKInt { col, counts, .. } => *counts[group].entry(col[doc]).or_default() += 1,
+            Stat::TopKBytes {
+                doc_term, counts, ..
+            } => {
+                if let Some(t) = doc_term[doc] {
+                    *counts[group].entry(t).or_default() += 1;
+                }
+            }
         }
     }
 
@@ -326,6 +411,39 @@ impl<'a> Stat<'a> {
                 digest: TDigest::from_values(std::mem::take(&mut buffers[group]), *max_size),
                 percentile: *percentile,
             },
+            Stat::TopKInt {
+                k,
+                capacity,
+                counts,
+                ..
+            } => {
+                let map: HashMap<Box<[u8]>, i64> = std::mem::take(&mut counts[group])
+                    .into_iter()
+                    .map(|(v, c)| (Box::from(encode_int_key(v)), c))
+                    .collect();
+                StatValue::TopK {
+                    items: top_k_sorted(map, *capacity),
+                    k: *k,
+                    capacity: *capacity,
+                }
+            }
+            Stat::TopKBytes {
+                terms,
+                k,
+                capacity,
+                counts,
+                ..
+            } => {
+                let map: HashMap<Box<[u8]>, i64> = std::mem::take(&mut counts[group])
+                    .into_iter()
+                    .map(|(idx, c)| (terms[idx as usize].clone(), c))
+                    .collect();
+                StatValue::TopK {
+                    items: top_k_sorted(map, *capacity),
+                    k: *k,
+                    capacity: *capacity,
+                }
+            }
         }
     }
 }

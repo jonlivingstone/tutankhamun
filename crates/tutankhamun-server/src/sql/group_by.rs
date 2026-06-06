@@ -32,7 +32,8 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::session_state::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{
-    Aggregate, Expr, Extension, LogicalPlan, UserDefinedLogicalNode, UserDefinedLogicalNodeCore,
+    Aggregate, AggregateUDF, Expr, Extension, LogicalPlan, UserDefinedLogicalNode,
+    UserDefinedLogicalNodeCore,
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
@@ -59,7 +60,15 @@ pub fn session_context() -> SessionContext {
         .with_optimizer_rule(Arc::new(FtgsAggregatePushdown))
         .with_query_planner(Arc::new(FtgsQueryPlanner))
         .build();
-    SessionContext::new_with_state(state)
+    let ctx = SessionContext::new_with_state(state);
+    // `approx_top_k` has no `DataFusion` built-in; register it so SQL can
+    // parse it (and so it has a row-scan fallback when not pushed). Done on
+    // the live context — the builder's `with_aggregate_functions` would
+    // *replace* the default aggregates, not add to them.
+    ctx.register_udaf(AggregateUDF::from(
+        super::approx_top_k::ApproxTopK::default(),
+    ));
+    ctx
 }
 
 /// An aggregate the rule pushes down — the owned counterpart to
@@ -75,6 +84,8 @@ pub(crate) enum OwnedStat {
     /// `approx_percentile`: column, the quantile as raw `f64` bits (so the
     /// node stays `Eq`/`Ord`/`Hash` for plan dedup), and the digest size.
     ApproxPercentile(String, u64, usize),
+    /// `approx_top_k`: column, `k`, and the per-shard merge `capacity`.
+    TopK(String, usize, usize),
 }
 
 impl OwnedStat {
@@ -89,6 +100,7 @@ impl OwnedStat {
             OwnedStat::ApproxPercentile(c, bits, max_size) => {
                 StatSpec::ApproxPercentile(c, f64::from_bits(*bits), *max_size)
             }
+            OwnedStat::TopK(c, k, capacity) => StatSpec::TopK(c, *k, *capacity),
         }
     }
 }
@@ -353,9 +365,7 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
             // Optional third arg: t-digest size (centroids).
             let max_size = match rest {
                 [] => TDigest::DEFAULT_MAX_SIZE,
-                [Expr::Literal(ScalarValue::Int64(Some(n)), _)] if *n > 0 => {
-                    usize::try_from(*n).ok()?
-                }
+                [e] => lit_usize(e)?,
                 _ => return None,
             };
             Some(OwnedStat::ApproxPercentile(
@@ -364,6 +374,41 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
                 max_size,
             ))
         }
+        // approx_top_k(col, k [, capacity]) — the k most frequent values of
+        // a column. Counts per-doc, so any kind (String/Int/Metric) works.
+        "approx_top_k" => {
+            let [col_expr, k_expr, rest @ ..] = args.as_slice() else {
+                return None;
+            };
+            let Expr::Column(c) = col_expr else {
+                return None;
+            };
+            if !matches!(
+                prov.field_kind(&c.name)?,
+                FieldKind::String | FieldKind::Int | FieldKind::Metric
+            ) {
+                return None;
+            }
+            let k = lit_usize(k_expr)?;
+            // `capacity` is at least `k` — you can't keep fewer candidates
+            // than the result needs.
+            let capacity = match rest {
+                [] => super::approx_top_k::default_capacity(k),
+                [e] => lit_usize(e)?,
+                _ => return None,
+            }
+            .max(k);
+            Some(OwnedStat::TopK(c.name.clone(), k, capacity))
+        }
+        _ => None,
+    }
+}
+
+/// A positive `Int64` literal as a `usize` (`DataFusion` renders an
+/// unsuffixed integer literal as `Int64`).
+fn lit_usize(expr: &Expr) -> Option<usize> {
+    match expr {
+        Expr::Literal(ScalarValue::Int64(Some(n)), _) if *n > 0 => usize::try_from(*n).ok(),
         _ => None,
     }
 }

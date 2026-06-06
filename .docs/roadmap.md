@@ -234,8 +234,14 @@ directly.
       `Int`/`Metric` columns; each group buffers values and builds the
       digest at the merge edge; returns the column's `Int64` type like
       DataFusion. `Float`-column percentiles await float metric storage)
-- [ ] `approx_top_k(field, k, [capacity])` (Count-Min + heavy
-      hitters) — §3.1
+- [~] `approx_top_k(field, k, [capacity])` — §3.1 (the `k` most
+      frequent values per group, returned as
+      `List<Struct<value, count>>`. No `DataFusion` built-in, so a custom
+      `approx_top_k` UDAF is registered — it makes the function available
+      in SQL and is the row-scan fallback; the FTGS pushdown reuses the
+      inverted index / forward column to count exactly per shard, keeps
+      the top-`capacity`, and merges across shards via the `StatValue`
+      seam — no Count-Min sketch needed. `String`/`Int`/`Metric` columns)
 - [ ] `theta(field, [nominal_entries])` returning Arrow `Binary`
       — §3.1
 - [ ] `theta_intersect(a, b)` — §3.1

@@ -736,6 +736,7 @@ async fn approx_distinct_pushes_down() {
     let sql = "SELECT vendor_id, approx_distinct(fare) FROM trips \
                GROUP BY vendor_id ORDER BY vendor_id";
     assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
 
     // Each vendor's fares are distinct (small → HLL exact): vendor 1
     // {100,300}=2, vendor 2 {200,400}=2, vendor 3 {500,600}=2.
@@ -1184,4 +1185,137 @@ async fn approx_percentile_empty_input_is_null() {
         .unwrap();
     assert_eq!(b.num_rows(), 1);
     assert!(m.is_null(0), "percentile over empty input is NULL");
+}
+
+// ---- approx_top_k ----
+
+/// The `List<Struct<value: Utf8, count>>` cell at `(col, row)` as
+/// (value, count) pairs.
+fn topk_str(b: &arrow::array::RecordBatch, col: usize, row: usize) -> Vec<(String, i64)> {
+    let list = b
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .expect("List column");
+    let item = list.value(row);
+    let s = item
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    let values = s
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let counts = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    (0..s.len())
+        .map(|i| (values.value(i).to_string(), counts.value(i)))
+        .collect()
+}
+
+/// Same, for a `List<Struct<value: Int64, count>>` cell.
+fn topk_int(b: &arrow::array::RecordBatch, col: usize, row: usize) -> Vec<(i64, i64)> {
+    let list = b
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .expect("List column");
+    let item = list.value(row);
+    let s = item
+        .as_any()
+        .downcast_ref::<arrow::array::StructArray>()
+        .unwrap();
+    let values = s
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let counts = s
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    (0..s.len())
+        .map(|i| (values.value(i), counts.value(i)))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_top_k_string_global() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // country: us 3 (A0,A2,B0), de 3 (A1,A3,B1). Tie → value asc.
+    let sql = "SELECT approx_top_k(country, 2) AS top FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(
+        topk_str(b, 0, 0),
+        vec![("de".to_string(), 3), ("us".to_string(), 3)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_top_k_int_global() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // vendor_id: 1→2, 2→2, 3→2. All tie → value asc, top 2 = (1,2),(2,2).
+    let sql = "SELECT approx_top_k(vendor_id, 2) AS top FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(topk_int(b, 0, 0), vec![(1, 2), (2, 2)]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_top_k_grouped() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // vendor 1: us,us → [(us,2)]; vendor 2: de,de → [(de,2)];
+    // vendor 3: us,de → tie → [(de,1),(us,1)].
+    let sql = "SELECT vendor_id, approx_top_k(country, 2) AS top FROM trips \
+               GROUP BY vendor_id ORDER BY vendor_id";
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(topk_str(b, 1, 0), vec![("us".to_string(), 2)]);
+    assert_eq!(topk_str(b, 1, 1), vec![("de".to_string(), 2)]);
+    assert_eq!(
+        topk_str(b, 1, 2),
+        vec![("de".to_string(), 1), ("us".to_string(), 1)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_top_k_capacity_below_k_is_clamped() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // capacity 1 < k 2: clamped to k, so both values still come back.
+    let sql = "SELECT approx_top_k(country, 2, 1) AS top FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(
+        topk_str(b, 0, 0),
+        vec![("de".to_string(), 3), ("us".to_string(), 3)]
+    );
 }

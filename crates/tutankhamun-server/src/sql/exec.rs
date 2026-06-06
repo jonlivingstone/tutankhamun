@@ -15,10 +15,11 @@ use std::sync::Arc;
 use anyhow::Context as _;
 
 use arrow::array::{
-    ArrayRef, Float64Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
-    TimestampNanosecondArray, UInt64Array,
+    ArrayRef, Float64Array, Int64Array, ListArray, RecordBatch, RecordBatchOptions, StringArray,
+    StructArray, TimestampNanosecondArray, UInt64Array,
 };
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::buffer::OffsetBuffer;
+use arrow::datatypes::{DataType, FieldRef, SchemaRef, TimeUnit};
 use datafusion::common::Result as DfResult;
 use datafusion::common::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -763,13 +764,17 @@ fn reshape_aggregate(
     // Stat columns follow the group columns.
     for s in 0..num_stats {
         let dtype = schema.field(num_group_cols + s).data_type();
-        let array = if matches!(dtype, DataType::Float64) {
-            float_array(out.iter().map(|o| Some(o.stats[s].avg_f64())).collect())
-        } else {
-            stat_array(
+        let array = match dtype {
+            DataType::Float64 => {
+                float_array(out.iter().map(|o| Some(o.stats[s].avg_f64())).collect())
+            }
+            DataType::List(item) => {
+                topk_list_array(item, out.iter().map(|o| topk_slice(&o.stats[s])))?
+            }
+            _ => stat_array(
                 dtype,
                 out.iter().map(|o| Some(o.stats[s].finalize())).collect(),
-            )?
+            )?,
         };
         arrays.push(array);
     }
@@ -801,6 +806,70 @@ fn group_column(dtype: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {
                 .collect::<Vec<Option<i64>>>(),
         )),
     }
+}
+
+/// The top-`k` `(value-key bytes, count)` slice of a `TopK` stat value
+/// (its `items` are already top-`capacity`, count-descending).
+fn topk_slice(stat: &StatValue) -> &[(Box<[u8]>, i64)] {
+    match stat {
+        StatValue::TopK { items, k, .. } => &items[..(*k).min(items.len())],
+        _ => unreachable!("a List column is an approx_top_k stat"),
+    }
+}
+
+/// Build the `List<Struct<value, count>>` column (`approx_top_k`'s output)
+/// from each row's top-k `(value-key bytes, count)` slice. The struct/list
+/// `Field`s are taken from the schema's declared `item_field` so the
+/// `RecordBatch` matches the aggregate's output type exactly; `value`
+/// decodes like a group column (`Utf8` → term, `Int64` → key).
+fn topk_list_array<'a>(
+    item_field: &FieldRef,
+    rows: impl Iterator<Item = &'a [(Box<[u8]>, i64)]>,
+) -> anyhow::Result<ArrayRef> {
+    let DataType::Struct(fields) = item_field.data_type() else {
+        anyhow::bail!("approx_top_k list item is not a Struct");
+    };
+    let (value_field, count_field) = (&fields[0], &fields[1]);
+
+    let mut lengths: Vec<usize> = Vec::new();
+    let mut bytes: Vec<&[u8]> = Vec::new();
+    let mut counts: Vec<i64> = Vec::new();
+    for items in rows {
+        lengths.push(items.len());
+        for (b, c) in items {
+            bytes.push(b);
+            counts.push(*c);
+        }
+    }
+
+    let value_array: ArrayRef = match value_field.data_type() {
+        DataType::Utf8 => Arc::new(StringArray::from(
+            bytes
+                .iter()
+                .map(|b| render_term(FieldKind::String, b))
+                .collect::<Vec<String>>(),
+        )),
+        DataType::Int64 => Arc::new(Int64Array::from(
+            bytes
+                .iter()
+                .map(|b| decode_int_key(b))
+                .collect::<Vec<i64>>(),
+        )),
+        other => anyhow::bail!("approx_top_k value type {other:?} unsupported"),
+    };
+    let struct_array = StructArray::from(vec![
+        (value_field.clone(), value_array),
+        (
+            count_field.clone(),
+            Arc::new(Int64Array::from(counts)) as ArrayRef,
+        ),
+    ]);
+    Ok(Arc::new(ListArray::new(
+        item_field.clone(),
+        OffsetBuffer::from_lengths(lengths),
+        Arc::new(struct_array),
+        None,
+    )))
 }
 
 /// Build a stat column in the type the aggregate's output schema
@@ -835,22 +904,31 @@ fn reshape_global(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(owned.len());
     for (s, spec) in owned.iter().enumerate() {
         let dtype = schema.field(s).data_type();
-        let array = if matches!(dtype, DataType::Float64) {
+        let array = match dtype {
             // `AVG`: present → sum/count; empty input → NULL.
-            float_array(vec![stats.map(|st| st[s].avg_f64())])
-        } else {
-            let value = match stats {
-                Some(st) => Some(st[s].finalize()),
-                None => match spec {
-                    OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
-                    OwnedStat::Sum(_)
-                    | OwnedStat::Min(_)
-                    | OwnedStat::Max(_)
-                    | OwnedStat::ApproxPercentile(..) => None,
-                    OwnedStat::Avg(_) => unreachable!("avg output is Float64"),
-                },
-            };
-            stat_array(dtype, vec![value])?
+            DataType::Float64 => float_array(vec![stats.map(|st| st[s].avg_f64())]),
+            // `approx_top_k`: one row holding the top-k list (or an empty
+            // list when there was no input).
+            DataType::List(item) => {
+                let empty: &[(Box<[u8]>, i64)] = &[];
+                let row = stats.map_or(empty, |st| topk_slice(&st[s]));
+                topk_list_array(item, std::iter::once(row))?
+            }
+            _ => {
+                let value = match stats {
+                    Some(st) => Some(st[s].finalize()),
+                    None => match spec {
+                        OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
+                        OwnedStat::Sum(_)
+                        | OwnedStat::Min(_)
+                        | OwnedStat::Max(_)
+                        | OwnedStat::ApproxPercentile(..) => None,
+                        OwnedStat::Avg(_) => unreachable!("avg output is Float64"),
+                        OwnedStat::TopK(..) => unreachable!("top-k output is a List"),
+                    },
+                };
+                stat_array(dtype, vec![value])?
+            }
         };
         arrays.push(array);
     }
