@@ -119,12 +119,19 @@ directly.
 - [x] Ordering-invariant enforcement (terms sorted, groups
       ascending, fields in declaration order) — §2.6
 - [ ] Per-shard FTGS execution (single-threaded per shard, run
-      via Rayon) — §2.6, §2.3
-- [ ] Shard-fan-out merge (within a daemon) — §2.6
-- [ ] `GSVector`-equivalent two-level bitmap for merge — §2.6
+      via Rayon) — §2.6, §2.3 (`ftgs_scan_merge` fans out
+      sequentially; Rayon dispatch still to wire)
+- [x] Shard-fan-out merge (within a daemon) — §2.6
+      (`merge_ftgs`: k-way merge of per-shard rows, combining stats
+      on `(field, term, group)` via `StatSpec::combine`)
+- [x] `GSVector`-equivalent two-level bitmap for merge — §2.6
+      (row-per-`(field,term,group)` granularity + `BitTree` make a
+      separate merge-time group bitmap unnecessary)
 - [ ] Arrow record-batch output (1024 / 4096 row default
       batching) — §2.6
 - [ ] Same merge code reused at client layer (cross-daemon) — §2.6
+      (`merge_ftgs` is already the shared primitive; cross-daemon
+      wiring still to build)
 
 ## Engine — sessions
 

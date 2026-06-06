@@ -4,9 +4,9 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 use tempfile::TempDir;
 
-use super::{FtgsRow, StatSpec, ftgs_scan};
+use super::{FtgsRow, StatSpec, ftgs_scan, ftgs_scan_merge, merge_ftgs, render_term};
 use crate::group_lookup::GroupLookup;
-use crate::shard::{DiskShard, DiskShardWriter};
+use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
 
 /// Postings map from a doc→term assignment given in doc-id order.
 fn postings(terms: &[&str]) -> BTreeMap<String, RoaringBitmap> {
@@ -36,6 +36,25 @@ fn write_dataset(dir: &Path) -> DiskShard {
     DiskShard::open(dir).expect("open")
 }
 
+/// One shard with a `country` string field + `revenue` metric.
+fn write_country_shard(dir: &Path, countries: &[&str], revenue: Vec<i64>) -> DiskShard {
+    let mut w = DiskShardWriter::new(dir, (0, 0)).expect("new");
+    w.add_string_field("country", postings(countries))
+        .expect("country");
+    w.add_metric("revenue", revenue).expect("revenue");
+    w.finalize().expect("finalize");
+    DiskShard::open(dir).expect("open")
+}
+
+/// One shard with an `hour` int field + `revenue` metric.
+fn write_hour_shard(dir: &Path, hours: Vec<i64>, revenue: Vec<i64>) -> DiskShard {
+    let mut w = DiskShardWriter::new(dir, (0, 0)).expect("new");
+    w.add_int_field("hour", hours).expect("hour");
+    w.add_metric("revenue", revenue).expect("revenue");
+    w.finalize().expect("finalize");
+    DiskShard::open(dir).expect("open")
+}
+
 /// Groups: doc0=1 doc1=1 doc2=2 doc3=2 doc4=1.
 fn groups_5() -> GroupLookup {
     let mut g = GroupLookup::all_in_one_group(5);
@@ -53,13 +72,31 @@ fn setup() -> (TempDir, DiskShard) {
     (tmp, shard)
 }
 
-fn row(field: &str, term: &str, group: u32, stats: &[i64]) -> FtgsRow {
-    FtgsRow {
-        field: field.to_string(),
-        term: term.to_string(),
-        group,
-        stats: stats.to_vec(),
+/// Field kinds in the test datasets, for rendering raw term keys.
+fn kind_of(field: &str) -> FieldKind {
+    match field {
+        "hour" => FieldKind::Int,
+        _ => FieldKind::String,
     }
+}
+
+/// Render FTGS output to comparable `(field, term, group, stats)` tuples
+/// — `FtgsRow::term` is the raw FST key.
+fn rendered(rows: &[FtgsRow]) -> Vec<(String, String, u32, Vec<i64>)> {
+    rows.iter()
+        .map(|r| {
+            (
+                r.field.clone(),
+                render_term(kind_of(&r.field), &r.term),
+                r.group,
+                r.stats.clone(),
+            )
+        })
+        .collect()
+}
+
+fn row(field: &str, term: &str, group: u32, stats: &[i64]) -> (String, String, u32, Vec<i64>) {
+    (field.to_string(), term.to_string(), group, stats.to_vec())
 }
 
 #[test]
@@ -77,7 +114,7 @@ fn sum_by_string_field_is_field_term_group_ordered() {
     // UK docs {2,4}: g2 doc2=30, g1 doc4=50.
     // US docs {0,1,3}: g1 docs0,1=10+20, g2 doc3=40.
     assert_eq!(
-        rows,
+        rendered(&rows),
         vec![
             row("country", "UK", 1, &[50]),
             row("country", "UK", 2, &[30]),
@@ -93,9 +130,9 @@ fn int_group_by_renders_decimal_terms() {
     let rows = ftgs_scan(&shard, &groups_5(), &["hour"], &[StatSpec::Sum("revenue")]).unwrap();
 
     // hour 9 docs {0,1} both g1 -> 30; hour 10 docs {2,4}: g2=30, g1=50;
-    // hour 11 doc {3} g2 -> 40. Terms render as decimal, numerically sorted.
+    // hour 11 doc {3} g2 -> 40. Terms numerically sorted (FST byte order).
     assert_eq!(
-        rows,
+        rendered(&rows),
         vec![
             row("hour", "9", 1, &[30]),
             row("hour", "10", 1, &[50]),
@@ -115,7 +152,7 @@ fn group_zero_is_excluded() {
 
     // (US, g1) now holds only doc0 -> 10; doc1 contributes nowhere.
     assert_eq!(
-        rows,
+        rendered(&rows),
         vec![
             row("country", "UK", 1, &[50]),
             row("country", "UK", 2, &[30]),
@@ -138,7 +175,7 @@ fn count_min_max_operators() {
 
     let find = |term: &str, group: u32| {
         rows.iter()
-            .find(|r| r.term == term && r.group == group)
+            .find(|r| render_term(kind_of(&r.field), &r.term) == term && r.group == group)
             .unwrap()
             .stats
             .clone()
@@ -193,4 +230,91 @@ fn rejects_unknown_stat_column() {
     let (_tmp, shard) = setup();
     let err = ftgs_scan(&shard, &groups_5(), &["country"], &[StatSpec::Sum("nope")]).unwrap_err();
     assert!(err.to_string().contains("no forward column"));
+}
+
+// ---- cross-shard merge ----
+
+#[test]
+fn int_terms_merge_in_numeric_order_across_shards() {
+    let (t1, t2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let s1 = write_hour_shard(t1.path(), vec![9, 10, 11], vec![1, 1, 1]);
+    let s2 = write_hour_shard(t2.path(), vec![9, 10, 11], vec![1, 1, 1]);
+    let (g1, g2) = (
+        GroupLookup::all_in_one_group(3),
+        GroupLookup::all_in_one_group(3),
+    );
+    let shards: [(&dyn Shard, &GroupLookup); 2] = [(&s1, &g1), (&s2, &g2)];
+    let merged = ftgs_scan_merge(&shards, &["hour"], &[StatSpec::Sum("revenue")]).unwrap();
+
+    // The decision's proof: terms in numeric order, NOT decimal-string
+    // lexical order ("10","11","9"). Each hour's revenue sums across both.
+    assert_eq!(
+        rendered(&merged),
+        vec![
+            row("hour", "9", 1, &[2]),
+            row("hour", "10", 1, &[2]),
+            row("hour", "11", 1, &[2]),
+        ]
+    );
+}
+
+#[test]
+fn overlapping_keys_combine_all_operators() {
+    let (t1, t2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    // Both shards: all docs country=US, group 1.
+    let s1 = write_country_shard(t1.path(), &["US", "US"], vec![10, 20]);
+    let s2 = write_country_shard(t2.path(), &["US", "US"], vec![5, 40]);
+    let (g1, g2) = (
+        GroupLookup::all_in_one_group(2),
+        GroupLookup::all_in_one_group(2),
+    );
+    let stats = [
+        StatSpec::Count,
+        StatSpec::Sum("revenue"),
+        StatSpec::Min("revenue"),
+        StatSpec::Max("revenue"),
+    ];
+    let shards: [(&dyn Shard, &GroupLookup); 2] = [(&s1, &g1), (&s2, &g2)];
+    let merged = ftgs_scan_merge(&shards, &["country"], &stats).unwrap();
+
+    // (US, g1): count 2+2=4, sum 30+45=75, min min(10,5)=5, max max(20,40)=40.
+    assert_eq!(
+        rendered(&merged),
+        vec![row("country", "US", 1, &[4, 75, 5, 40])]
+    );
+}
+
+#[test]
+fn disjoint_terms_interleave_sorted() {
+    let (t1, t2) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+    let s1 = write_country_shard(t1.path(), &["US"], vec![10]);
+    let s2 = write_country_shard(t2.path(), &["UK"], vec![20]);
+    let (g1, g2) = (
+        GroupLookup::all_in_one_group(1),
+        GroupLookup::all_in_one_group(1),
+    );
+    let shards: [(&dyn Shard, &GroupLookup); 2] = [(&s1, &g1), (&s2, &g2)];
+    let merged = ftgs_scan_merge(&shards, &["country"], &[StatSpec::Sum("revenue")]).unwrap();
+
+    // UK before US (sorted), no key shared so nothing combines.
+    assert_eq!(
+        rendered(&merged),
+        vec![
+            row("country", "UK", 1, &[20]),
+            row("country", "US", 1, &[10]),
+        ]
+    );
+}
+
+#[test]
+fn single_shard_merge_equals_scan() {
+    let (_tmp, shard) = setup();
+    let groups = groups_5();
+    let scanned = ftgs_scan(&shard, &groups, &["country"], &[StatSpec::Sum("revenue")]).unwrap();
+    let merged = merge_ftgs(
+        vec![scanned.clone()],
+        &["country"],
+        &[StatSpec::Sum("revenue")],
+    );
+    assert_eq!(merged, scanned);
 }
