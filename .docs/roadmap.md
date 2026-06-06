@@ -165,17 +165,18 @@ directly.
       + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
 - [x] Time-range shard pruning in the SQL scan (prune shards by a
       predicate on the time column before fetch) — §3.2
-- [~] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
+- [x] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
       FTGS scan (Tier 2/3) — §3.2
-      (single-column `Int`/`String` GROUP BY *and* global no-GROUP-BY
-      aggregates + COUNT(*)/SUM/MIN/MAX/approx_count_distinct pushed via an
-      optimizer rule → `FtgsAggExec`, including the `String` NULL group; the
-      global path reuses `aggregate_docs` over the filtered set → one row with
-      SQL empty-input semantics (count/approx → 0, sum/min/max → NULL);
-      `approx_distinct` works on `String` args too, hashing the inverted-index
-      terms (no forward column) so the sketch still merges across shards;
-      unsupported shapes fall back to DataFusion. Remaining: multi-column
-      GROUP BY via regroups; AVG)
+      (single- *and* multi-column `Int`/`String` GROUP BY *and* global
+      no-GROUP-BY aggregates + COUNT(*)/SUM/MIN/MAX/AVG/approx_count_distinct
+      pushed via an optimizer rule → `FtgsAggExec`, including the `String` NULL
+      group; multi-column regroups the prefix columns into a combo group id
+      (shared across shards) and scans the last column; the global path reuses
+      `aggregate_docs` over the filtered set → one row with SQL empty-input
+      semantics (count/approx → 0, sum/min/max/avg → NULL); `approx_distinct`
+      works on `String` args too, hashing the inverted-index terms (no forward
+      column) so the sketch still merges across shards; unsupported shapes fall
+      back to DataFusion)
 - [ ] FlightSQL service implementation — §3.2
 - [ ] Session-aware SQL execution — DataFusion planner reuses
       session state when new query's filter refines previous — §3.2

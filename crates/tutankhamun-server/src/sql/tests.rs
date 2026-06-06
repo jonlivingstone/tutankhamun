@@ -943,3 +943,182 @@ async fn avg_empty_input_is_null() {
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     assert_eq!(f64_col(&batches[0], 0), vec![None]);
 }
+
+// ---- multi-column GROUP BY ----
+
+/// `Int64`/`UInt64` column `col` as `i64` (ignores nulls; group/stat
+/// columns in these tests are non-null).
+fn col_i64(b: &arrow::array::RecordBatch, col: usize) -> Vec<i64> {
+    let c = b.column(col);
+    if let Some(a) = c.as_any().downcast_ref::<arrow::array::Int64Array>() {
+        a.values().to_vec()
+    } else if let Some(a) = c.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+        a.values()
+            .iter()
+            .map(|&v| i64::try_from(v).unwrap())
+            .collect()
+    } else {
+        panic!("expected an Int64/UInt64 column at {col}");
+    }
+}
+
+/// `Utf8` column `col`, `None` for NULL.
+fn col_str(b: &arrow::array::RecordBatch, col: usize) -> Vec<Option<String>> {
+    let a = b
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .expect("expected a Utf8 column");
+    (0..a.len())
+        .map(|i| (!a.is_null(i)).then(|| a.value(i).to_string()))
+        .collect()
+}
+
+/// Single shard with a *sparse* `String` field: `tag` covers only doc 0,
+/// so docs 1 and 2 have no term (the SQL NULL group). `vendor_id`
+/// [1, 1, 2], `fare` [10, 20, 30].
+fn write_sparse_tag_shard(root: &Path) {
+    let mut w = DiskShardWriter::new(&root.join("s"), (0, 0)).expect("new");
+    w.add_int_field("vendor_id", vec![1, 1, 2]).expect("int");
+    w.add_metric("fare", vec![10, 20, 30]).expect("metric");
+    let mut tag = BTreeMap::new();
+    tag.insert("x".to_string(), bitmap([0]));
+    w.add_string_field("tag", tag).expect("string");
+    w.finalize().expect("finalize");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_column_group_by_pushes_down() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // Int prefix (vendor_id) × String cursor (country). Cells:
+    // (1,us)=100+300, (2,de)=200+400, (3,us)=500, (3,de)=600.
+    let sql = "SELECT vendor_id, country, sum(fare) FROM trips \
+               GROUP BY vendor_id, country ORDER BY vendor_id, country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    let (v, c, s) = (col_i64(b, 0), col_str(b, 1), col_i64(b, 2));
+    let rows: Vec<(i64, &str, i64)> = (0..b.num_rows())
+        .map(|i| (v[i], c[i].as_deref().unwrap(), s[i]))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "us", 400),
+            (2, "de", 600),
+            (3, "de", 600),
+            (3, "us", 500)
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_column_group_by_order_independent() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // String prefix (country) × Int cursor (vendor_id) — same cells, cols
+    // swapped.
+    let sql = "SELECT country, vendor_id, sum(fare) FROM trips \
+               GROUP BY country, vendor_id ORDER BY country, vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    let (c, v, s) = (col_str(b, 0), col_i64(b, 1), col_i64(b, 2));
+    let rows: Vec<(&str, i64, i64)> = (0..b.num_rows())
+        .map(|i| (c[i].as_deref().unwrap(), v[i], s[i]))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("de", 2, 600),
+            ("de", 3, 600),
+            ("us", 1, 400),
+            ("us", 3, 500)
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_column_group_by_with_avg() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // (1,us)=400/2, (2,de)=600/2, (3,de)=600/1, (3,us)=500/1.
+    let sql = "SELECT vendor_id, country, avg(fare) FROM trips \
+               GROUP BY vendor_id, country ORDER BY vendor_id, country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(
+        f64_col(b, 2),
+        vec![Some(200.0), Some(300.0), Some(600.0), Some(500.0)]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_column_null_cursor_group() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_sparse_tag_shard(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // Int prefix, String cursor with NULLs: docs 1,2 have no tag.
+    // (1,x)=10, (1,NULL)=20, (2,NULL)=30.
+    let sql = "SELECT vendor_id, tag, sum(fare) FROM trips GROUP BY vendor_id, tag";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    let (v, t, s) = (col_i64(b, 0), col_str(b, 1), col_i64(b, 2));
+    let mut rows: Vec<(i64, Option<String>, i64)> = (0..b.num_rows())
+        .map(|i| (v[i], t[i].clone(), s[i]))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(1, None, 20), (1, Some("x".to_string()), 10), (2, None, 30),]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_column_null_prefix_group() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_sparse_tag_shard(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // String prefix with NULLs (tag) × Int cursor (vendor_id): the
+    // missing-tag docs form their own NULL prefix group.
+    // (x,1)=10, (NULL,1)=20, (NULL,2)=30.
+    let sql = "SELECT tag, vendor_id, sum(fare) FROM trips GROUP BY tag, vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    let (t, v, s) = (col_str(b, 0), col_i64(b, 1), col_i64(b, 2));
+    let mut rows: Vec<(Option<String>, i64, i64)> = (0..b.num_rows())
+        .map(|i| (t[i].clone(), v[i], s[i]))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![(None, 1, 20), (None, 2, 30), (Some("x".to_string()), 1, 10),]
+    );
+}

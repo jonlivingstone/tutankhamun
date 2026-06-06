@@ -7,6 +7,7 @@
 //! one record batch per shard from the projected forward columns.
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -34,11 +35,13 @@ use super::group_by::OwnedStat;
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::cache::Cache;
 use crate::ftgs::{
-    FtgsRow, StatSpec, StatValue, aggregate_docs, combine_stats, ftgs_scan_merge, render_term,
+    FtgsRow, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats,
+    ftgs_scan_merge, render_term, term_map,
 };
 use crate::group_lookup::GroupLookup;
 use crate::shard::{
-    DiskShard, FieldKind, FilterClause, FilterResult, Shard, decode_int_key, matched_doc_set,
+    DiskShard, FieldKind, FilterClause, FilterResult, Shard, decode_int_key, encode_int_key,
+    matched_doc_set,
 };
 use crate::shard_source::{ObjectStoreShardSource, ShardSource};
 use crate::storage::StorageRegistry;
@@ -384,11 +387,11 @@ fn string_column(
 pub(crate) struct FtgsAggExec {
     url: String,
     cache: Arc<Cache>,
-    group_col: Option<String>,
+    group_cols: Vec<String>,
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
     /// Output schema, matching the `Aggregate` this replaces: the group
-    /// column (if any) followed by one column per stat.
+    /// columns (in `GROUP BY` order) followed by one column per stat.
     schema: SchemaRef,
     plan_properties: PlanProperties,
 }
@@ -397,7 +400,7 @@ impl FtgsAggExec {
     pub(crate) fn new(
         url: String,
         cache: Arc<Cache>,
-        group_col: Option<String>,
+        group_cols: Vec<String>,
         stats: Vec<OwnedStat>,
         filters: Vec<PushedFilter>,
         schema: SchemaRef,
@@ -411,7 +414,7 @@ impl FtgsAggExec {
         Self {
             url,
             cache,
-            group_col,
+            group_cols,
             stats,
             filters,
             schema,
@@ -422,10 +425,14 @@ impl FtgsAggExec {
 
 impl DisplayAs for FtgsAggExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let group_by = if self.group_cols.is_empty() {
+            "(global)".to_string()
+        } else {
+            self.group_cols.join(",")
+        };
         write!(
             f,
-            "FtgsAggExec: group_by={}, stats={}, pushed_filters={}",
-            self.group_col.as_deref().unwrap_or("(global)"),
+            "FtgsAggExec: group_by={group_by}, stats={}, pushed_filters={}",
             self.stats.len(),
             self.filters.len()
         )
@@ -465,7 +472,7 @@ impl ExecutionPlan for FtgsAggExec {
             aggregate_batch(
                 &self.url,
                 &self.cache,
-                self.group_col.as_deref(),
+                &self.group_cols,
                 &self.stats,
                 &self.filters,
                 &self.schema,
@@ -482,65 +489,98 @@ impl ExecutionPlan for FtgsAggExec {
 async fn aggregate_batch(
     url: &str,
     cache: &Cache,
-    group_col: Option<&str>,
+    group_cols: &[String],
     stats: &[OwnedStat],
     filters: &[PushedFilter],
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
     let shards = fetch_selected_shards(url, cache, filters).await?;
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
-    match group_col {
-        Some(col) => aggregate_grouped(&shards, col, &stat_specs, stats.len(), schema),
-        None => reshape_global(
+    if group_cols.is_empty() {
+        reshape_global(
             global_stats(&shards, &stat_specs)?.as_deref(),
             stats,
             schema,
-        ),
+        )
+    } else {
+        aggregate_grouped(&shards, group_cols, &stat_specs, stats.len(), schema)
     }
 }
 
-/// Single-column `GROUP BY`: one output row per `(term, group)`, plus a
-/// trailing NULL group for `String` columns (docs with no term).
+/// `GROUP BY g1..gk`: regroup the prefix `g1..g(k-1)` into each shard's
+/// group lookup as a combo id, scan the last column `gk` with FTGS, and
+/// reshape to one row per `(prefix tuple, cursor term)`. A `String` cursor
+/// can leave docs term-less — those form a per-group NULL-keyed row.
 fn aggregate_grouped(
     shards: &[(DiskShard, FilterResult)],
-    group_col: &str,
+    group_cols: &[String],
     stat_specs: &[StatSpec],
     num_stats: usize,
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
-    // A `String` group column can be sparse: filtered docs with no term
-    // for it form the SQL NULL group. `Int` columns are dense, so they
-    // never have one — skip the extra pass entirely.
-    let group_is_string = matches!(schema.field(0).data_type(), DataType::Utf8);
+    let (cursor, prefix) = group_cols
+        .split_last()
+        .expect("grouped path has at least one column");
+    // The cursor column is output column `prefix.len()`. A `String` cursor
+    // can be sparse (the SQL NULL group); `Int`/`Metric` are dense.
+    let cursor_is_string = matches!(schema.field(prefix.len()).data_type(), DataType::Utf8);
 
-    // Per shard, a group lookup placing WHERE-matching docs in group 1
-    // and the rest in group 0 (which FTGS skips). An empty selection
-    // contributes no shard. For a `String` column we also aggregate the
-    // no-term docs into a NULL group, combined across shards.
+    // Combo ids are assigned from one map shared across all shards, so a
+    // given prefix tuple maps to the same group id everywhere — the
+    // invariant `ftgs_scan_merge` needs to fold rows across shards.
+    let mut combo = ComboMap::default();
     let mut pairs: Vec<(&DiskShard, GroupLookup)> = Vec::with_capacity(shards.len());
-    let mut null_stats: Option<Vec<StatValue>> = None;
+    // NULL-cursor docs, aggregated per combo group, merged across shards.
+    let mut null_stats: BTreeMap<u32, Vec<StatValue>> = BTreeMap::new();
     for (shard, selection) in shards {
         let num_docs = usize::try_from(shard.num_docs())?;
-        let filtered: Option<&RoaringBitmap> = match selection {
+        let matched: Option<&RoaringBitmap> = match selection {
             FilterResult::Empty => continue,
             FilterResult::All => None,
             FilterResult::Bitmap(bm) => Some(bm),
         };
 
-        let groups = match filtered {
-            None => GroupLookup::all_in_one_group(num_docs),
-            Some(bm) => {
-                let mut g = GroupLookup::constant(num_docs, 0);
-                for doc in bm {
-                    g.set(doc as usize, 1);
+        let groups = if prefix.is_empty() {
+            // Single column: the lookup carries only WHERE membership
+            // (matched → group 1), so the unfiltered case stays O(1).
+            match matched {
+                None => GroupLookup::all_in_one_group(num_docs),
+                Some(bm) => {
+                    let mut g = GroupLookup::constant(num_docs, 0);
+                    for doc in bm {
+                        g.set(doc as usize, 1);
+                    }
+                    g
                 }
-                g
             }
+        } else {
+            // Regroup each matched doc by its prefix tuple's combo id.
+            let keys: Vec<DocKeys> = prefix
+                .iter()
+                .map(|c| DocKeys::build(shard, c))
+                .collect::<anyhow::Result<_>>()?;
+            let mut g = GroupLookup::constant(num_docs, 0);
+            match matched {
+                None => {
+                    for doc in 0..num_docs {
+                        let key = keys.iter().map(|k| k.key(doc)).collect();
+                        g.set(doc, combo.id(key));
+                    }
+                }
+                Some(bm) => {
+                    for doc in bm {
+                        let doc = doc as usize;
+                        let key = keys.iter().map(|k| k.key(doc)).collect();
+                        g.set(doc, combo.id(key));
+                    }
+                }
+            }
+            g
         };
 
-        if group_is_string {
-            let covered = covered_docs(shard, group_col);
-            let null_docs = match filtered {
+        if cursor_is_string {
+            let covered = covered_docs(shard, cursor);
+            let null_docs = match matched {
                 None => {
                     let mut all = RoaringBitmap::new();
                     all.insert_range(0..u32::try_from(num_docs)?);
@@ -548,11 +588,12 @@ fn aggregate_grouped(
                 }
                 Some(bm) => bm.clone() - covered,
             };
-            if !null_docs.is_empty() {
-                let shard_null = aggregate_docs(shard, null_docs.iter(), stat_specs)?;
-                match null_stats.as_mut() {
-                    Some(acc) => combine_stats(acc, &shard_null, stat_specs),
-                    None => null_stats = Some(shard_null),
+            for (gid, st) in aggregate_docs_grouped(shard, null_docs.iter(), &groups, stat_specs)? {
+                match null_stats.get_mut(&gid) {
+                    Some(acc) => combine_stats(acc, &st, stat_specs),
+                    None => {
+                        null_stats.insert(gid, st);
+                    }
                 }
             }
         }
@@ -562,8 +603,70 @@ fn aggregate_grouped(
 
     let refs: Vec<(&dyn Shard, &GroupLookup)> =
         pairs.iter().map(|(s, g)| (*s as &dyn Shard, g)).collect();
-    let rows = ftgs_scan_merge(&refs, &[group_col], stat_specs)?;
-    reshape_aggregate(&rows, num_stats, schema, null_stats.as_deref())
+    let rows = ftgs_scan_merge(&refs, &[cursor.as_str()], stat_specs)?;
+    reshape_aggregate(
+        &rows,
+        prefix.len(),
+        num_stats,
+        schema,
+        &combo.inverse,
+        &null_stats,
+    )
+}
+
+/// Assigns a stable group id (from 1) to each distinct prefix-column
+/// tuple, shared across all shards so a tuple maps to the same id
+/// everywhere — what lets [`ftgs_scan_merge`] fold matching `(cursor
+/// term, group)` rows across shards. `inverse[id - 1]` recovers the tuple
+/// for output; a `None` component is a SQL NULL group value.
+#[derive(Default)]
+struct ComboMap {
+    map: BTreeMap<Vec<Option<Box<[u8]>>>, u32>,
+    inverse: Vec<Vec<Option<Box<[u8]>>>>,
+}
+
+impl ComboMap {
+    fn id(&mut self, key: Vec<Option<Box<[u8]>>>) -> u32 {
+        if let Some(&id) = self.map.get(&key) {
+            return id;
+        }
+        let id = u32::try_from(self.inverse.len() + 1).expect("combo group count fits u32");
+        self.inverse.push(key.clone());
+        self.map.insert(key, id);
+        id
+    }
+}
+
+/// Per-doc value source for a regroup column, yielding a doc's
+/// FTGS-canonical term-key bytes — the same encoding the cursor's
+/// `FtgsRow.term` carries, so reshape decodes prefix and cursor columns
+/// the same way.
+enum DocKeys<'a> {
+    /// `Int`/`Metric`: dense forward column; key = order-preserving 8-byte.
+    Int(&'a [i64]),
+    /// `String`: doc→term reverse map; `None` for a doc with no term.
+    Str {
+        doc_term: Vec<Option<u32>>,
+        terms: Vec<Box<[u8]>>,
+    },
+}
+
+impl<'a> DocKeys<'a> {
+    fn build(shard: &'a dyn Shard, name: &str) -> anyhow::Result<DocKeys<'a>> {
+        if let Some(col) = shard.forward_column(name) {
+            Ok(DocKeys::Int(col))
+        } else {
+            let (doc_term, terms) = term_map(shard, name)?;
+            Ok(DocKeys::Str { doc_term, terms })
+        }
+    }
+
+    fn key(&self, doc: usize) -> Option<Box<[u8]>> {
+        match self {
+            DocKeys::Int(col) => Some(Box::from(encode_int_key(col[doc]).as_slice())),
+            DocKeys::Str { doc_term, terms } => doc_term[doc].map(|i| terms[i as usize].clone()),
+        }
+    }
 }
 
 /// Global aggregate (no `GROUP BY`): aggregate each shard's whole
@@ -602,67 +705,102 @@ fn covered_docs(shard: &dyn Shard, col: &str) -> RoaringBitmap {
     covered
 }
 
-/// Turn merged FTGS rows into one record batch: column 0 is the group
-/// value (an `Int` decoded from the raw term key → `Int64`, or a
-/// `String` term → `Utf8`), columns 1.. are the i64 stats in `StatSpec`
-/// order. `null_stats` (only ever `Some` for a `String` group) appends a
-/// trailing NULL-keyed row.
+/// Turn merged FTGS rows into one record batch. The first `num_prefix`
+/// columns are the regrouped prefix values, decoded from each row's combo
+/// group via `inverse`; column `num_prefix` is the cursor term (`None` for
+/// a `String` cursor's NULL group); the rest are the stats. `null_stats`
+/// holds the NULL-cursor docs, one entry per combo group.
 fn reshape_aggregate(
     rows: &[FtgsRow],
+    num_prefix: usize,
     num_stats: usize,
     schema: &SchemaRef,
-    null_stats: Option<&[StatValue]>,
+    inverse: &[Vec<Option<Box<[u8]>>>],
+    null_stats: &BTreeMap<u32, Vec<StatValue>>,
 ) -> anyhow::Result<RecordBatch> {
-    let num_rows = rows.len() + usize::from(null_stats.is_some());
+    // One output row per scanned `(cursor term, group)`, plus one per
+    // NULL-cursor combo group. `group` decodes to the prefix tuple.
+    struct OutRow<'a> {
+        group: u32,
+        cursor: Option<&'a [u8]>,
+        stats: &'a [StatValue],
+    }
+    let out: Vec<OutRow> = rows
+        .iter()
+        .map(|r| OutRow {
+            group: r.group,
+            cursor: Some(&r.term),
+            stats: &r.stats,
+        })
+        .chain(null_stats.iter().map(|(&gid, st)| OutRow {
+            group: gid,
+            cursor: None,
+            stats: st,
+        }))
+        .collect();
 
-    let group: ArrayRef = match schema.field(0).data_type() {
-        DataType::Utf8 => {
-            let mut terms: Vec<Option<String>> = rows
-                .iter()
-                .map(|r| Some(render_term(FieldKind::String, &r.term)))
-                .collect();
-            if null_stats.is_some() {
-                terms.push(None);
-            }
-            Arc::new(StringArray::from(terms))
-        }
-        // `Int` group: dense, so never a NULL row.
-        _ => Arc::new(Int64Array::from(
-            rows.iter()
-                .map(|r| decode_int_key(&r.term))
-                .collect::<Vec<_>>(),
-        )),
-    };
+    let num_group_cols = num_prefix + 1;
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + num_stats);
 
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + num_stats);
-    arrays.push(group);
+    // Group columns: prefix j from `inverse[group - 1][j]`, the cursor
+    // (last group column) from the row's own term. `j` indexes the schema,
+    // the prefix/cursor split, and the inverse tuple — not a single slice.
+    #[allow(clippy::needless_range_loop)]
+    for j in 0..num_group_cols {
+        let values: Vec<Option<&[u8]>> = out
+            .iter()
+            .map(|o| {
+                if j == num_prefix {
+                    o.cursor
+                } else {
+                    inverse[(o.group - 1) as usize][j].as_deref()
+                }
+            })
+            .collect();
+        arrays.push(group_column(schema.field(j).data_type(), &values));
+    }
+
+    // Stat columns follow the group columns.
     for s in 0..num_stats {
-        let dtype = schema.field(s + 1).data_type();
+        let dtype = schema.field(num_group_cols + s).data_type();
         let array = if matches!(dtype, DataType::Float64) {
-            // `AVG` → one f64 per group; the NULL group is just another group.
-            let mut col: Vec<Option<f64>> =
-                rows.iter().map(|r| Some(r.stats[s].avg_f64())).collect();
-            if let Some(ns) = null_stats {
-                col.push(Some(ns[s].avg_f64()));
-            }
-            float_array(col)
+            float_array(out.iter().map(|o| Some(o.stats[s].avg_f64())).collect())
         } else {
-            let mut col: Vec<Option<i64>> =
-                rows.iter().map(|r| Some(r.stats[s].finalize())).collect();
-            if let Some(ns) = null_stats {
-                col.push(Some(ns[s].finalize()));
-            }
-            stat_array(dtype, col)?
+            stat_array(
+                dtype,
+                out.iter().map(|o| Some(o.stats[s].finalize())).collect(),
+            )?
         };
         arrays.push(array);
     }
 
-    let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
+    let options = RecordBatchOptions::new().with_row_count(Some(out.len()));
     Ok(RecordBatch::try_new_with_options(
         Arc::clone(schema),
         arrays,
         &options,
     )?)
+}
+
+/// Build a group-key column from FTGS term-key bytes in the column's
+/// declared type: `Utf8` renders the term string, `Int64` decodes the
+/// order-preserving key. `None` (a `String` NULL group) is a SQL NULL.
+fn group_column(dtype: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {
+    match dtype {
+        DataType::Utf8 => Arc::new(StringArray::from(
+            values
+                .iter()
+                .map(|v| v.map(|b| render_term(FieldKind::String, b)))
+                .collect::<Vec<Option<String>>>(),
+        )),
+        // `Int` group: dense, so a `None` here never occurs.
+        _ => Arc::new(Int64Array::from(
+            values
+                .iter()
+                .map(|v| v.map(decode_int_key))
+                .collect::<Vec<Option<i64>>>(),
+        )),
+    }
 }
 
 /// Build a stat column in the type the aggregate's output schema

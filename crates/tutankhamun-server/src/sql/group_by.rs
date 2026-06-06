@@ -1,21 +1,22 @@
-//! Single-column `GROUP BY` pushdown: a `DataFusion` optimizer rule
-//! that rewrites `Aggregate(TableScan(TutankhamunTableProvider))` into an
+//! `GROUP BY` pushdown: a `DataFusion` optimizer rule that rewrites
+//! `Aggregate(TableScan(TutankhamunTableProvider))` into an
 //! [`FtgsAggregate`] extension node, planned to an [`FtgsAggExec`] that
 //! runs the aggregation through FTGS instead of materializing every row.
 //!
-//! The rewrite is purely additive: it fires only for the exactly
-//! supported shape — a single `Int` grouping column, aggregates limited
-//! to `COUNT(*)` / `SUM` / `MIN` / `MAX` over `Metric`/`Int` columns, and
-//! a *bare* `TableScan` (so all `WHERE` filters were pushed exactly; an
+//! The rewrite is purely additive: it fires only for the supported shape
+//! — zero or more `String`/`Int` grouping columns, aggregates limited to
+//! `COUNT(*)` / `SUM` / `MIN` / `MAX` / `AVG` / `approx_distinct`, and a
+//! *bare* `TableScan` (so all `WHERE` filters were pushed exactly; an
 //! inexact `<`/`>` leaves a `Filter` node and we fall back). Every other
 //! query is left untouched for `DataFusion` to aggregate over the row
 //! scan, so the pushdown can never change a result, only skip the
 //! optimization.
 //!
-//! A single `Int` or `String` grouping column. `Int`/`Metric` forward
-//! columns are dense, so an `Int` group has no NULL group; a `String`
-//! column can be sparse, so [`FtgsAggExec`] adds a NULL-group pass that
-//! aggregates the docs with no term into a NULL-keyed row.
+//! Multi-column `GROUP BY` regroups all but the last column into the
+//! group lookup (the combo key) and scans the last. `String` columns can
+//! be sparse, so [`FtgsAggExec`] adds a NULL pass for docs with no term:
+//! a missing prefix value is its own group; a missing cursor value yields
+//! a NULL-keyed row per group.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -92,22 +93,17 @@ impl OwnedStat {
 pub(crate) struct FtgsAggregate {
     url: String,
     cache: Arc<Cache>,
-    /// The single grouping column, or `None` for a global aggregate
-    /// (no `GROUP BY`) — one row over the whole filtered set.
-    group_col: Option<String>,
+    /// The grouping columns in `GROUP BY` order, or empty for a global
+    /// aggregate (no `GROUP BY`) — one row over the whole filtered set.
+    group_cols: Vec<String>,
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
     schema: DFSchemaRef,
 }
 
 impl FtgsAggregate {
-    fn identity(&self) -> (&str, Option<&str>, &[OwnedStat], &[PushedFilter]) {
-        (
-            &self.url,
-            self.group_col.as_deref(),
-            &self.stats,
-            &self.filters,
-        )
+    fn identity(&self) -> (&str, &[String], &[OwnedStat], &[PushedFilter]) {
+        (&self.url, &self.group_cols, &self.stats, &self.filters)
     }
 }
 
@@ -162,7 +158,7 @@ impl UserDefinedLogicalNodeCore for FtgsAggregate {
         write!(
             f,
             "FtgsAggregate: group_by=[{}], stats={}, filters={}",
-            self.group_col.as_deref().unwrap_or(""),
+            self.group_cols.join(","),
             self.stats.len(),
             self.filters.len()
         )
@@ -226,22 +222,23 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
     };
 
     // No grouping column → a global aggregate (one row over the whole
-    // filtered set). Exactly one column → grouped; it must be filterable
-    // (`String`/`Int`, i.e. carries the inverted index the cursor walks).
-    // Two or more columns fall back (needs regroups).
-    let group_col = match agg.group_expr.as_slice() {
-        [] => None,
-        [Expr::Column(col)] => {
-            if !matches!(
-                prov.field_kind(&col.name),
-                Some(FieldKind::String | FieldKind::Int)
-            ) {
-                return Ok(None);
-            }
-            Some(col.name.clone())
+    // filtered set). Otherwise every column must be a bare, filterable
+    // (`String`/`Int`) column — these carry the inverted index the cursor
+    // walks and the regroup reads. The exec regroups all but the last
+    // column into the group lookup and scans the last.
+    let mut group_cols = Vec::with_capacity(agg.group_expr.len());
+    for expr in &agg.group_expr {
+        let Expr::Column(col) = expr else {
+            return Ok(None);
+        };
+        if !matches!(
+            prov.field_kind(&col.name),
+            Some(FieldKind::String | FieldKind::Int)
+        ) {
+            return Ok(None);
         }
-        _ => return Ok(None),
-    };
+        group_cols.push(col.name.clone());
+    }
 
     // Every aggregate must map to a supported scalar stat.
     let mut stats = Vec::with_capacity(agg.aggr_expr.len());
@@ -268,7 +265,7 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
     Ok(Some(FtgsAggregate {
         url: prov.url().to_string(),
         cache: Arc::clone(prov.cache()),
-        group_col,
+        group_cols,
         stats,
         filters,
         schema: Arc::clone(&agg.schema),
@@ -349,7 +346,7 @@ impl ExtensionPlanner for FtgsAggregatePlanner {
         let exec = FtgsAggExec::new(
             node.url.clone(),
             Arc::clone(&node.cache),
-            node.group_col.clone(),
+            node.group_cols.clone(),
             node.stats.clone(),
             node.filters.clone(),
             Arc::clone(node.schema.inner()),

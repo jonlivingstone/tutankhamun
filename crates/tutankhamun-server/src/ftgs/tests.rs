@@ -4,7 +4,10 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 use tempfile::TempDir;
 
-use super::{FtgsRow, StatSpec, StatValue, ftgs_scan, ftgs_scan_merge, merge_ftgs, render_term};
+use super::{
+    FtgsRow, StatSpec, StatValue, aggregate_docs_grouped, ftgs_scan, ftgs_scan_merge, merge_ftgs,
+    render_term,
+};
 use crate::group_lookup::GroupLookup;
 use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
 
@@ -140,6 +143,20 @@ fn int_group_by_renders_decimal_terms() {
             row("hour", "11", 2, &[40]),
         ]
     );
+}
+
+#[test]
+fn aggregate_docs_grouped_buckets_by_group() {
+    let (_tmp, shard) = setup();
+    // groups_5: docs→groups [1,1,2,2,1]; revenue [10,20,30,40,50].
+    let out =
+        aggregate_docs_grouped(&shard, 0..5, &groups_5(), &[StatSpec::Sum("revenue")]).unwrap();
+    let finalized: Vec<(u32, Vec<i64>)> = out
+        .iter()
+        .map(|(&g, st)| (g, st.iter().map(StatValue::finalize).collect()))
+        .collect();
+    // group 1 = {0,1,4} = 10+20+50 = 80; group 2 = {2,3} = 30+40 = 70.
+    assert_eq!(finalized, vec![(1, vec![80]), (2, vec![70])]);
 }
 
 #[test]

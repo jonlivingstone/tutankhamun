@@ -27,7 +27,7 @@
 //! loop and `FtgsRow` are agnostic to which variant a stat is.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use anyhow::{Context as _, Result, bail};
 use rayon::prelude::*;
@@ -289,13 +289,13 @@ impl<'a> Stat<'a> {
 /// A `String` column's reverse map: per doc, the index into the term
 /// table of the term covering it (`None` = no value), plus the term
 /// bytes themselves (allocated once each, indexed by `doc_term`).
-type TermMap = (Vec<Option<u32>>, Vec<Box<[u8]>>);
+pub(crate) type TermMap = (Vec<Option<u32>>, Vec<Box<[u8]>>);
 
 /// Build a doc→term reverse map for a `String` field (no forward
 /// column): walk its inverted index once, allocating each term's bytes
 /// exactly once in `terms` and recording, per doc, the term that covers
 /// it. Docs with no term map to `None`. `O(num_docs)` work per shard.
-fn term_map(shard: &dyn Shard, name: &str) -> Result<TermMap> {
+pub(crate) fn term_map(shard: &dyn Shard, name: &str) -> Result<TermMap> {
     let index = shard.inverted_index(name).with_context(|| {
         format!("stat field {name:?} has neither a forward column nor an inverted index")
     })?;
@@ -412,6 +412,47 @@ pub fn aggregate_docs(
         }
     }
     Ok(accumulators.iter_mut().map(|s| s.take_value(0)).collect())
+}
+
+/// Aggregate `docs` bucketed by their [`GroupLookup`] group — like
+/// [`ftgs_scan`] without a term cursor. Used by the multi-column SQL
+/// path for docs the cursor field doesn't emit (no term for it): each
+/// keeps the combo group it was regrouped into, so its stats land in the
+/// right `(prefix-tuple, NULL-cursor)` row. Group 0 (filtered out) is
+/// skipped; the returned map holds one entry per group actually touched.
+pub fn aggregate_docs_grouped(
+    shard: &dyn Shard,
+    docs: impl Iterator<Item = u32>,
+    groups: &GroupLookup,
+    stats: &[StatSpec],
+) -> Result<BTreeMap<u32, Vec<StatValue>>> {
+    let num_groups = groups.num_groups().max(1) as usize;
+    let mut accumulators: Vec<Stat> = stats
+        .iter()
+        .map(|spec| Stat::new(*spec, shard, num_groups))
+        .collect::<Result<_>>()?;
+    let mut seen = BitTree::new(num_groups);
+    for doc in docs {
+        let group = groups.get(doc as usize);
+        if group == 0 {
+            continue;
+        }
+        seen.set(group as usize);
+        for stat in &mut accumulators {
+            stat.update(group as usize, doc as usize);
+        }
+    }
+    let mut drained = Vec::new();
+    seen.drain_into(&mut drained);
+    let mut out = BTreeMap::new();
+    for g in drained {
+        let row = accumulators
+            .iter_mut()
+            .map(|s| s.take_value(g as usize))
+            .collect();
+        out.insert(g, row);
+    }
+    Ok(out)
 }
 
 /// Render a raw FST key ([`FtgsRow::term`]) as its display term: `Int`
