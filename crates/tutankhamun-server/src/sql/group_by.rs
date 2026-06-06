@@ -32,7 +32,7 @@ use datafusion::execution::context::QueryPlanner;
 use datafusion::execution::session_state::SessionState;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{
-    Aggregate, AggregateUDF, Expr, Extension, LogicalPlan, UserDefinedLogicalNode,
+    Aggregate, AggregateUDF, Expr, Extension, LogicalPlan, ScalarUDF, UserDefinedLogicalNode,
     UserDefinedLogicalNodeCore,
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
@@ -68,6 +68,10 @@ pub fn session_context() -> SessionContext {
     ctx.register_udaf(AggregateUDF::from(
         super::approx_top_k::ApproxTopK::default(),
     ));
+    // theta (Binary sketch aggregate) + theta_intersect (scalar over two
+    // Binary sketches) — also custom, no DataFusion built-in.
+    ctx.register_udaf(AggregateUDF::from(super::theta::Theta::default()));
+    ctx.register_udf(ScalarUDF::from(super::theta::ThetaIntersect::default()));
     ctx
 }
 
@@ -86,6 +90,8 @@ pub(crate) enum OwnedStat {
     ApproxPercentile(String, u64, usize),
     /// `approx_top_k`: column, `k`, and the per-shard merge `capacity`.
     TopK(String, usize, usize),
+    /// `theta`: column and the sketch's nominal entries.
+    Theta(String, usize),
 }
 
 impl OwnedStat {
@@ -101,6 +107,7 @@ impl OwnedStat {
                 StatSpec::ApproxPercentile(c, f64::from_bits(*bits), *max_size)
             }
             OwnedStat::TopK(c, k, capacity) => StatSpec::TopK(c, *k, *capacity),
+            OwnedStat::Theta(c, nominal) => StatSpec::Theta(c, *nominal),
         }
     }
 }
@@ -293,6 +300,8 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
 }
 
 /// Map one aggregate expression to a pushable [`OwnedStat`], or `None`.
+// One arm per supported aggregate name — long but flat.
+#[allow(clippy::too_many_lines)]
 fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<OwnedStat> {
     let Expr::AggregateFunction(af) = expr else {
         return None;
@@ -399,6 +408,28 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
             }
             .max(k);
             Some(OwnedStat::TopK(c.name.clone(), k, capacity))
+        }
+        // theta(col [, nominal]) — a KMV distinct-count sketch (Binary).
+        // Counts per-doc, so any kind (String/Int/Metric) works.
+        "theta" => {
+            let [col_expr, rest @ ..] = args.as_slice() else {
+                return None;
+            };
+            let Expr::Column(c) = col_expr else {
+                return None;
+            };
+            if !matches!(
+                prov.field_kind(&c.name)?,
+                FieldKind::String | FieldKind::Int | FieldKind::Metric
+            ) {
+                return None;
+            }
+            let nominal = match rest {
+                [] => crate::sketches::ThetaSketch::DEFAULT_NOMINAL,
+                [e] => lit_usize(e)?.next_power_of_two(),
+                _ => return None,
+            };
+            Some(OwnedStat::Theta(c.name.clone(), nominal))
         }
         _ => None,
     }

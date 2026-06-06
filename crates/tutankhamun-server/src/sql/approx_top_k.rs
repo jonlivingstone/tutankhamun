@@ -130,7 +130,7 @@ impl AggregateUDFImpl for ApproxTopK {
 /// Read a positive-integer literal arg by evaluating it against an empty
 /// batch — the same trick `approx_percentile_cont` uses for its percentile.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-fn scalar_usize(expr: &Arc<dyn PhysicalExpr>) -> Result<usize> {
+pub(crate) fn scalar_usize(expr: &Arc<dyn PhysicalExpr>) -> Result<usize> {
     let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
     let ColumnarValue::Scalar(scalar) = expr.evaluate(&empty)? else {
         return internal_err!("approx_top_k expects a literal k/capacity, got an array");

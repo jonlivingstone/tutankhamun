@@ -36,7 +36,7 @@ use crate::bit_tree::BitTree;
 use crate::group_lookup::GroupLookup;
 use crate::runtime;
 use crate::shard::{FieldKind, Shard, decode_int_key, encode_int_key, require_field, utf8_term};
-use crate::sketches::{Hll, TDigest};
+use crate::sketches::{Hll, TDigest, ThetaSketch};
 
 /// A stat the caller wants accumulated per group, named against the
 /// shard's columns. `Sum`/`Min`/`Max`/`Avg`/`ApproxPercentile` read a
@@ -56,6 +56,8 @@ pub enum StatSpec<'a> {
     /// `approx_top_k`: column, `k`, and the per-shard `capacity` retained
     /// for the merge.
     TopK(&'a str, usize, usize),
+    /// `theta`: column and the sketch's nominal entries.
+    Theta(&'a str, usize),
 }
 
 impl StatSpec<'_> {
@@ -73,7 +75,8 @@ impl StatSpec<'_> {
             StatSpec::Avg(_)
             | StatSpec::ApproxCountDistinct(_)
             | StatSpec::ApproxPercentile(..)
-            | StatSpec::TopK(..) => {
+            | StatSpec::TopK(..)
+            | StatSpec::Theta(..) => {
                 unreachable!("non-scalar stat combines its own accumulator")
             }
         }
@@ -105,6 +108,9 @@ pub enum StatValue {
         k: usize,
         capacity: usize,
     },
+    /// `theta` — a KMV sketch, unioned across shards, serialized to `Binary`
+    /// at output.
+    Theta(ThetaSketch),
 }
 
 /// Sort `(value-key, count)` pairs count-descending, value-key ascending
@@ -133,6 +139,7 @@ impl StatValue {
             }
             StatValue::Avg { .. } => unreachable!("avg finalizes to f64, not i64"),
             StatValue::TopK { .. } => unreachable!("top-k reshapes to a list, not i64"),
+            StatValue::Theta(_) => unreachable!("theta reshapes to Binary, not i64"),
         }
     }
 
@@ -180,6 +187,7 @@ pub fn combine_stats(acc: &mut [StatValue], other: &[StatValue], specs: &[StatSp
                 }
                 *a = top_k_sorted(map, *capacity);
             }
+            (StatValue::Theta(a), StatValue::Theta(b)) => a.union(b),
             _ => unreachable!("stat variants match across shards (same specs)"),
         }
     }
@@ -266,6 +274,20 @@ enum Stat<'a> {
         capacity: usize,
         counts: Vec<HashMap<u32, i64>>,
     },
+    /// `theta` over an `Int`/`Metric` forward column: hash `col[doc]`.
+    ThetaInt {
+        col: &'a [i64],
+        nominal: usize,
+        sketches: Vec<ThetaSketch>,
+    },
+    /// `theta` over a `String` column: hash the doc's term bytes (a doc with
+    /// no term contributes nothing).
+    ThetaBytes {
+        doc_term: Vec<Option<u32>>,
+        terms: Vec<Box<[u8]>>,
+        nominal: usize,
+        sketches: Vec<ThetaSketch>,
+    },
 }
 
 impl<'a> Stat<'a> {
@@ -342,6 +364,24 @@ impl<'a> Stat<'a> {
                     }
                 }
             }
+            // `Int`/`Metric` hash the forward column; `String` hashes terms.
+            StatSpec::Theta(name, nominal) => {
+                if let Some(col) = shard.forward_column(name) {
+                    Stat::ThetaInt {
+                        col,
+                        nominal,
+                        sketches: vec![ThetaSketch::with_nominal(nominal); num_groups],
+                    }
+                } else {
+                    let (doc_term, terms) = term_map(shard, name)?;
+                    Stat::ThetaBytes {
+                        doc_term,
+                        terms,
+                        nominal,
+                        sketches: vec![ThetaSketch::with_nominal(nominal); num_groups],
+                    }
+                }
+            }
         })
     }
 
@@ -374,6 +414,17 @@ impl<'a> Stat<'a> {
             } => {
                 if let Some(t) = doc_term[doc] {
                     *counts[group].entry(t).or_default() += 1;
+                }
+            }
+            Stat::ThetaInt { col, sketches, .. } => sketches[group].insert(col[doc]),
+            Stat::ThetaBytes {
+                doc_term,
+                terms,
+                sketches,
+                ..
+            } => {
+                if let Some(t) = doc_term[doc] {
+                    sketches[group].insert_bytes(&terms[t as usize]);
                 }
             }
         }
@@ -444,6 +495,15 @@ impl<'a> Stat<'a> {
                     capacity: *capacity,
                 }
             }
+            Stat::ThetaInt {
+                nominal, sketches, ..
+            }
+            | Stat::ThetaBytes {
+                nominal, sketches, ..
+            } => StatValue::Theta(std::mem::replace(
+                &mut sketches[group],
+                ThetaSketch::with_nominal(*nominal),
+            )),
         }
     }
 }

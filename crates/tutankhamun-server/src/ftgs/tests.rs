@@ -228,6 +228,29 @@ fn approx_top_k_merges_across_shards() {
 }
 
 #[test]
+fn theta_counts_and_merges_across_shards() {
+    let tmp = TempDir::new().unwrap();
+    let s1 = write_hour_shard(&tmp.path().join("a"), vec![0, 1, 2], vec![0, 0, 0]);
+    let s2 = write_hour_shard(&tmp.path().join("b"), vec![2, 3, 4], vec![0, 0, 0]);
+
+    let spec = [StatSpec::Theta("hour", 4096)];
+    // hour distinct per shard: s1 {0,1,2}=3, s2 {2,3,4}=3.
+    let mut a = aggregate_docs(&s1, 0..3, &spec).unwrap();
+    let StatValue::Theta(sa) = &a[0] else {
+        panic!()
+    };
+    assert_eq!(sa.estimate(), 3);
+
+    let b = aggregate_docs(&s2, 0..3, &spec).unwrap();
+    combine_stats(&mut a, &b, &spec);
+    // union {0,1,2,3,4} = 5 (hour 2 shared, deduped).
+    let StatValue::Theta(merged) = &a[0] else {
+        panic!()
+    };
+    assert_eq!(merged.estimate(), 5);
+}
+
+#[test]
 fn group_zero_is_excluded() {
     let (_tmp, shard) = setup();
     // Move doc1 (US, revenue 20) into the filtered-out group 0.

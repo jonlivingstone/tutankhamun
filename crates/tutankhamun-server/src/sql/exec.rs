@@ -15,8 +15,8 @@ use std::sync::Arc;
 use anyhow::Context as _;
 
 use arrow::array::{
-    ArrayRef, Float64Array, Int64Array, ListArray, RecordBatch, RecordBatchOptions, StringArray,
-    StructArray, TimestampNanosecondArray, UInt64Array,
+    ArrayRef, BinaryBuilder, Float64Array, Int64Array, ListArray, RecordBatch, RecordBatchOptions,
+    StringArray, StructArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, FieldRef, SchemaRef, TimeUnit};
@@ -45,6 +45,7 @@ use crate::shard::{
     matched_doc_set,
 };
 use crate::shard_source::{ObjectStoreShardSource, ShardSource};
+use crate::sketches::ThetaSketch;
 use crate::storage::StorageRegistry;
 
 #[derive(Debug)]
@@ -771,6 +772,9 @@ fn reshape_aggregate(
             DataType::List(item) => {
                 topk_list_array(item, out.iter().map(|o| topk_slice(&o.stats[s])))?
             }
+            DataType::Binary => {
+                theta_binary_array(out.iter().map(|o| Some(theta_sketch(&o.stats[s]))))
+            }
             _ => stat_array(
                 dtype,
                 out.iter().map(|o| Some(o.stats[s].finalize())).collect(),
@@ -872,6 +876,27 @@ fn topk_list_array<'a>(
     )))
 }
 
+/// The `ThetaSketch` of a `Theta` stat value (a `Binary` column).
+fn theta_sketch(stat: &StatValue) -> &ThetaSketch {
+    match stat {
+        StatValue::Theta(s) => s,
+        _ => unreachable!("a Binary column is a theta stat"),
+    }
+}
+
+/// Build the `Binary` column (`theta`'s output) from each row's sketch,
+/// `None` → SQL NULL.
+fn theta_binary_array<'a>(rows: impl Iterator<Item = Option<&'a ThetaSketch>>) -> ArrayRef {
+    let mut b = BinaryBuilder::new();
+    for row in rows {
+        match row {
+            Some(sketch) => b.append_value(sketch.to_bytes()),
+            None => b.append_null(),
+        }
+    }
+    Arc::new(b.finish())
+}
+
 /// Build a stat column in the type the aggregate's output schema
 /// declares, each `None` rendering a SQL NULL. Cardinalities are
 /// non-negative, so the `UInt64` widening can't lose a value.
@@ -914,6 +939,10 @@ fn reshape_global(
                 let row = stats.map_or(empty, |st| topk_slice(&st[s]));
                 topk_list_array(item, std::iter::once(row))?
             }
+            // `theta`: one Binary sketch, or NULL when there was no input.
+            DataType::Binary => {
+                theta_binary_array(std::iter::once(stats.map(|st| theta_sketch(&st[s]))))
+            }
             _ => {
                 let value = match stats {
                     Some(st) => Some(st[s].finalize()),
@@ -925,6 +954,7 @@ fn reshape_global(
                         | OwnedStat::ApproxPercentile(..) => None,
                         OwnedStat::Avg(_) => unreachable!("avg output is Float64"),
                         OwnedStat::TopK(..) => unreachable!("top-k output is a List"),
+                        OwnedStat::Theta(..) => unreachable!("theta output is Binary"),
                     },
                 };
                 stat_array(dtype, vec![value])?

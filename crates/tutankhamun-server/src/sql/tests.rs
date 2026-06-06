@@ -1319,3 +1319,78 @@ async fn approx_top_k_capacity_below_k_is_clamped() {
         vec![("de".to_string(), 3), ("us".to_string(), 3)]
     );
 }
+
+// ---- theta sketches ----
+
+/// Deserialize the theta sketch in `Binary` column `col`, row `row`.
+fn theta_at(b: &arrow::array::RecordBatch, col: usize, row: usize) -> crate::sketches::ThetaSketch {
+    let a = b
+        .column(col)
+        .as_any()
+        .downcast_ref::<arrow::array::BinaryArray>()
+        .expect("Binary column");
+    crate::sketches::ThetaSketch::from_bytes(a.value(row)).expect("valid sketch")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn theta_global_estimates_distinct() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // vendor_id distinct = {1,2,3} → 3 (exact regime). Pushes to FTGS.
+    let sql = "SELECT theta(vendor_id) AS s FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(theta_at(b, 0, 0).estimate(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn theta_grouped_by_int_string_column() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // theta over a String column, grouped by an Int. vendor 1 docs→country
+    // {us}=1; vendor 2 {de}=1; vendor 3 {us,de}=2.
+    let sql = "SELECT vendor_id, theta(country) AS s FROM trips \
+               GROUP BY vendor_id ORDER BY vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    assert_eq!(theta_at(b, 1, 0).estimate(), 1);
+    assert_eq!(theta_at(b, 1, 1).estimate(), 1);
+    assert_eq!(theta_at(b, 1, 2).estimate(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn theta_intersect_counts_cohort_overlap() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // Warm the shard cache with one scan first: the two scalar subqueries
+    // below otherwise fetch the same cold shard concurrently and race.
+    ctx.sql("SELECT count(*) FROM trips")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    // vendors with country=us = {1,3}; country=de = {2,3}; overlap = {3} → 1.
+    let sql = "SELECT theta_intersect(
+        (SELECT theta(vendor_id) FROM trips WHERE country = 'us'),
+        (SELECT theta(vendor_id) FROM trips WHERE country = 'de')
+    ) AS both";
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows[0][0], 1);
+}

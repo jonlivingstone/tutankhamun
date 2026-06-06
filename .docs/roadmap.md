@@ -242,9 +242,13 @@ directly.
       inverted index / forward column to count exactly per shard, keeps
       the top-`capacity`, and merges across shards via the `StatValue`
       seam — no Count-Min sketch needed. `String`/`Int`/`Metric` columns)
-- [ ] `theta(field, [nominal_entries])` returning Arrow `Binary`
-      — §3.1
-- [ ] `theta_intersect(a, b)` — §3.1
+- [x] `theta(field, [nominal_entries])` returning Arrow `Binary`
+      — §3.1 (a custom KMV theta sketch; the `theta` UDAF builds it as a
+      `Binary` column — FTGS pushdown over `String`/`Int`/`Metric` columns,
+      merged by union via the `StatValue` seam, with the UDAF as fallback)
+- [x] `theta_intersect(a, b)` — §3.1 (a scalar UDF over two `Binary`
+      sketch columns → the estimated overlap `Int64`; cohort intersection
+      HLL can't do)
 - [~] Sketch merge in the FTGS merge path (sketches are
       mergeable by construction) — §3.1 (HLL registers union via
       the `StatValue`/`combine_stats` seam; t-digest/theta extend it)
