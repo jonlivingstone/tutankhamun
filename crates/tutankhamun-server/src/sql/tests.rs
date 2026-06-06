@@ -510,3 +510,145 @@ async fn time_filter_selects_one_shard_across_a_two_day_dataset() {
         .value(0);
     assert_eq!(total, 11);
 }
+
+// ---- Tier 2: single-column GROUP BY pushdown into FTGS ----
+
+/// Physical plan of `sql` under `ctx`, rendered for substring checks
+/// (e.g. asserting `FtgsAggExec` is or isn't present).
+async fn physical_plan(ctx: &SessionContext, sql: &str) -> String {
+    let plan = ctx
+        .sql(sql)
+        .await
+        .unwrap()
+        .create_physical_plan()
+        .await
+        .unwrap();
+    format!(
+        "{}",
+        datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+    )
+}
+
+/// All-`Int64` result rows in batch order.
+fn int_rows(batches: &[arrow::array::RecordBatch]) -> Vec<Vec<i64>> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let cols: Vec<&arrow::array::Int64Array> = (0..b.num_columns())
+                .map(|i| {
+                    b.column(i)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                })
+                .collect();
+            (0..b.num_rows()).map(move |r| cols.iter().map(|c| c.value(r)).collect())
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_int_pushes_down_and_aggregates() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT vendor_id, sum(fare), count(*), min(fare), max(fare) \
+               FROM trips GROUP BY vendor_id ORDER BY vendor_id";
+
+    // The pushdown fired: FTGS exec replaced the DataFusion aggregate.
+    assert!(
+        physical_plan(&ctx, sql).await.contains("FtgsAggExec"),
+        "expected GROUP BY to push down to FtgsAggExec"
+    );
+
+    // vendor 1 = docs A{0,2} fare {100,300}; vendor 2 = A{1,3} {200,400};
+    // vendor 3 = B{0,1} {500,600}. Columns: vendor, sum, count, min, max.
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(
+        rows,
+        vec![
+            vec![1, 400, 2, 100, 300],
+            vec![2, 600, 2, 200, 400],
+            vec![3, 1100, 2, 500, 600],
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_int_with_exact_where_filter() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // `country = 'us'` is an exact filter → bare TableScan → still pushed.
+    let sql = "SELECT vendor_id, sum(fare) FROM trips \
+               WHERE country = 'us' GROUP BY vendor_id ORDER BY vendor_id";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    // us docs: A{0,2} (vendor 1, fare 100+300=400), B{0} (vendor 3, 500).
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![vec![1, 400], vec![3, 500]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_string_falls_back_to_datafusion() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // String group column: not pushed (NULL-group risk) — DataFusion
+    // aggregates the row scan, still correctly.
+    let sql = "SELECT country, count(*) AS n FROM trips GROUP BY country ORDER BY country";
+    assert!(
+        !physical_plan(&ctx, sql).await.contains("FtgsAggExec"),
+        "string GROUP BY must not push down"
+    );
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let countries = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::StringArray>()
+        .unwrap();
+    let counts = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    // de: A{1,3}, B{1} = 3; us: A{0,2}, B{0} = 3.
+    assert_eq!((countries.value(0), counts.value(0)), ("de", 3));
+    assert_eq!((countries.value(1), counts.value(1)), ("us", 3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn avg_falls_back_to_datafusion() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // AVG isn't a pushed stat → fallback (correct via DataFusion).
+    let sql = "SELECT vendor_id, avg(fare) FROM trips GROUP BY vendor_id ORDER BY vendor_id";
+    assert!(!physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let avg = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    // vendor 1 fares {100,300} → avg 200.
+    assert!((avg.value(0) - 200.0).abs() < 1e-9);
+}

@@ -15,7 +15,7 @@ use crate::shard::FilterClause;
 
 /// Owned mirror of [`FilterClause`] so the SQL execution plan can
 /// hold filters past the lifetime of the `scan(&self, …)` call.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct PushedFilter {
     pub field: String,
     pub op: PushedOp,
@@ -28,7 +28,7 @@ pub(crate) struct PushedFilter {
     pub exact: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum PushedOp {
     Equals(String),
     Range {

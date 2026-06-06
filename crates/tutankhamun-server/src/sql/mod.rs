@@ -24,9 +24,11 @@
 //! sessions, `FlightSQL` wire).
 
 pub mod exec;
+pub mod group_by;
 pub mod provider;
 pub mod pushdown;
 
+pub use group_by::session_context;
 pub use provider::TutankhamunTableProvider;
 
 #[cfg(test)]

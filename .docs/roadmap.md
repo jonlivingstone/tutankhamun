@@ -165,8 +165,12 @@ directly.
       + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
 - [x] Time-range shard pruning in the SQL scan (prune shards by a
       predicate on the time column before fetch) — §3.2
-- [ ] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
+- [~] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
       FTGS scan (Tier 2/3) — §3.2
+      (Tier 2 done: single-`Int`-column GROUP BY + COUNT(*)/SUM/MIN/MAX
+      pushed via an optimizer rule → `FtgsAggExec`; unsupported shapes
+      fall back to DataFusion. Remaining: String group-by w/ NULL group,
+      multi-column GROUP BY via regroups, AVG)
 - [ ] FlightSQL service implementation — §3.2
 - [ ] Session-aware SQL execution — DataFusion planner reuses
       session state when new query's filter refines previous — §3.2

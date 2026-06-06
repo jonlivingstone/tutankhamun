@@ -9,11 +9,14 @@
 
 use std::any::Any;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 
-use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray};
+use arrow::array::{
+    ArrayRef, Int64Array, RecordBatch, RecordBatchOptions, StringArray, TimestampNanosecondArray,
+};
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::Result as DfResult;
 use datafusion::common::error::DataFusionError;
@@ -25,9 +28,12 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 
+use super::group_by::OwnedStat;
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::cache::Cache;
-use crate::shard::{DiskShard, FilterClause, FilterResult, Shard, matched_doc_set};
+use crate::ftgs::{FtgsRow, StatSpec, ftgs_scan_merge};
+use crate::group_lookup::GroupLookup;
+use crate::shard::{DiskShard, FilterClause, FilterResult, Shard, decode_int_key, matched_doc_set};
 use crate::shard_source::{ObjectStoreShardSource, ShardSource};
 use crate::storage::StorageRegistry;
 
@@ -108,37 +114,9 @@ impl ExecutionPlan for TutankhamunExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
-        // DataFusion's `execute` is synchronous, but our scan work is
-        // async (cache fetches, shard discovery). We run it on a
-        // dedicated scoped thread with its own current-thread runtime.
-        //
-        // Why not `block_on` / `block_in_place` on the ambient
-        // runtime: `block_on` panics if the caller is already inside a
-        // runtime, and `block_in_place` only works on the
-        // multi-thread scheduler (it panics on a current-thread
-        // runtime, which the CLI builds). A separate thread sidesteps
-        // both — correct under any ambient flavor or none. Tier 1 is
-        // single-partition, so the one-thread-per-scan cost is bounded;
-        // Tier 2 streaming will replace this with a proper
-        // `RecordBatchStream`.
-        let batches = std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()?;
-                    rt.block_on(collect_batches(
-                        &self.url,
-                        &self.cache,
-                        &self.pushed,
-                        &self.projected_schema,
-                    ))
-                })
-                .join()
-                .map_err(|_| anyhow::anyhow!("scan thread panicked"))?
-        })
-        .map_err(|e| DataFusionError::External(e.into()))?;
-
+        let batches = block_on_scan(|| {
+            collect_batches(&self.url, &self.cache, &self.pushed, &self.projected_schema)
+        })?;
         Ok(Box::pin(MemoryStream::try_new(
             batches,
             Arc::clone(&self.projected_schema),
@@ -147,12 +125,44 @@ impl ExecutionPlan for TutankhamunExec {
     }
 }
 
-async fn collect_batches(
+/// Run a scan's async work to completion from `DataFusion`'s
+/// synchronous `execute`, on a dedicated scoped thread with its own
+/// current-thread runtime. `block_on` panics if the caller is already
+/// inside a runtime, and `block_in_place` only works on the multi-thread
+/// scheduler (it panics on the current-thread runtime the CLI builds);
+/// a separate thread sidesteps both — correct under any ambient flavor
+/// or none. Single-partition, so the one-thread-per-scan cost is
+/// bounded; Tier 2 streaming will replace this with a real
+/// `RecordBatchStream`. The future is built inside the thread (`make`),
+/// so only it crosses the thread boundary, not the future.
+fn block_on_scan<T, Fut>(make: impl FnOnce() -> Fut + Send) -> DfResult<T>
+where
+    Fut: Future<Output = anyhow::Result<T>>,
+    T: Send,
+{
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                rt.block_on(make())
+            })
+            .join()
+            .map_err(|_| anyhow::anyhow!("scan thread panicked"))?
+    })
+    .map_err(|e| DataFusionError::External(e.into()))
+}
+
+/// Discover the dataset's shards, prune by time, fetch + open each, and
+/// resolve the pushed filters to a matched-doc set. The shared prelude
+/// for both the row scan ([`collect_batches`]) and the FTGS aggregate
+/// ([`aggregate_batch`]).
+async fn fetch_selected_shards(
     url: &str,
     cache: &Cache,
     pushed: &[PushedFilter],
-    projected_schema: &SchemaRef,
-) -> anyhow::Result<Vec<RecordBatch>> {
+) -> anyhow::Result<Vec<(DiskShard, FilterResult)>> {
     let registry = StorageRegistry::from_url(url)?;
     let source = ObjectStoreShardSource::new(registry.store());
     let summaries = source.discover().await?;
@@ -160,7 +170,7 @@ async fn collect_batches(
     let filter_clauses: Vec<FilterClause<'_>> =
         pushed.iter().map(PushedFilter::as_clause).collect();
 
-    let mut batches = Vec::with_capacity(summaries.len());
+    let mut out = Vec::with_capacity(summaries.len());
     for summary in &summaries {
         // Prune whole shards before fetching them: if the query
         // constrains the time field to a window that the shard's
@@ -176,7 +186,21 @@ async fn collect_batches(
         let local_dir = cache.fetch_shard(summary).await?;
         let shard = DiskShard::open(&local_dir)?;
         let selection = matched_doc_set(&shard, &filter_clauses)?;
-        let batch = build_record_batch(&shard, &selection, projected_schema)?;
+        out.push((shard, selection));
+    }
+    Ok(out)
+}
+
+async fn collect_batches(
+    url: &str,
+    cache: &Cache,
+    pushed: &[PushedFilter],
+    projected_schema: &SchemaRef,
+) -> anyhow::Result<Vec<RecordBatch>> {
+    let shards = fetch_selected_shards(url, cache, pushed).await?;
+    let mut batches = Vec::with_capacity(shards.len());
+    for (shard, selection) in &shards {
+        let batch = build_record_batch(shard, selection, projected_schema)?;
         if batch.num_rows() > 0 {
             batches.push(batch);
         }
@@ -344,6 +368,168 @@ fn string_column(
         FilterResult::Bitmap(bm) => bm.iter().map(|d| term_at(d as usize)).collect(),
     };
     Ok(Arc::new(StringArray::from(values)))
+}
+
+/// `ExecutionPlan` for a pushed-down single-column `GROUP BY` (§3.2).
+/// Runs the aggregation through FTGS per shard and merges, emitting one
+/// pre-aggregated record batch instead of materializing every row.
+#[derive(Debug)]
+pub(crate) struct FtgsAggExec {
+    url: String,
+    cache: Arc<Cache>,
+    group_col: String,
+    stats: Vec<OwnedStat>,
+    filters: Vec<PushedFilter>,
+    /// Output schema: the group column, then one `Int64` column per
+    /// stat — matching the `Aggregate`'s output that this replaces.
+    schema: SchemaRef,
+    plan_properties: PlanProperties,
+}
+
+impl FtgsAggExec {
+    pub(crate) fn new(
+        url: String,
+        cache: Arc<Cache>,
+        group_col: String,
+        stats: Vec<OwnedStat>,
+        filters: Vec<PushedFilter>,
+        schema: SchemaRef,
+    ) -> Self {
+        let plan_properties = PlanProperties::new(
+            EquivalenceProperties::new(Arc::clone(&schema)),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            url,
+            cache,
+            group_col,
+            stats,
+            filters,
+            schema,
+            plan_properties,
+        }
+    }
+}
+
+impl DisplayAs for FtgsAggExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FtgsAggExec: group_by={}, stats={}, pushed_filters={}",
+            self.group_col,
+            self.stats.len(),
+            self.filters.len()
+        )
+    }
+}
+
+impl ExecutionPlan for FtgsAggExec {
+    fn name(&self) -> &'static str {
+        "FtgsAggExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DfResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DfResult<SendableRecordBatchStream> {
+        let batch = block_on_scan(|| {
+            aggregate_batch(
+                &self.url,
+                &self.cache,
+                &self.group_col,
+                &self.stats,
+                &self.filters,
+                &self.schema,
+            )
+        })?;
+        Ok(Box::pin(MemoryStream::try_new(
+            vec![batch],
+            Arc::clone(&self.schema),
+            None,
+        )?))
+    }
+}
+
+async fn aggregate_batch(
+    url: &str,
+    cache: &Cache,
+    group_col: &str,
+    stats: &[OwnedStat],
+    filters: &[PushedFilter],
+    schema: &SchemaRef,
+) -> anyhow::Result<RecordBatch> {
+    let shards = fetch_selected_shards(url, cache, filters).await?;
+
+    // Per shard, a group lookup placing WHERE-matching docs in group 1
+    // and the rest in group 0 (which FTGS skips). An empty selection
+    // contributes no shard.
+    let mut pairs: Vec<(&DiskShard, GroupLookup)> = Vec::with_capacity(shards.len());
+    for (shard, selection) in &shards {
+        let num_docs = usize::try_from(shard.num_docs())?;
+        let groups = match selection {
+            FilterResult::Empty => continue,
+            FilterResult::All => GroupLookup::all_in_one_group(num_docs),
+            FilterResult::Bitmap(bm) => {
+                let mut g = GroupLookup::constant(num_docs, 0);
+                for doc in bm {
+                    g.set(doc as usize, 1);
+                }
+                g
+            }
+        };
+        pairs.push((shard, groups));
+    }
+
+    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
+    let refs: Vec<(&dyn Shard, &GroupLookup)> =
+        pairs.iter().map(|(s, g)| (*s as &dyn Shard, g)).collect();
+    let rows = ftgs_scan_merge(&refs, &[group_col], &stat_specs)?;
+    reshape_aggregate(&rows, stats.len(), schema)
+}
+
+/// Turn merged FTGS rows into one record batch: column 0 is the `Int`
+/// group value decoded from the raw term key, columns 1.. are the stats
+/// in `StatSpec` order. All output columns are `Int64`.
+fn reshape_aggregate(
+    rows: &[FtgsRow],
+    num_stats: usize,
+    schema: &SchemaRef,
+) -> anyhow::Result<RecordBatch> {
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + num_stats);
+    let group: Vec<i64> = rows.iter().map(|r| decode_int_key(&r.term)).collect();
+    arrays.push(Arc::new(Int64Array::from(group)));
+    for s in 0..num_stats {
+        let col: Vec<i64> = rows.iter().map(|r| r.stats[s]).collect();
+        arrays.push(Arc::new(Int64Array::from(col)));
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::clone(schema),
+        arrays,
+        &options,
+    )?)
 }
 
 #[cfg(test)]

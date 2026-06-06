@@ -30,6 +30,27 @@ pub struct TutankhamunTableProvider {
     url: String,
     cache: Arc<Cache>,
     schema: SchemaRef,
+    /// Field name → kind, from the dataset's metadata. The Arrow
+    /// `schema` collapses `Metric`/`Int` to `Int64`, so the aggregate
+    /// pushdown rule consults this to tell a filterable `Int` group
+    /// column from a non-filterable `Metric`.
+    field_kinds: std::collections::BTreeMap<String, FieldKind>,
+}
+
+impl TutankhamunTableProvider {
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(crate) fn cache(&self) -> &Arc<Cache> {
+        &self.cache
+    }
+
+    /// Kind of `field` as declared in the dataset metadata, or `None`
+    /// if the dataset has no such field.
+    pub(crate) fn field_kind(&self, field: &str) -> Option<FieldKind> {
+        self.field_kinds.get(field).copied()
+    }
 }
 
 impl TutankhamunTableProvider {
@@ -63,7 +84,18 @@ impl TutankhamunTableProvider {
             }
         }
         let schema = arrow_schema_from_metadata(&first.metadata);
-        Ok(Self { url, cache, schema })
+        let field_kinds = first
+            .metadata
+            .fields
+            .iter()
+            .map(|f| (f.name.clone(), f.kind))
+            .collect();
+        Ok(Self {
+            url,
+            cache,
+            schema,
+            field_kinds,
+        })
     }
 }
 

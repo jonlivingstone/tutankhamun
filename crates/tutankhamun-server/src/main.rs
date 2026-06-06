@@ -397,10 +397,9 @@ fn run_sql(
     cache_size: &str,
 ) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    use datafusion::prelude::SessionContext;
     use std::sync::Arc;
     use tutankhamun_server::cache::Cache;
-    use tutankhamun_server::sql::TutankhamunTableProvider;
+    use tutankhamun_server::sql::{self, TutankhamunTableProvider};
 
     let url = shard_source::resolve_source_url(source)?;
     let cache_dir = resolve_cache_dir(cache_dir);
@@ -419,7 +418,9 @@ fn run_sql(
             size_cap,
         )?);
         let provider = TutankhamunTableProvider::try_new(url, cache).await?;
-        let ctx = SessionContext::new();
+        // GROUP BY pushdown rule + planner wired in; falls back to
+        // DataFusion's own aggregation for unsupported queries.
+        let ctx = sql::session_context();
         ctx.register_table("t", Arc::new(provider))
             .context("register table t")?;
         let batches = ctx.sql(query).await?.collect().await?;
