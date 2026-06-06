@@ -307,6 +307,37 @@ fn disjoint_terms_interleave_sorted() {
 }
 
 #[test]
+fn fans_out_and_combines_across_three_shards() {
+    let (t1, t2, t3) = (
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    );
+    // Partially overlapping hours so combining spans non-adjacent shards.
+    let s1 = write_hour_shard(t1.path(), vec![9, 11], vec![10, 10]);
+    let s2 = write_hour_shard(t2.path(), vec![10], vec![20]);
+    let s3 = write_hour_shard(t3.path(), vec![9, 10, 11], vec![1, 1, 1]);
+    let (g1, g2, g3) = (
+        GroupLookup::all_in_one_group(2),
+        GroupLookup::all_in_one_group(1),
+        GroupLookup::all_in_one_group(3),
+    );
+    let shards: [(&dyn Shard, &GroupLookup); 3] = [(&s1, &g1), (&s2, &g2), (&s3, &g3)];
+    let merged = ftgs_scan_merge(&shards, &["hour"], &[StatSpec::Sum("revenue")]).unwrap();
+
+    // hour 9: s1 10 + s3 1 = 11; hour 10: s2 20 + s3 1 = 21;
+    // hour 11: s1 10 + s3 1 = 11. Numeric order across all three.
+    assert_eq!(
+        rendered(&merged),
+        vec![
+            row("hour", "9", 1, &[11]),
+            row("hour", "10", 1, &[21]),
+            row("hour", "11", 1, &[11]),
+        ]
+    );
+}
+
+#[test]
 fn single_shard_merge_equals_scan() {
     let (_tmp, shard) = setup();
     let groups = groups_5();

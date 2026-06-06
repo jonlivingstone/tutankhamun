@@ -118,9 +118,10 @@ directly.
       sketches land as new variants)
 - [x] Ordering-invariant enforcement (terms sorted, groups
       ascending, fields in declaration order) — §2.6
-- [ ] Per-shard FTGS execution (single-threaded per shard, run
-      via Rayon) — §2.6, §2.3 (`ftgs_scan_merge` fans out
-      sequentially; Rayon dispatch still to wire)
+- [x] Per-shard FTGS execution (single-threaded per shard, run
+      via Rayon) — §2.6, §2.3 (`ftgs_scan_merge` fans out over the
+      bounded pool via `runtime::run_cpu` + `par_iter`; sequential
+      when the pool isn't initialised)
 - [x] Shard-fan-out merge (within a daemon) — §2.6
       (`merge_ftgs`: k-way merge of per-shard rows, combining stats
       on `(field, term, group)` via `StatSpec::combine`)

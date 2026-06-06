@@ -31,6 +31,29 @@ fn pool() -> &'static ThreadPool {
         .expect("Rayon pool not initialised; call init_rayon() in main()")
 }
 
+/// Whether the bounded Rayon pool has been initialised ([`init_rayon`]).
+/// Callers that want to fall back to sequential work when it hasn't
+/// (e.g. tests, non-`serve` CLI) gate on this before [`run_cpu`].
+#[must_use]
+pub fn rayon_ready() -> bool {
+    RAYON_POOL.get().is_some()
+}
+
+/// Run a CPU-bound closure on the bounded Rayon pool, blocking until it
+/// returns. Unlike [`spawn_cpu`], the closure may borrow from the
+/// caller's stack (it runs synchronously), so this is the entry point
+/// for data-parallel work (`par_iter`) over borrowed data — the closure
+/// and any `par_iter` inside it run on the bounded pool. Call only when
+/// [`rayon_ready`]; panics otherwise (same contract as the pool's other
+/// users). An async caller wraps the whole thing in [`spawn_cpu`].
+pub fn run_cpu<OP, R>(op: OP) -> R
+where
+    OP: FnOnce() -> R + Send,
+    R: Send,
+{
+    pool().install(op)
+}
+
 /// Dispatch a CPU-bound closure onto the Rayon pool, returning a
 /// Tokio-compatible future.
 ///

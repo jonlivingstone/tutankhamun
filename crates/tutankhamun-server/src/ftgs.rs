@@ -32,9 +32,11 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use anyhow::{Context as _, Result, bail};
+use rayon::prelude::*;
 
 use crate::bit_tree::BitTree;
 use crate::group_lookup::GroupLookup;
+use crate::runtime;
 use crate::shard::{FieldKind, Shard, decode_int_key, require_field, utf8_term};
 
 /// A stat the caller wants accumulated per group, named against the
@@ -246,18 +248,32 @@ pub fn render_term(kind: FieldKind, key: &[u8]) -> String {
 
 /// Within-daemon fan-out: run [`ftgs_scan`] over each `(shard, groups)`
 /// pair — each shard carries its own [`GroupLookup`] — and merge the
-/// per-shard results. Sequential for now; Rayon per-shard dispatch is a
-/// separate item. The cross-daemon layer reuses [`merge_ftgs`] directly
-/// on each daemon's already-merged rows ("distribution is recursion").
+/// per-shard results. Each shard's scan is single-threaded; the shards
+/// run in parallel on the bounded Rayon pool when it's initialised
+/// (the daemon), else sequentially (tests / non-`serve` CLI). The
+/// cross-daemon layer reuses [`merge_ftgs`] directly on each daemon's
+/// already-merged rows ("distribution is recursion").
 pub fn ftgs_scan_merge(
     shards: &[(&dyn Shard, &GroupLookup)],
     group_by: &[&str],
     stats: &[StatSpec],
 ) -> Result<Vec<FtgsRow>> {
-    let per_shard = shards
-        .iter()
-        .map(|(shard, groups)| ftgs_scan(*shard, groups, group_by, stats))
-        .collect::<Result<Vec<_>>>()?;
+    // par_iter preserves input order, so `per_shard` is positionally
+    // identical to the sequential form — and `merge_ftgs` is order-
+    // independent regardless — so the branch can't change the result.
+    let per_shard: Vec<Vec<FtgsRow>> = if runtime::rayon_ready() {
+        runtime::run_cpu(|| {
+            shards
+                .par_iter()
+                .map(|(shard, groups)| ftgs_scan(*shard, groups, group_by, stats))
+                .collect::<Result<Vec<_>>>()
+        })?
+    } else {
+        shards
+            .iter()
+            .map(|(shard, groups)| ftgs_scan(*shard, groups, group_by, stats))
+            .collect::<Result<Vec<_>>>()?
+    };
     Ok(merge_ftgs(per_shard, group_by, stats))
 }
 
