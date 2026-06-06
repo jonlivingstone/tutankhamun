@@ -228,8 +228,12 @@ directly.
       (pushed through the SQL `GROUP BY`/global paths via the `StatValue`
       seam, over `Int`/`Metric` forward columns or `String` index terms;
       optional `precision` arg still to add)
-- [ ] `approx_percentile(field, p, [compression])` (t-digest) —
-      §3.1
+- [~] `approx_percentile(field, p, [compression])` (t-digest) —
+      §3.1 (SQL `approx_percentile_cont(col, p [, centroids])` pushed
+      through the `GROUP BY`/global paths via the `StatValue` seam over
+      `Int`/`Metric` columns; each group buffers values and builds the
+      digest at the merge edge; returns the column's `Int64` type like
+      DataFusion. `Float`-column percentiles await float metric storage)
 - [ ] `approx_top_k(field, k, [capacity])` (Count-Min + heavy
       hitters) — §3.1
 - [ ] `theta(field, [nominal_entries])` returning Arrow `Binary`

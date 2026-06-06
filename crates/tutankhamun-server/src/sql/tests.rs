@@ -1122,3 +1122,66 @@ async fn multi_column_null_prefix_group() {
         vec![(None, 1, 20), (None, 2, 30), (Some("x".to_string()), 1, 10),]
     );
 }
+
+// ---- approx_percentile (t-digest) ----
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_percentile_global_pushes_down() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // fares {100..600}: median ~350. Output is Int64 (the input type).
+    let sql = "SELECT approx_percentile_cont(fare, 0.5) AS median FROM trips";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    let m = rows[0][0];
+    assert!((300..=400).contains(&m), "median = {m}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_percentile_grouped_and_merges_across_shards() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // de = {200,400,600} median ~400; us = {100,300,500} median ~300.
+    // us values span both shards, so this also exercises the digest merge.
+    let sql = "SELECT country, approx_percentile_cont(fare, 0.5) AS m FROM trips \
+               GROUP BY country ORDER BY country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    let m = col_i64(b, 1);
+    assert!((350..=450).contains(&m[0]), "de median = {}", m[0]);
+    assert!((250..=350).contains(&m[1]), "us median = {}", m[1]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approx_percentile_empty_input_is_null() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT approx_percentile_cont(fare, 0.5) AS m FROM trips WHERE country = 'zz'";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let b = &ctx.sql(sql).await.unwrap().collect().await.unwrap()[0];
+    let m = b
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(b.num_rows(), 1);
+    assert!(m.is_null(0), "percentile over empty input is NULL");
+}

@@ -3446,6 +3446,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tdigest"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c45d225a08ebccf0e0c7d46db4066ea8ab05b29d3750ecc1a04f1675978bf3c8"
+dependencies = [
+ "ordered-float",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3802,6 +3811,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tdigest",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

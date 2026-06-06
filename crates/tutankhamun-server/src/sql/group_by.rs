@@ -39,6 +39,7 @@ use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
 use datafusion::prelude::SessionContext;
+use datafusion::scalar::ScalarValue;
 
 use super::exec::FtgsAggExec;
 use super::provider::TutankhamunTableProvider;
@@ -46,6 +47,7 @@ use super::pushdown::{PushedFilter, expr_to_pushed_filter};
 use crate::cache::Cache;
 use crate::ftgs::StatSpec;
 use crate::shard::FieldKind;
+use crate::sketches::TDigest;
 
 /// A `SessionContext` with the `GROUP BY` pushdown rule + planner wired
 /// in. Falls back to `DataFusion`'s own aggregation for any query the
@@ -70,6 +72,9 @@ pub(crate) enum OwnedStat {
     Max(String),
     Avg(String),
     ApproxCountDistinct(String),
+    /// `approx_percentile`: column, the quantile as raw `f64` bits (so the
+    /// node stays `Eq`/`Ord`/`Hash` for plan dedup), and the digest size.
+    ApproxPercentile(String, u64, usize),
 }
 
 impl OwnedStat {
@@ -81,6 +86,9 @@ impl OwnedStat {
             OwnedStat::Max(c) => StatSpec::Max(c),
             OwnedStat::Avg(c) => StatSpec::Avg(c),
             OwnedStat::ApproxCountDistinct(c) => StatSpec::ApproxCountDistinct(c),
+            OwnedStat::ApproxPercentile(c, bits, max_size) => {
+                StatSpec::ApproxPercentile(c, f64::from_bits(*bits), *max_size)
+            }
         }
     }
 }
@@ -321,6 +329,40 @@ fn aggregate_to_stat(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<Own
                 "avg" => OwnedStat::Avg(col),
                 _ => OwnedStat::ApproxCountDistinct(col),
             })
+        }
+        // approx_percentile_cont(col, p [, centroids]) — a t-digest quantile
+        // over a `Metric`/`Int` column. The column is passed bare (no cast).
+        "approx_percentile_cont" => {
+            let [Expr::Column(c), p_expr, rest @ ..] = args.as_slice() else {
+                return None;
+            };
+            if !matches!(
+                prov.field_kind(&c.name)?,
+                FieldKind::Metric | FieldKind::Int
+            ) {
+                return None;
+            }
+            let percentile = match p_expr {
+                Expr::Literal(ScalarValue::Float64(Some(p)), _) => *p,
+                Expr::Literal(ScalarValue::Float32(Some(p)), _) => f64::from(*p),
+                _ => return None,
+            };
+            if !(0.0..=1.0).contains(&percentile) {
+                return None;
+            }
+            // Optional third arg: t-digest size (centroids).
+            let max_size = match rest {
+                [] => TDigest::DEFAULT_MAX_SIZE,
+                [Expr::Literal(ScalarValue::Int64(Some(n)), _)] if *n > 0 => {
+                    usize::try_from(*n).ok()?
+                }
+                _ => return None,
+            };
+            Some(OwnedStat::ApproxPercentile(
+                c.name.clone(),
+                percentile.to_bits(),
+                max_size,
+            ))
         }
         _ => None,
     }

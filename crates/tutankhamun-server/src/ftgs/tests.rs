@@ -5,8 +5,8 @@ use roaring::RoaringBitmap;
 use tempfile::TempDir;
 
 use super::{
-    FtgsRow, StatSpec, StatValue, aggregate_docs_grouped, ftgs_scan, ftgs_scan_merge, merge_ftgs,
-    render_term,
+    FtgsRow, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats, ftgs_scan,
+    ftgs_scan_merge, merge_ftgs, render_term,
 };
 use crate::group_lookup::GroupLookup;
 use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
@@ -157,6 +157,34 @@ fn aggregate_docs_grouped_buckets_by_group() {
         .collect();
     // group 1 = {0,1,4} = 10+20+50 = 80; group 2 = {2,3} = 30+40 = 70.
     assert_eq!(finalized, vec![(1, vec![80]), (2, vec![70])]);
+}
+
+#[test]
+fn approx_percentile_estimates_quantile() {
+    let (_tmp, shard) = setup();
+    // revenue {10,20,30,40,50}: median 30 (t-digest keeps all points exact
+    // at this size, so within a tight band).
+    let spec = [StatSpec::ApproxPercentile("revenue", 0.5, 100)];
+    let out = aggregate_docs(&shard, 0..5, &spec).unwrap();
+    let p50 = out[0].finalize();
+    assert!((25..=35).contains(&p50), "p50 = {p50}");
+}
+
+#[test]
+fn approx_percentile_merges_across_shards() {
+    let tmp = TempDir::new().unwrap();
+    let s1 = write_hour_shard(&tmp.path().join("a"), vec![0, 0, 0], vec![10, 20, 30]);
+    let s2 = write_hour_shard(&tmp.path().join("b"), vec![0, 0, 0], vec![40, 50, 60]);
+
+    // Combine the per-shard digests, as the cross-shard merge does.
+    let spec = [StatSpec::ApproxPercentile("revenue", 0.5, 100)];
+    let mut a = aggregate_docs(&s1, 0..3, &spec).unwrap();
+    let b = aggregate_docs(&s2, 0..3, &spec).unwrap();
+    combine_stats(&mut a, &b, &spec);
+
+    // Combined {10,20,30,40,50,60}: median 35.
+    let p50 = a[0].finalize();
+    assert!((30..=40).contains(&p50), "merged p50 = {p50}");
 }
 
 #[test]

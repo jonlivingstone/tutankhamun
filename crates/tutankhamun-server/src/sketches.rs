@@ -6,6 +6,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::BuildHasherDefault;
 
 use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
+use tdigest::TDigest as TDigestImpl;
 
 /// A deterministic, fixed-seed hasher. Random per-instance seeds (e.g.
 /// `RandomState`) would make two shards' sketches hash the same value
@@ -59,5 +60,38 @@ impl Default for Hll {
             HyperLogLogPlus::<Vec<u8>, _>::new(Self::PRECISION, FixedHasher::default())
                 .expect("HLL precision 14 is in range"),
         )
+    }
+}
+
+/// A `t-digest` quantile sketch over `f64` values — the backing for
+/// `approx_percentile`. Mergeable across shards (centroids merge) and
+/// queried for any quantile at finalize. The crate's API is batch (build
+/// from a value buffer), not per-value, so accumulation collects values
+/// and constructs the digest once at the merge edge.
+#[derive(Clone, Debug)]
+pub struct TDigest(TDigestImpl);
+
+impl TDigest {
+    /// Centroids retained — the accuracy/size trade-off (~1 % quantile
+    /// error, tighter at the tails). Matches the crate's default.
+    pub const DEFAULT_MAX_SIZE: usize = 100;
+
+    /// Build a digest from a batch of values, keeping up to `max_size`
+    /// centroids.
+    #[must_use]
+    pub fn from_values(values: Vec<f64>, max_size: usize) -> Self {
+        TDigest(TDigestImpl::new_with_size(max_size).merge_unsorted(values))
+    }
+
+    /// Merge `other`'s centroids into `self`. `self`'s digest moves into
+    /// the merge (only `other` is borrowed, so it's cloned).
+    pub fn merge(&mut self, other: &TDigest) {
+        self.0 = TDigestImpl::merge_digests(vec![std::mem::take(&mut self.0), other.0.clone()]);
+    }
+
+    /// Estimate the value at quantile `q` (in `[0, 1]`).
+    #[must_use]
+    pub fn quantile(&self, q: f64) -> f64 {
+        self.0.estimate_quantile(q)
     }
 }

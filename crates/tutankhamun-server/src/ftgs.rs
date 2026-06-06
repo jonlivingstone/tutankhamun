@@ -36,12 +36,14 @@ use crate::bit_tree::BitTree;
 use crate::group_lookup::GroupLookup;
 use crate::runtime;
 use crate::shard::{FieldKind, Shard, decode_int_key, require_field, utf8_term};
-use crate::sketches::Hll;
+use crate::sketches::{Hll, TDigest};
 
 /// A stat the caller wants accumulated per group, named against the
-/// shard's columns. `Sum`/`Min`/`Max`/`Avg` read a `Metric`/`Int`
-/// forward column; `ApproxCountDistinct` reads a forward column too, or a
-/// `String` field's inverted-index terms; `Count` needs no column.
+/// shard's columns. `Sum`/`Min`/`Max`/`Avg`/`ApproxPercentile` read a
+/// `Metric`/`Int` forward column; `ApproxCountDistinct` reads a forward
+/// column too, or a `String` field's inverted-index terms; `Count` needs
+/// no column. `ApproxPercentile` also carries the quantile and the digest
+/// size.
 #[derive(Debug, Clone, Copy)]
 pub enum StatSpec<'a> {
     Count,
@@ -50,20 +52,24 @@ pub enum StatSpec<'a> {
     Max(&'a str),
     Avg(&'a str),
     ApproxCountDistinct(&'a str),
+    ApproxPercentile(&'a str, f64, usize),
 }
 
 impl StatSpec<'_> {
     /// Merge two scalar stat values for the same `(field, term, group)`:
-    /// additive stats sum, `Min`/`Max` fold. The non-scalar stats
-    /// (`Avg`'s `(sum, count)`, `ApproxCountDistinct`'s sketch) merge their
-    /// own accumulator instead — see [`combine_stats`] — so never reach here.
+    /// additive stats sum, `Min`/`Max` fold. The non-scalar stats (`Avg`'s
+    /// `(sum, count)`, `ApproxCountDistinct`'s HLL, `ApproxPercentile`'s
+    /// t-digest) merge their own accumulator instead — see
+    /// [`combine_stats`] — so never reach here.
     #[must_use]
     pub fn combine(self, a: i64, b: i64) -> i64 {
         match self {
             StatSpec::Count | StatSpec::Sum(_) => a + b,
             StatSpec::Min(_) => a.min(b),
             StatSpec::Max(_) => a.max(b),
-            StatSpec::Avg(_) | StatSpec::ApproxCountDistinct(_) => {
+            StatSpec::Avg(_)
+            | StatSpec::ApproxCountDistinct(_)
+            | StatSpec::ApproxPercentile(..) => {
                 unreachable!("non-scalar stat combines its own accumulator")
             }
         }
@@ -84,16 +90,25 @@ pub enum StatValue {
     Avg { sum: i64, count: i64 },
     /// `ApproxCountDistinct` — a `HyperLogLog`, finalized to an estimate.
     Hll(Hll),
+    /// `ApproxPercentile` — a `t-digest` plus the quantile to query at
+    /// finalize. Carried un-finalized so digests merge across shards.
+    TDigest { digest: TDigest, percentile: f64 },
 }
 
 impl StatValue {
     /// The `i64` result for a scalar/sketch stat. `Avg` finalizes to a
     /// `f64` instead — see [`avg_f64`](Self::avg_f64).
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn finalize(&self) -> i64 {
         match self {
             StatValue::Scalar(v) => *v,
             StatValue::Hll(h) => h.estimate(),
+            // `approx_percentile_cont` returns the column's (`Int64`) type,
+            // so the quantile rounds back to `i64`.
+            StatValue::TDigest { digest, percentile } => {
+                digest.quantile(*percentile).round() as i64
+            }
             StatValue::Avg { .. } => unreachable!("avg finalizes to f64, not i64"),
         }
     }
@@ -124,6 +139,9 @@ pub fn combine_stats(acc: &mut [StatValue], other: &[StatValue], specs: &[StatSp
                 *count += *c;
             }
             (StatValue::Hll(a), StatValue::Hll(b)) => a.merge(b),
+            (StatValue::TDigest { digest: a, .. }, StatValue::TDigest { digest: b, .. }) => {
+                a.merge(b);
+            }
             _ => unreachable!("stat variants match across shards (same specs)"),
         }
     }
@@ -183,6 +201,15 @@ enum Stat<'a> {
         terms: Vec<Box<[u8]>>,
         sketches: Vec<Hll>,
     },
+    /// `approx_percentile`: the `t-digest` crate builds from a batch, so
+    /// each group buffers its values and the digest is constructed at
+    /// `take_value`. `percentile`/`max_size` ride along to finalize.
+    ApproxPercentile {
+        col: &'a [i64],
+        percentile: f64,
+        max_size: usize,
+        buffers: Vec<Vec<f64>>,
+    },
 }
 
 impl<'a> Stat<'a> {
@@ -232,10 +259,17 @@ impl<'a> Stat<'a> {
                     }
                 }
             }
+            StatSpec::ApproxPercentile(name, percentile, max_size) => Stat::ApproxPercentile {
+                col: column(name)?,
+                percentile,
+                max_size,
+                buffers: vec![Vec::new(); num_groups],
+            },
         })
     }
 
     /// Fold `doc`'s value into `group`'s slot.
+    #[allow(clippy::cast_precision_loss)]
     fn update(&mut self, group: usize, doc: usize) {
         match self {
             Stat::Count { slots } => slots[group] += 1,
@@ -256,6 +290,7 @@ impl<'a> Stat<'a> {
                     sketches[group].insert_bytes(&terms[t as usize]);
                 }
             }
+            Stat::ApproxPercentile { col, buffers, .. } => buffers[group].push(col[doc] as f64),
         }
     }
 
@@ -282,6 +317,15 @@ impl<'a> Stat<'a> {
             Stat::Hll { sketches, .. } | Stat::HllBytes { sketches, .. } => {
                 StatValue::Hll(std::mem::take(&mut sketches[group]))
             }
+            Stat::ApproxPercentile {
+                percentile,
+                max_size,
+                buffers,
+                ..
+            } => StatValue::TDigest {
+                digest: TDigest::from_values(std::mem::take(&mut buffers[group]), *max_size),
+                percentile: *percentile,
+            },
         }
     }
 }

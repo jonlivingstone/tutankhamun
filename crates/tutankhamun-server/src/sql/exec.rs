@@ -843,7 +843,10 @@ fn reshape_global(
                 Some(st) => Some(st[s].finalize()),
                 None => match spec {
                     OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
-                    OwnedStat::Sum(_) | OwnedStat::Min(_) | OwnedStat::Max(_) => None,
+                    OwnedStat::Sum(_)
+                    | OwnedStat::Min(_)
+                    | OwnedStat::Max(_)
+                    | OwnedStat::ApproxPercentile(..) => None,
                     OwnedStat::Avg(_) => unreachable!("avg output is Float64"),
                 },
             };
