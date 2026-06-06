@@ -95,16 +95,18 @@ directly.
 
 ## Engine — group lookup
 
-- [ ] `GroupLookup` enum with backing variants — §2.5
-- [ ] `ConstantGroupLookup` — §2.5
-- [ ] `BitSetGroupLookup` — §2.5
-- [ ] `ByteGroupLookup` — §2.5
-- [ ] `U16GroupLookup` — §2.5
-- [ ] `U32GroupLookup` — §2.5
-- [ ] In-place upgrade between backings when cardinality crosses
+- [x] `GroupLookup` enum with backing variants — §2.5
+- [x] `ConstantGroupLookup` — §2.5
+- [x] `BitSetGroupLookup` — §2.5
+- [x] `ByteGroupLookup` — §2.5
+- [x] `U16GroupLookup` — §2.5
+- [x] `U32GroupLookup` — §2.5
+- [x] In-place upgrade between backings when cardinality crosses
       thresholds — §2.5
-- [ ] `next_group_callback(doc_ids, &mut BitTree)` dispatch — §2.5
+- [x] `next_group_callback(doc_ids, &mut BitTree)` dispatch — §2.5
 - [ ] Memory cost reporting to `SessionMemoryHandle` — §2.5
+      (`GroupLookup::memory_used()` exposed; wiring waits on §2.2's
+      `SessionMemoryHandle`)
 
 ## Engine — FTGS
 

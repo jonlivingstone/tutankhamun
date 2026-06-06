@@ -393,7 +393,7 @@ async fn time_field_presented_as_timestamp() {
     write_time_dataset(tmp.path());
     let (provider, _cache_dir) = provider_for(tmp.path()).await;
 
-    // The time field's Arrow type is Timestamp(Second), not Int64.
+    // The time field's Arrow type is Timestamp(Nanosecond), not Int64.
     let ts_field = provider
         .schema()
         .field_with_name("ts")
@@ -404,7 +404,7 @@ async fn time_field_presented_as_timestamp() {
             ts_field.data_type(),
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _)
         ),
-        "ts should be Timestamp(Second), got {:?}",
+        "ts should be Timestamp(Nanosecond), got {:?}",
         ts_field.data_type()
     );
 }
@@ -456,7 +456,7 @@ async fn select_time_field_returns_timestamps() {
             col.data_type(),
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, _)
         ),
-        "projected ts column should be Timestamp(Second)"
+        "projected ts column should be Timestamp(Nanosecond)"
     );
     let ts = col
         .as_any()

@@ -453,10 +453,9 @@ struct BucketBuilder {
     /// Name of the time column (the `--time` header). Stored as an
     /// `Int` field at finalize so per-doc time is range-filterable.
     time_name: String,
-    /// Parsed epoch-seconds time of each doc, in doc-id order.
+    /// Parsed epoch-seconds time of each doc, in doc-id order. The
+    /// shard's `(time_min, time_max)` is folded from this at finalize.
     time_values: Vec<i64>,
-    time_min: i64,
-    time_max: i64,
     doc_id: u32,
 }
 
@@ -482,15 +481,11 @@ impl BucketBuilder {
                 .collect(),
             time_name: time_name.to_string(),
             time_values: Vec::new(),
-            time_min: i64::MAX,
-            time_max: i64::MIN,
             doc_id: 0,
         }
     }
 
     fn push_row(&mut self, row: &csv::StringRecord, line: u64, t: i64) -> Result<()> {
-        self.time_min = self.time_min.min(t);
-        self.time_max = self.time_max.max(t);
         self.time_values.push(t);
 
         for col in &mut self.numeric {
@@ -532,11 +527,15 @@ impl BucketBuilder {
     fn finalize(self, output_dir: &Path) -> Result<u64> {
         // Buckets are only created on first push_row, so doc_id is
         // always >= 1 here. Catch a refactor that breaks that
-        // invariant before time_min/time_max (MAX/MIN) reach
-        // Metadata::validate.
+        // invariant before the (MAX, MIN) sentinel from an empty fold
+        // reaches Metadata::validate.
         debug_assert!(self.doc_id > 0, "finalize called on empty BucketBuilder");
         let num_docs = u64::from(self.doc_id);
-        let mut writer = DiskShardWriter::new(output_dir, (self.time_min, self.time_max))
+        let (time_min, time_max) = self
+            .time_values
+            .iter()
+            .fold((i64::MAX, i64::MIN), |(lo, hi), &t| (lo.min(t), hi.max(t)));
+        let mut writer = DiskShardWriter::new(output_dir, (time_min, time_max))
             .with_context(|| format!("create writer at {}", output_dir.display()))?;
         // The time column is stored as an Int field (forward column +
         // order-preserving index) so per-doc time-range filters push

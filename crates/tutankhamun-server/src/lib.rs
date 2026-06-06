@@ -2,8 +2,10 @@
 //!
 //! See `.docs/tutankhamun.md` for the design.
 
+pub mod bit_tree;
 pub mod cache;
 pub mod config;
+pub mod group_lookup;
 pub mod ingest;
 pub mod ops_http;
 pub mod runtime;

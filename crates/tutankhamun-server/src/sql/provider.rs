@@ -131,7 +131,7 @@ fn arrow_schema_from_metadata(metadata: &Metadata) -> SchemaRef {
     // Every declared field is exposed to DataFusion: Metric/Int as
     // Int64 (read from forward columns), String as Utf8
     // (reconstructed per doc from the inverted index at scan time),
-    // and the time field as Timestamp(Second) so SQL can filter it
+    // and the time field as Timestamp(Nanosecond) so SQL can filter it
     // with date/timestamp literals. The time field is itself an Int
     // field on disk (epoch seconds); only its presentation type
     // differs. String reconstruction is O(num_docs) per shard per
