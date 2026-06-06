@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use arrow::array::Array;
 use datafusion::catalog::TableProvider;
 use datafusion::prelude::SessionContext;
 use roaring::RoaringBitmap;
@@ -597,8 +598,35 @@ async fn group_by_int_with_exact_where_filter() {
     assert_eq!(rows, vec![vec![1, 400], vec![3, 500]]);
 }
 
+/// Result rows of a `String`-grouped query as `(group, stats)`, with a
+/// NULL group key as `None`.
+fn string_keyed_rows(batches: &[arrow::array::RecordBatch]) -> Vec<(Option<String>, Vec<i64>)> {
+    batches
+        .iter()
+        .flat_map(|b| {
+            let keys = b
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            let cols: Vec<&arrow::array::Int64Array> = (1..b.num_columns())
+                .map(|i| {
+                    b.column(i)
+                        .as_any()
+                        .downcast_ref::<arrow::array::Int64Array>()
+                        .unwrap()
+                })
+                .collect();
+            (0..b.num_rows()).map(move |r| {
+                let key = (!keys.is_null(r)).then(|| keys.value(r).to_string());
+                (key, cols.iter().map(|c| c.value(r)).collect())
+            })
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn group_by_string_falls_back_to_datafusion() {
+async fn group_by_string_pushes_down_no_null_group_when_dense() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     write_two_shard_dataset(tmp.path());
     let (provider, _cache_dir) = provider_for(tmp.path()).await;
@@ -606,28 +634,64 @@ async fn group_by_string_falls_back_to_datafusion() {
     let ctx = super::session_context();
     ctx.register_table("trips", Arc::new(provider)).unwrap();
 
-    // String group column: not pushed (NULL-group risk) — DataFusion
-    // aggregates the row scan, still correctly.
+    // Every doc carries a country term, so the string GROUP BY pushes
+    // down and emits no NULL row.
     let sql = "SELECT country, count(*) AS n FROM trips GROUP BY country ORDER BY country";
-    assert!(
-        !physical_plan(&ctx, sql).await.contains("FtgsAggExec"),
-        "string GROUP BY must not push down"
-    );
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
 
-    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
-    let countries = batches[0]
-        .column(0)
-        .as_any()
-        .downcast_ref::<arrow::array::StringArray>()
-        .unwrap();
-    let counts = batches[0]
-        .column(1)
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .unwrap();
-    // de: A{1,3}, B{1} = 3; us: A{0,2}, B{0} = 3.
-    assert_eq!((countries.value(0), counts.value(0)), ("de", 3));
-    assert_eq!((countries.value(1), counts.value(1)), ("us", 3));
+    let rows = string_keyed_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    // de: A{1,3}, B{1} = 3; us: A{0,2}, B{0} = 3. No NULL group.
+    assert_eq!(
+        rows,
+        vec![
+            (Some("de".to_string()), vec![3]),
+            (Some("us".to_string()), vec![3]),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_string_emits_null_group_for_no_term_docs() {
+    // 3 docs, fare [10, 20, 30]; only doc 0 has a country term ("us").
+    // docs 1 and 2 carry no country → SQL NULL group.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let shard = tmp.path().join("s");
+    let mut w = DiskShardWriter::new(&shard, (0, 0)).expect("new");
+    w.add_metric("fare", vec![10, 20, 30]).expect("fare");
+    let mut country = BTreeMap::new();
+    country.insert("us".to_string(), bitmap([0]));
+    w.add_string_field("country", country).expect("country");
+    w.finalize().expect("finalize");
+
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT country, sum(fare), count(*) FROM trips GROUP BY country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let rows = string_keyed_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    // us: doc 0 → sum 10, count 1. NULL: docs {1,2} → sum 50, count 2.
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&(Some("us".to_string()), vec![10, 1])));
+    assert!(rows.contains(&(None, vec![50, 2])));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_string_with_where_filter() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // vendor_id = 1 → docs A{0,2}, both country "us", fare 100 + 300.
+    let sql = "SELECT country, sum(fare) FROM trips WHERE vendor_id = 1 GROUP BY country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    let rows = string_keyed_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![(Some("us".to_string()), vec![400])]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

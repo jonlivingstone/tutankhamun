@@ -12,9 +12,10 @@
 //! scan, so the pushdown can never change a result, only skip the
 //! optimization.
 //!
-//! `Int` grouping only, by design: `Int`/`Metric` forward columns are
-//! dense, so an `Int` group column has no NULL group. A sparse `String`
-//! column would need an explicit NULL-group pass.
+//! A single `Int` or `String` grouping column. `Int`/`Metric` forward
+//! columns are dense, so an `Int` group has no NULL group; a `String`
+//! column can be sparse, so [`FtgsAggExec`] adds a NULL-group pass that
+//! aggregates the docs with no term into a NULL-keyed row.
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -213,12 +214,16 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
         return Ok(None);
     };
 
-    // Exactly one grouping column, of `Int` kind (dense → no NULL group).
+    // Exactly one grouping column, filterable (`String` or `Int`, i.e.
+    // carries an inverted index whose terms drive the cursor).
     let [Expr::Column(col)] = agg.group_expr.as_slice() else {
         return Ok(None);
     };
     let group_col = col.name.clone();
-    if prov.field_kind(&group_col) != Some(FieldKind::Int) {
+    if !matches!(
+        prov.field_kind(&group_col),
+        Some(FieldKind::String | FieldKind::Int)
+    ) {
         return Ok(None);
     }
 

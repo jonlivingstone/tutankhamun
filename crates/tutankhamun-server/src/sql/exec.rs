@@ -27,12 +27,16 @@ use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
 };
 
+use roaring::RoaringBitmap;
+
 use super::group_by::OwnedStat;
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::cache::Cache;
-use crate::ftgs::{FtgsRow, StatSpec, ftgs_scan_merge};
+use crate::ftgs::{FtgsRow, StatSpec, aggregate_docs, combine_stats, ftgs_scan_merge, render_term};
 use crate::group_lookup::GroupLookup;
-use crate::shard::{DiskShard, FilterClause, FilterResult, Shard, decode_int_key, matched_doc_set};
+use crate::shard::{
+    DiskShard, FieldKind, FilterClause, FilterResult, Shard, decode_int_key, matched_doc_set,
+};
 use crate::shard_source::{ObjectStoreShardSource, ShardSource};
 use crate::storage::StorageRegistry;
 
@@ -479,17 +483,30 @@ async fn aggregate_batch(
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
     let shards = fetch_selected_shards(url, cache, filters).await?;
+    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
+
+    // A `String` group column can be sparse: filtered docs with no term
+    // for it form the SQL NULL group. `Int` columns are dense, so they
+    // never have one — skip the extra pass entirely.
+    let group_is_string = matches!(schema.field(0).data_type(), DataType::Utf8);
 
     // Per shard, a group lookup placing WHERE-matching docs in group 1
     // and the rest in group 0 (which FTGS skips). An empty selection
-    // contributes no shard.
+    // contributes no shard. For a `String` column we also aggregate the
+    // no-term docs into a NULL group, combined across shards.
     let mut pairs: Vec<(&DiskShard, GroupLookup)> = Vec::with_capacity(shards.len());
+    let mut null_stats: Option<Vec<i64>> = None;
     for (shard, selection) in &shards {
         let num_docs = usize::try_from(shard.num_docs())?;
-        let groups = match selection {
+        let filtered: Option<&RoaringBitmap> = match selection {
             FilterResult::Empty => continue,
-            FilterResult::All => GroupLookup::all_in_one_group(num_docs),
-            FilterResult::Bitmap(bm) => {
+            FilterResult::All => None,
+            FilterResult::Bitmap(bm) => Some(bm),
+        };
+
+        let groups = match filtered {
+            None => GroupLookup::all_in_one_group(num_docs),
+            Some(bm) => {
                 let mut g = GroupLookup::constant(num_docs, 0);
                 for doc in bm {
                     g.set(doc as usize, 1);
@@ -497,32 +514,91 @@ async fn aggregate_batch(
                 g
             }
         };
+
+        if group_is_string {
+            let covered = covered_docs(shard, group_col);
+            let null_docs = match filtered {
+                None => {
+                    let mut all = RoaringBitmap::new();
+                    all.insert_range(0..u32::try_from(num_docs)?);
+                    all - covered
+                }
+                Some(bm) => bm.clone() - covered,
+            };
+            if !null_docs.is_empty() {
+                let shard_null = aggregate_docs(shard, null_docs.iter(), &stat_specs)?;
+                match null_stats.as_mut() {
+                    Some(acc) => combine_stats(acc, &shard_null, &stat_specs),
+                    None => null_stats = Some(shard_null),
+                }
+            }
+        }
+
         pairs.push((shard, groups));
     }
 
-    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
     let refs: Vec<(&dyn Shard, &GroupLookup)> =
         pairs.iter().map(|(s, g)| (*s as &dyn Shard, g)).collect();
     let rows = ftgs_scan_merge(&refs, &[group_col], &stat_specs)?;
-    reshape_aggregate(&rows, stats.len(), schema)
+    reshape_aggregate(&rows, stats.len(), schema, null_stats.as_deref())
 }
 
-/// Turn merged FTGS rows into one record batch: column 0 is the `Int`
-/// group value decoded from the raw term key, columns 1.. are the stats
-/// in `StatSpec` order. All output columns are `Int64`.
+/// Union of all of `col`'s postings in `shard` — the docs that carry
+/// some term for it. Docs absent from this set have no value, i.e. the
+/// SQL NULL group.
+fn covered_docs(shard: &dyn Shard, col: &str) -> RoaringBitmap {
+    let mut covered = RoaringBitmap::new();
+    if let Some(index) = shard.inverted_index(col) {
+        for (_term, bitmap) in index.range_bytes(None, None) {
+            covered |= bitmap;
+        }
+    }
+    covered
+}
+
+/// Turn merged FTGS rows into one record batch: column 0 is the group
+/// value (an `Int` decoded from the raw term key → `Int64`, or a
+/// `String` term → `Utf8`), columns 1.. are the i64 stats in `StatSpec`
+/// order. `null_stats` (only ever `Some` for a `String` group) appends a
+/// trailing NULL-keyed row.
 fn reshape_aggregate(
     rows: &[FtgsRow],
     num_stats: usize,
     schema: &SchemaRef,
+    null_stats: Option<&[i64]>,
 ) -> anyhow::Result<RecordBatch> {
+    let num_rows = rows.len() + usize::from(null_stats.is_some());
+
+    let group: ArrayRef = match schema.field(0).data_type() {
+        DataType::Utf8 => {
+            let mut terms: Vec<Option<String>> = rows
+                .iter()
+                .map(|r| Some(render_term(FieldKind::String, &r.term)))
+                .collect();
+            if null_stats.is_some() {
+                terms.push(None);
+            }
+            Arc::new(StringArray::from(terms))
+        }
+        // `Int` group: dense, so never a NULL row.
+        _ => Arc::new(Int64Array::from(
+            rows.iter()
+                .map(|r| decode_int_key(&r.term))
+                .collect::<Vec<_>>(),
+        )),
+    };
+
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(1 + num_stats);
-    let group: Vec<i64> = rows.iter().map(|r| decode_int_key(&r.term)).collect();
-    arrays.push(Arc::new(Int64Array::from(group)));
+    arrays.push(group);
     for s in 0..num_stats {
-        let col: Vec<i64> = rows.iter().map(|r| r.stats[s]).collect();
+        let mut col: Vec<i64> = rows.iter().map(|r| r.stats[s]).collect();
+        if let Some(ns) = null_stats {
+            col.push(ns[s]);
+        }
         arrays.push(Arc::new(Int64Array::from(col)));
     }
-    let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+
+    let options = RecordBatchOptions::new().with_row_count(Some(num_rows));
     Ok(RecordBatch::try_new_with_options(
         Arc::clone(schema),
         arrays,

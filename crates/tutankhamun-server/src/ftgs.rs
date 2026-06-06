@@ -64,6 +64,15 @@ impl StatSpec<'_> {
     }
 }
 
+/// Combine `other`'s stats into `acc` in place — the per-column
+/// [`StatSpec::combine`] applied across two finalized stat rows. The
+/// cross-shard merge of any two groups' stats.
+pub fn combine_stats(acc: &mut [i64], other: &[i64], specs: &[StatSpec]) {
+    for (i, &b) in other.iter().enumerate() {
+        acc[i] = specs[i].combine(acc[i], b);
+    }
+}
+
 /// One output row: the requested stats for a single `(field, term,
 /// group)`. `term` is the raw order-preserving FST key — the canonical
 /// sort order the merge compares by; render it for display with
@@ -232,6 +241,28 @@ pub fn ftgs_scan(
     Ok(rows)
 }
 
+/// Aggregate a single set of docs as one group, returning one finalized
+/// value per [`StatSpec`]. Used for groups the term cursor doesn't
+/// emit — e.g. the SQL NULL group: docs with no term for a group-by
+/// column. `docs` must be valid indices into the shard's forward
+/// columns.
+pub fn aggregate_docs(
+    shard: &dyn Shard,
+    docs: impl Iterator<Item = u32>,
+    stats: &[StatSpec],
+) -> Result<Vec<i64>> {
+    let mut accumulators: Vec<Stat> = stats
+        .iter()
+        .map(|spec| Stat::new(*spec, shard, 1))
+        .collect::<Result<_>>()?;
+    for doc in docs {
+        for stat in &mut accumulators {
+            stat.update(0, doc as usize);
+        }
+    }
+    Ok(accumulators.iter().map(|s| s.value(0)).collect())
+}
+
 /// Render a raw FST key ([`FtgsRow::term`]) as its display term: `Int`
 /// keys are the order-preserving 8-byte encoding, everything else a
 /// UTF-8 string. The caller supplies the field's `FieldKind` (held by
@@ -325,9 +356,7 @@ pub fn merge_ftgs(
             Some(last)
                 if last.field == row.field && last.term == row.term && last.group == row.group =>
             {
-                for (s, spec) in stats.iter().enumerate() {
-                    last.stats[s] = spec.combine(last.stats[s], row.stats[s]);
-                }
+                combine_stats(&mut last.stats, &row.stats, stats);
             }
             _ => out.push(row),
         }
