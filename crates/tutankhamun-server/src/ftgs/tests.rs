@@ -11,6 +11,13 @@ use super::{
 use crate::group_lookup::GroupLookup;
 use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
 
+/// Finalize a scalar stat to its `i64` output — panics via
+/// [`Finalized::int`](super::Finalized::int) if it isn't an `Int`-kind stat,
+/// which the scalar tests never produce.
+fn fin_int(v: &StatValue) -> i64 {
+    v.finalize().int()
+}
+
 /// Postings map from a doc→term assignment given in doc-id order.
 fn postings(terms: &[&str]) -> BTreeMap<String, RoaringBitmap> {
     let mut map: BTreeMap<String, RoaringBitmap> = BTreeMap::new();
@@ -92,7 +99,7 @@ fn rendered(rows: &[FtgsRow]) -> Vec<(String, String, u32, Vec<i64>)> {
                 r.field.clone(),
                 render_term(kind_of(&r.field), &r.term),
                 r.group,
-                r.stats.iter().map(StatValue::finalize).collect(),
+                r.stats.iter().map(fin_int).collect(),
             )
         })
         .collect()
@@ -153,7 +160,7 @@ fn aggregate_docs_grouped_buckets_by_group() {
         aggregate_docs_grouped(&shard, 0..5, &groups_5(), &[StatSpec::Sum("revenue")]).unwrap();
     let finalized: Vec<(u32, Vec<i64>)> = out
         .iter()
-        .map(|(&g, st)| (g, st.iter().map(StatValue::finalize).collect()))
+        .map(|(&g, st)| (g, st.iter().map(fin_int).collect()))
         .collect();
     // group 1 = {0,1,4} = 10+20+50 = 80; group 2 = {2,3} = 30+40 = 70.
     assert_eq!(finalized, vec![(1, vec![80]), (2, vec![70])]);
@@ -166,7 +173,7 @@ fn approx_percentile_estimates_quantile() {
     // at this size, so within a tight band).
     let spec = [StatSpec::ApproxPercentile("revenue", 0.5, 100)];
     let out = aggregate_docs(&shard, 0..5, &spec).unwrap();
-    let p50 = out[0].finalize();
+    let p50 = fin_int(&out[0]);
     assert!((25..=35).contains(&p50), "p50 = {p50}");
 }
 
@@ -183,7 +190,7 @@ fn approx_percentile_merges_across_shards() {
     combine_stats(&mut a, &b, &spec);
 
     // Combined {10,20,30,40,50,60}: median 35.
-    let p50 = a[0].finalize();
+    let p50 = fin_int(&a[0]);
     assert!((30..=40).contains(&p50), "merged p50 = {p50}");
 }
 
@@ -287,7 +294,7 @@ fn count_min_max_operators() {
             .unwrap()
             .stats
             .iter()
-            .map(StatValue::finalize)
+            .map(fin_int)
             .collect::<Vec<i64>>()
     };
 

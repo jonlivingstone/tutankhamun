@@ -46,7 +46,7 @@ use super::exec::FtgsAggExec;
 use super::provider::TutankhamunTableProvider;
 use super::pushdown::{PushedFilter, expr_to_pushed_filter};
 use crate::cache::Cache;
-use crate::ftgs::StatSpec;
+use crate::ftgs::{OutputKind, StatSpec};
 use crate::shard::FieldKind;
 use crate::sketches::TDigest;
 
@@ -109,6 +109,11 @@ impl OwnedStat {
             OwnedStat::TopK(c, k, capacity) => StatSpec::TopK(c, *k, *capacity),
             OwnedStat::Theta(c, nominal) => StatSpec::Theta(c, *nominal),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn output_kind(&self) -> OutputKind {
+        self.as_spec().output_kind()
     }
 }
 

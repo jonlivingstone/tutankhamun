@@ -60,7 +60,42 @@ pub enum StatSpec<'a> {
     Theta(&'a str, usize),
 }
 
+/// Which Arrow column a stat reshapes into. The single source of truth for
+/// output-column dispatch — derived from the stat itself, not from the
+/// schema dtype (where `Float64` only means `Avg` by convention, and a
+/// future second `Float64`/`List`/`Binary` stat would misroute). Written
+/// exhaustively so a new [`StatSpec`] variant fails to compile here until
+/// it is classified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputKind {
+    /// `Count`/`Sum`/`Min`/`Max`/`ApproxCountDistinct`/`ApproxPercentile`
+    /// — `Int64` (or `UInt64` for the HLL cardinality).
+    Int,
+    /// `Avg` — `Float64`.
+    Float,
+    /// `approx_top_k` — `List<Struct<value, count>>`.
+    TopK,
+    /// `theta` — `Binary`.
+    Theta,
+}
+
 impl StatSpec<'_> {
+    /// The output column kind for this stat — see [`OutputKind`].
+    #[must_use]
+    pub fn output_kind(self) -> OutputKind {
+        match self {
+            StatSpec::Count
+            | StatSpec::Sum(_)
+            | StatSpec::Min(_)
+            | StatSpec::Max(_)
+            | StatSpec::ApproxCountDistinct(_)
+            | StatSpec::ApproxPercentile(..) => OutputKind::Int,
+            StatSpec::Avg(_) => OutputKind::Float,
+            StatSpec::TopK(..) => OutputKind::TopK,
+            StatSpec::Theta(..) => OutputKind::Theta,
+        }
+    }
+
     /// Merge two scalar stat values for the same `(field, term, group)`:
     /// additive stats sum, `Min`/`Max` fold. The non-scalar stats (`Avg`'s
     /// `(sum, count)`, `ApproxCountDistinct`'s HLL, `ApproxPercentile`'s
@@ -86,7 +121,7 @@ impl StatSpec<'_> {
 /// A stat's per-group accumulator value, carried through the cross-shard
 /// merge un-finalized so mergeable sketches can be unioned (you can't
 /// combine two finalized cardinalities). [`finalize`](Self::finalize)
-/// produces the output `i64`.
+/// produces the typed output ([`Finalized`]).
 #[derive(Debug, Clone)]
 pub enum StatValue {
     /// `Count`/`Sum`/`Min`/`Max` — the value is already the result.
@@ -123,35 +158,84 @@ fn top_k_sorted(map: HashMap<Box<[u8]>, i64>, n: usize) -> Vec<(Box<[u8]>, i64)>
     entries
 }
 
-impl StatValue {
-    /// The `i64` result for a scalar/sketch stat. `Avg` finalizes to a
-    /// `f64` instead — see [`avg_f64`](Self::avg_f64).
+/// The finalized output of a stat, typed by output kind. Borrows the large
+/// variants (`TopK` items, `Theta` sketch) from `&self` to stay zero-copy —
+/// they feed straight into the Arrow column builders. The variant a column
+/// yields is fixed by its [`StatSpec::output_kind`]. All fields are `Copy`
+/// (scalars and borrows), so the enum is too.
+#[derive(Debug, Clone, Copy)]
+pub enum Finalized<'a> {
+    /// `Count`/`Sum`/`Min`/`Max`, the HLL estimate, or the rounded
+    /// percentile.
+    Int(i64),
+    /// `Avg`'s `sum / count` quotient.
+    Float(f64),
+    /// `approx_top_k`'s `(value-key bytes, count)` slice, already truncated
+    /// to `k`.
+    TopK(&'a [(Box<[u8]>, i64)]),
+    /// `theta`'s KMV sketch.
+    Theta(&'a ThetaSketch),
+}
+
+impl<'a> Finalized<'a> {
+    /// Pull the one variant the column's [`OutputKind`] guarantees. The kind
+    /// and the value both derive from the same `StatSpec`, so the other arms
+    /// are unreachable — a tight, local invariant at each reshape dispatch
+    /// arm (and a clear panic if a test ever violates it).
     #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn finalize(&self) -> i64 {
+    pub fn int(self) -> i64 {
         match self {
-            StatValue::Scalar(v) => *v,
-            StatValue::Hll(h) => h.estimate(),
-            // `approx_percentile_cont` returns the column's (`Int64`) type,
-            // so the quantile rounds back to `i64`.
-            StatValue::TDigest { digest, percentile } => {
-                digest.quantile(*percentile).round() as i64
-            }
-            StatValue::Avg { .. } => unreachable!("avg finalizes to f64, not i64"),
-            StatValue::TopK { .. } => unreachable!("top-k reshapes to a list, not i64"),
-            StatValue::Theta(_) => unreachable!("theta reshapes to Binary, not i64"),
+            Finalized::Int(v) => v,
+            _ => unreachable!("an Int column holds only Int-kind stats"),
         }
     }
 
-    /// The `f64` result for an `Avg` stat (`sum / count`). The caller
-    /// reaches this only for a `Float64` output column, where `count >= 1`
-    /// by construction (a group exists because it has a doc).
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
-    pub fn avg_f64(&self) -> f64 {
+    pub fn float(self) -> f64 {
         match self {
-            StatValue::Avg { sum, count } => *sum as f64 / *count as f64,
-            _ => unreachable!("avg_f64 on a non-avg stat"),
+            Finalized::Float(v) => v,
+            _ => unreachable!("a Float64 column is an avg stat"),
+        }
+    }
+
+    #[must_use]
+    pub fn topk(self) -> &'a [(Box<[u8]>, i64)] {
+        match self {
+            Finalized::TopK(items) => items,
+            _ => unreachable!("a List column is an approx_top_k stat"),
+        }
+    }
+
+    #[must_use]
+    pub fn theta(self) -> &'a ThetaSketch {
+        match self {
+            Finalized::Theta(s) => s,
+            _ => unreachable!("a Binary column is a theta stat"),
+        }
+    }
+}
+
+impl StatValue {
+    /// Finalize this accumulator into its typed output — see [`Finalized`].
+    /// Exhaustive over every variant; the reshape selects a column builder by
+    /// the stat's [`OutputKind`](StatSpec::output_kind), then pulls the
+    /// matching variant from the result.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+    pub fn finalize(&self) -> Finalized<'_> {
+        match self {
+            StatValue::Scalar(v) => Finalized::Int(*v),
+            StatValue::Hll(h) => Finalized::Int(h.estimate()),
+            // `approx_percentile_cont` returns the column's (`Int64`) type,
+            // so the quantile rounds back to `i64`.
+            StatValue::TDigest { digest, percentile } => {
+                Finalized::Int(digest.quantile(*percentile).round() as i64)
+            }
+            // `count >= 1` by construction (a group exists because it has a
+            // doc), so the quotient is well-defined.
+            StatValue::Avg { sum, count } => Finalized::Float(*sum as f64 / *count as f64),
+            StatValue::TopK { items, k, .. } => Finalized::TopK(&items[..(*k).min(items.len())]),
+            StatValue::Theta(s) => Finalized::Theta(s),
         }
     }
 }

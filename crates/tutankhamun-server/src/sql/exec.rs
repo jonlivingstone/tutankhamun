@@ -36,8 +36,8 @@ use super::group_by::OwnedStat;
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::cache::Cache;
 use crate::ftgs::{
-    FtgsRow, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats,
-    ftgs_scan_merge, render_term, term_map,
+    FtgsRow, OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped,
+    combine_stats, ftgs_scan_merge, render_term, term_map,
 };
 use crate::group_lookup::GroupLookup;
 use crate::shard::{
@@ -505,7 +505,7 @@ async fn aggregate_batch(
             schema,
         )
     } else {
-        aggregate_grouped(&shards, group_cols, &stat_specs, stats.len(), schema)
+        aggregate_grouped(&shards, group_cols, &stat_specs, schema)
     }
 }
 
@@ -517,7 +517,6 @@ fn aggregate_grouped(
     shards: &[(DiskShard, FilterResult)],
     group_cols: &[String],
     stat_specs: &[StatSpec],
-    num_stats: usize,
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
     let (cursor, prefix) = group_cols
@@ -609,7 +608,7 @@ fn aggregate_grouped(
     reshape_aggregate(
         &rows,
         prefix.len(),
-        num_stats,
+        stat_specs,
         schema,
         &combo.inverse,
         &null_stats,
@@ -715,7 +714,7 @@ fn covered_docs(shard: &dyn Shard, col: &str) -> RoaringBitmap {
 fn reshape_aggregate(
     rows: &[FtgsRow],
     num_prefix: usize,
-    num_stats: usize,
+    specs: &[StatSpec],
     schema: &SchemaRef,
     inverse: &[Vec<Option<Box<[u8]>>>],
     null_stats: &BTreeMap<u32, Vec<StatValue>>,
@@ -742,7 +741,7 @@ fn reshape_aggregate(
         .collect();
 
     let num_group_cols = num_prefix + 1;
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + num_stats);
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + specs.len());
 
     // Group columns: prefix j from `inverse[group - 1][j]`, the cursor
     // (last group column) from the row's own term. `j` indexes the schema,
@@ -762,23 +761,34 @@ fn reshape_aggregate(
         arrays.push(group_column(schema.field(j).data_type(), &values));
     }
 
-    // Stat columns follow the group columns.
-    for s in 0..num_stats {
+    // Stat columns follow the group columns. The output column is keyed by
+    // the stat's own [`OutputKind`], not the Arrow dtype — `dtype` only
+    // supplies the concrete array type the builder fills (Int64 vs UInt64,
+    // or the `List` item field for top-k).
+    for (s, spec) in specs.iter().enumerate() {
         let dtype = schema.field(num_group_cols + s).data_type();
-        let array = match dtype {
-            DataType::Float64 => {
-                float_array(out.iter().map(|o| Some(o.stats[s].avg_f64())).collect())
-            }
-            DataType::List(item) => {
-                topk_list_array(item, out.iter().map(|o| topk_slice(&o.stats[s])))?
-            }
-            DataType::Binary => {
-                theta_binary_array(out.iter().map(|o| Some(theta_sketch(&o.stats[s]))))
-            }
-            _ => stat_array(
+        let array = match spec.output_kind() {
+            // `stat_array` validates `dtype` (Int64/UInt64) itself.
+            OutputKind::Int => stat_array(
                 dtype,
-                out.iter().map(|o| Some(o.stats[s].finalize())).collect(),
+                out.iter()
+                    .map(|o| Some(o.stats[s].finalize().int()))
+                    .collect(),
             )?,
+            OutputKind::Float => float_array(
+                out.iter()
+                    .map(|o| Some(o.stats[s].finalize().float()))
+                    .collect(),
+            ),
+            OutputKind::TopK => {
+                let DataType::List(item) = dtype else {
+                    anyhow::bail!("approx_top_k output column is not a List, got {dtype:?}");
+                };
+                topk_list_array(item, out.iter().map(|o| o.stats[s].finalize().topk()))?
+            }
+            OutputKind::Theta => {
+                theta_binary_array(out.iter().map(|o| Some(o.stats[s].finalize().theta())))
+            }
         };
         arrays.push(array);
     }
@@ -809,15 +819,6 @@ fn group_column(dtype: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {
                 .map(|v| v.map(decode_int_key))
                 .collect::<Vec<Option<i64>>>(),
         )),
-    }
-}
-
-/// The top-`k` `(value-key bytes, count)` slice of a `TopK` stat value
-/// (its `items` are already top-`capacity`, count-descending).
-fn topk_slice(stat: &StatValue) -> &[(Box<[u8]>, i64)] {
-    match stat {
-        StatValue::TopK { items, k, .. } => &items[..(*k).min(items.len())],
-        _ => unreachable!("a List column is an approx_top_k stat"),
     }
 }
 
@@ -876,14 +877,6 @@ fn topk_list_array<'a>(
     )))
 }
 
-/// The `ThetaSketch` of a `Theta` stat value (a `Binary` column).
-fn theta_sketch(stat: &StatValue) -> &ThetaSketch {
-    match stat {
-        StatValue::Theta(s) => s,
-        _ => unreachable!("a Binary column is a theta stat"),
-    }
-}
-
 /// Build the `Binary` column (`theta`'s output) from each row's sketch,
 /// `None` → SQL NULL.
 fn theta_binary_array<'a>(rows: impl Iterator<Item = Option<&'a ThetaSketch>>) -> ArrayRef {
@@ -929,35 +922,34 @@ fn reshape_global(
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(owned.len());
     for (s, spec) in owned.iter().enumerate() {
         let dtype = schema.field(s).data_type();
-        let array = match dtype {
-            // `AVG`: present → sum/count; empty input → NULL.
-            DataType::Float64 => float_array(vec![stats.map(|st| st[s].avg_f64())]),
-            // `approx_top_k`: one row holding the top-k list (or an empty
-            // list when there was no input).
-            DataType::List(item) => {
-                let empty: &[(Box<[u8]>, i64)] = &[];
-                let row = stats.map_or(empty, |st| topk_slice(&st[s]));
-                topk_list_array(item, std::iter::once(row))?
-            }
-            // `theta`: one Binary sketch, or NULL when there was no input.
-            DataType::Binary => {
-                theta_binary_array(std::iter::once(stats.map(|st| theta_sketch(&st[s]))))
-            }
-            _ => {
+        let array = match spec.output_kind() {
+            OutputKind::Int => {
                 let value = match stats {
-                    Some(st) => Some(st[s].finalize()),
+                    Some(st) => Some(st[s].finalize().int()),
+                    // Empty input: `0` for the counts, SQL NULL for the rest
+                    // (`Sum`/`Min`/`Max`/`ApproxPercentile`).
                     None => match spec {
                         OwnedStat::Count | OwnedStat::ApproxCountDistinct(_) => Some(0),
-                        OwnedStat::Sum(_)
-                        | OwnedStat::Min(_)
-                        | OwnedStat::Max(_)
-                        | OwnedStat::ApproxPercentile(..) => None,
-                        OwnedStat::Avg(_) => unreachable!("avg output is Float64"),
-                        OwnedStat::TopK(..) => unreachable!("top-k output is a List"),
-                        OwnedStat::Theta(..) => unreachable!("theta output is Binary"),
+                        _ => None,
                     },
                 };
                 stat_array(dtype, vec![value])?
+            }
+            // `AVG`: present → sum/count; empty input → NULL.
+            OutputKind::Float => float_array(vec![stats.map(|st| st[s].finalize().float())]),
+            // `approx_top_k`: one row holding the top-k list (or an empty
+            // list when there was no input).
+            OutputKind::TopK => {
+                let DataType::List(item) = dtype else {
+                    anyhow::bail!("approx_top_k output column is not a List, got {dtype:?}");
+                };
+                let empty: &[(Box<[u8]>, i64)] = &[];
+                let row = stats.map_or(empty, |st| st[s].finalize().topk());
+                topk_list_array(item, std::iter::once(row))?
+            }
+            // `theta`: one Binary sketch, or NULL when there was no input.
+            OutputKind::Theta => {
+                theta_binary_array(std::iter::once(stats.map(|st| st[s].finalize().theta())))
             }
         };
         arrays.push(array);
