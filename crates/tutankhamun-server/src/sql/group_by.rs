@@ -42,7 +42,7 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 
-use super::exec::FtgsAggExec;
+use super::ftgs_agg::FtgsAggExec;
 use super::provider::TutankhamunTableProvider;
 use super::pushdown::{PushedFilter, expr_to_pushed_filter};
 use crate::cache::Cache;

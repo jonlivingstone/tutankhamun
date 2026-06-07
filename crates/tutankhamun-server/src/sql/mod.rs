@@ -19,6 +19,7 @@
 
 pub mod approx_top_k;
 pub mod exec;
+pub mod ftgs_agg;
 pub mod group_by;
 pub mod provider;
 pub mod pushdown;
