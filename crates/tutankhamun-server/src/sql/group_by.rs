@@ -39,7 +39,7 @@ use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, PhysicalPlanner};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::scalar::ScalarValue;
 
 use super::exec::FtgsAggExec;
@@ -55,7 +55,15 @@ use crate::sketches::TDigest;
 /// rule doesn't rewrite.
 #[must_use]
 pub fn session_context() -> SessionContext {
+    session_context_with(SessionConfig::new())
+}
+
+/// [`session_context`] built over a caller-supplied [`SessionConfig`] — lets
+/// callers (and tests) tune knobs like `batch_size`.
+#[must_use]
+pub fn session_context_with(config: SessionConfig) -> SessionContext {
     let state = SessionStateBuilder::new()
+        .with_config(config)
         .with_default_features()
         .with_optimizer_rule(Arc::new(FtgsAggregatePushdown))
         .with_query_planner(Arc::new(FtgsQueryPlanner))

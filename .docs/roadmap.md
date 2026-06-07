@@ -128,8 +128,13 @@ directly.
 - [x] `GSVector`-equivalent two-level bitmap for merge — §2.6
       (row-per-`(field,term,group)` granularity + `BitTree` make a
       separate merge-time group bitmap unnecessary)
-- [ ] Arrow record-batch output (1024 / 4096 row default
+- [x] Arrow record-batch output (1024 / 4096 row default
       batching) — §2.6
+      (both SQL exec nodes — `FtgsAggExec` and `TutankhamunExec` — chunk
+      their output to the session's configured `batch_size` via a zero-copy
+      `chunk_batch` over `RecordBatch::slice`, honoring DataFusion's own knob
+      rather than a fixed cap; the native/Flight path will set its own default
+      when built)
 - [ ] Same merge code reused at client layer (cross-daemon) — §2.6
       (`merge_ftgs` is already the shared primitive; cross-daemon
       wiring still to build)

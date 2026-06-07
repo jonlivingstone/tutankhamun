@@ -24,7 +24,7 @@ pub mod provider;
 pub mod pushdown;
 pub mod theta;
 
-pub use group_by::session_context;
+pub use group_by::{session_context, session_context_with};
 pub use provider::TutankhamunTableProvider;
 
 #[cfg(test)]

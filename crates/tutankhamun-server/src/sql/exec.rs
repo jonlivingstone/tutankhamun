@@ -123,16 +123,14 @@ impl ExecutionPlan for TutankhamunExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         let batches = block_on_scan(|| {
             collect_batches(&self.url, &self.cache, &self.pushed, &self.projected_schema)
         })?;
-        Ok(Box::pin(MemoryStream::try_new(
-            batches,
-            Arc::clone(&self.projected_schema),
-            None,
-        )?))
+        // Each shard contributes one (possibly large) batch; cap every emitted
+        // batch to the session's configured row count for streaming.
+        chunked_stream(batches, Arc::clone(&self.projected_schema), &context)
     }
 }
 
@@ -199,6 +197,35 @@ async fn fetch_selected_shards(
         out.push((shard, selection));
     }
     Ok(out)
+}
+
+/// Split a batch into `<= batch_size`-row slices for streaming. Zero-copy —
+/// Arrow `slice` shares the underlying buffers. A zero-row batch yields no
+/// slices.
+fn chunk_batch(batch: &RecordBatch, batch_size: usize) -> Vec<RecordBatch> {
+    let n = batch.num_rows();
+    let size = batch_size.max(1);
+    (0..n)
+        .step_by(size)
+        .map(|off| batch.slice(off, size.min(n - off)))
+        .collect()
+}
+
+/// Emit `batches` as a bounded record-batch stream: each is chunked to the
+/// session's configured `batch_size` (see [`chunk_batch`]) so downstream
+/// consumers get evenly capped batches. The single seam tying every exec's
+/// output batching to the session config.
+fn chunked_stream(
+    batches: Vec<RecordBatch>,
+    schema: SchemaRef,
+    context: &TaskContext,
+) -> DfResult<SendableRecordBatchStream> {
+    let batch_size = context.session_config().batch_size();
+    let chunked: Vec<RecordBatch> = batches
+        .into_iter()
+        .flat_map(|b| chunk_batch(&b, batch_size))
+        .collect();
+    Ok(Box::pin(MemoryStream::try_new(chunked, schema, None)?))
 }
 
 async fn collect_batches(
@@ -468,7 +495,7 @@ impl ExecutionPlan for FtgsAggExec {
     fn execute(
         &self,
         _partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         let batch = block_on_scan(|| {
             aggregate_batch(
@@ -480,11 +507,9 @@ impl ExecutionPlan for FtgsAggExec {
                 &self.schema,
             )
         })?;
-        Ok(Box::pin(MemoryStream::try_new(
-            vec![batch],
-            Arc::clone(&self.schema),
-            None,
-        )?))
+        // One row per group; cap every emitted batch to the session's
+        // configured row count for streaming.
+        chunked_stream(vec![batch], Arc::clone(&self.schema), &context)
     }
 }
 
@@ -1024,5 +1049,47 @@ mod tests {
             time_window(&[range("ts", None, Some("200"))], "ts"),
             Some((i64::MIN, 200))
         );
+    }
+
+    #[test]
+    fn chunk_batch_splits_to_bounded_slices() {
+        use std::sync::Arc;
+
+        use super::chunk_batch;
+        use arrow::array::{Int64Array, RecordBatch};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from((0..10).collect::<Vec<i64>>()))],
+        )
+        .unwrap();
+
+        let chunks = chunk_batch(&batch, 4);
+        assert_eq!(
+            chunks.iter().map(RecordBatch::num_rows).collect::<Vec<_>>(),
+            vec![4, 4, 2],
+        );
+
+        // Slices concatenate back to the original rows, in order.
+        let got: Vec<i64> = chunks
+            .iter()
+            .flat_map(|c| {
+                c.column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(got, (0..10).collect::<Vec<i64>>());
+
+        // `batch_size` 0 is treated as 1 — no panic, no empty-step loop.
+        assert_eq!(chunk_batch(&batch, 0).len(), 10);
+
+        // A zero-row batch yields no slices.
+        assert!(chunk_batch(&batch.slice(0, 0), 4).is_empty());
     }
 }

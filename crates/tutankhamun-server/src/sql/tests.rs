@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use arrow::array::Array;
 use datafusion::catalog::TableProvider;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use roaring::RoaringBitmap;
 use tempfile::TempDir;
 
@@ -52,6 +52,19 @@ fn bitmap(docs: impl IntoIterator<Item = u32>) -> RoaringBitmap {
     bm
 }
 
+/// Assert every batch is capped at `max_rows`, returning the total row count.
+fn assert_batches_capped(batches: &[arrow::array::RecordBatch], max_rows: usize) -> usize {
+    let counts: Vec<usize> = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .collect();
+    assert!(
+        counts.iter().all(|&n| n <= max_rows),
+        "batch rows: {counts:?}"
+    );
+    counts.iter().sum()
+}
+
 async fn provider_for(root: &Path) -> (TutankhamunTableProvider, TempDir) {
     let url = url::Url::from_directory_path(root)
         .expect("absolute")
@@ -89,6 +102,53 @@ async fn select_star_returns_all_forward_columns() {
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
     assert_eq!(total_rows, 6, "two shards × {{4, 2}} rows");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn row_scan_output_is_chunked_to_session_batch_size() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    // Shard A holds 4 docs; without chunking it would surface as one
+    // 4-row batch (> 2). DataFusion only ever coalesces small batches
+    // *up* to the target, never splits, so a max of 2 proves our chunk.
+    let ctx = super::session_context_with(SessionConfig::new().with_batch_size(2));
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let batches = ctx
+        .sql("SELECT vendor_id, fare FROM trips")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total = assert_batches_capped(&batches, 2);
+    assert_eq!(total, 6, "two shards × {{4, 2}} rows, just re-chunked");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grouped_aggregate_output_is_chunked_to_session_batch_size() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    let ctx = super::session_context_with(SessionConfig::new().with_batch_size(2));
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // vendor_id {1,2,3} → `FtgsAggExec` builds one 3-row batch; chunking
+    // caps it to 2.
+    let batches = ctx
+        .sql("SELECT vendor_id, count(*) AS n FROM trips GROUP BY vendor_id")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    let total = assert_batches_capped(&batches, 2);
+    assert_eq!(total, 3, "three distinct vendor_ids");
 }
 
 #[tokio::test(flavor = "multi_thread")]
