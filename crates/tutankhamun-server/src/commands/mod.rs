@@ -19,3 +19,12 @@ pub(crate) fn resolve_cache_dir(overridden: Option<&Path>) -> PathBuf {
         Path::to_path_buf,
     )
 }
+
+/// A current-thread tokio runtime for the one-shot CLI verbs — each does a
+/// bounded amount of async I/O against object storage, then exits. (`sql`
+/// uses a multi-thread runtime for `DataFusion`; `serve` builds its own.)
+pub(crate) fn current_thread_runtime() -> anyhow::Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
+}

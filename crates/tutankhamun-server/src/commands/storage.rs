@@ -5,9 +5,7 @@ use tutankhamun_server::storage::{self, StorageRegistry};
 use crate::{StorageArgs, StorageCommand};
 
 pub(crate) fn run(args: &StorageArgs) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = super::current_thread_runtime()?;
     match &args.command {
         StorageCommand::Check { url, prefix } => runtime.block_on(check(url, prefix.as_deref())),
     }

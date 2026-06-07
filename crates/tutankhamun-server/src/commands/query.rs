@@ -38,9 +38,7 @@ pub(crate) fn run(
         cache::size::parse_cache_size(cache_size, &cache_dir).context("parse --cache-size")?;
     let registry = StorageRegistry::from_url(&url)?;
     let cache = Cache::open(cache_dir, registry.store(), url.clone(), size_cap)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = super::current_thread_runtime()?;
     let output = runtime.block_on(shard_source::query_dataset(
         &url,
         &cache,

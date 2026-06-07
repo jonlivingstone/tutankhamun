@@ -41,9 +41,7 @@ pub(crate) fn run(
         ingest::IngestDestination::Remote(url) => {
             let staging = tempfile::tempdir().context("create ingest staging tempdir")?;
             let n = ingest::ingest_csv(input, staging.path(), &opts)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let runtime = super::current_thread_runtime()?;
             runtime.block_on(ingest::upload_ingest_tree(staging.path(), &url))?;
             println!("wrote {n} docs to {url}");
         }

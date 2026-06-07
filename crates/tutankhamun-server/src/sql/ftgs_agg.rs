@@ -28,9 +28,9 @@ use datafusion::physical_plan::{
 
 use roaring::RoaringBitmap;
 
-use super::exec::{block_on_scan, chunked_stream, fetch_selected_shards};
 use super::group_by::OwnedStat;
 use super::pushdown::PushedFilter;
+use super::scan::{block_on_scan, chunked_stream, fetch_selected_shards};
 use crate::cache::Cache;
 use crate::ftgs::{
     FtgsRow, OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped,

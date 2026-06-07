@@ -23,6 +23,7 @@ pub mod ftgs_agg;
 pub mod group_by;
 pub mod provider;
 pub mod pushdown;
+mod scan;
 pub mod theta;
 mod udaf_util;
 

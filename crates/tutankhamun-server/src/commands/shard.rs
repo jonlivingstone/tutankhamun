@@ -20,9 +20,7 @@ pub(crate) fn run(args: &ShardArgs) -> anyhow::Result<()> {
             shard::inspect(path, &mut out)
         }
         ShardCommand::List { url } => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let runtime = super::current_thread_runtime()?;
             runtime.block_on(list(url))
         }
         ShardCommand::Query {
