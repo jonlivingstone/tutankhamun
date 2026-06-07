@@ -3,7 +3,6 @@
 //! Single binary with subcommands. `t9n serve` runs the daemon; `t9n storage`
 //! groups operator commands for the storage backend.
 
-use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,16 +11,17 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
-use tutankhamun_server::ingest::{self, IngestOptions, ShardBy};
+use tutankhamun_server::ingest::ShardBy;
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
-use tutankhamun_server::shard;
 use tutankhamun_server::shard::Aggregate;
 use tutankhamun_server::shard_source::{
-    self, ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
+    ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
 };
 use tutankhamun_server::shutdown::{self, ShutdownHandle};
 use tutankhamun_server::storage::{self, StorageRegistry};
+
+mod commands;
 
 #[derive(Parser, Debug)]
 #[command(name = "t9n", version, about = "Tutankhamun (t9n) — analytics engine")]
@@ -155,9 +155,9 @@ enum Command {
 }
 
 /// CLI-facing shard-by aliases, mapped to the engine's duration-based
-/// [`ShardBy`] in `run_ingest`.
+/// [`ShardBy`] in `commands::ingest`.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum ShardByArg {
+pub(crate) enum ShardByArg {
     #[default]
     None,
     Daily,
@@ -175,19 +175,19 @@ impl From<ShardByArg> for ShardBy {
 }
 
 #[derive(Args, Debug)]
-struct StorageArgs {
+pub(crate) struct StorageArgs {
     #[command(subcommand)]
     command: StorageCommand,
 }
 
 #[derive(Args, Debug)]
-struct ShardArgs {
+pub(crate) struct ShardArgs {
     #[command(subcommand)]
     command: ShardCommand,
 }
 
 #[derive(Subcommand, Debug)]
-enum ShardCommand {
+pub(crate) enum ShardCommand {
     /// Print a shard's metadata and schema.
     Inspect {
         /// Path to the shard directory (containing metadata.json + metrics.arrow).
@@ -230,7 +230,7 @@ enum ShardCommand {
 }
 
 #[derive(Subcommand, Debug)]
-enum StorageCommand {
+pub(crate) enum StorageCommand {
     /// Verify that a storage URL is reachable by listing a prefix.
     Check {
         /// Storage backend URL (e.g. `s3://bucket/prefix`,
@@ -255,8 +255,8 @@ fn main() -> anyhow::Result<()> {
 
     match &cli.command {
         Command::Serve(args) => run_serve(args),
-        Command::Storage(args) => run_storage(args),
-        Command::Shard(args) => run_shard(args),
+        Command::Storage(args) => commands::storage::run(args),
+        Command::Shard(args) => commands::shard::run(args),
         Command::Query {
             source,
             metrics,
@@ -266,7 +266,7 @@ fn main() -> anyhow::Result<()> {
             to,
             cache_dir,
             cache_size,
-        } => run_query(
+        } => commands::query::run(
             source,
             metrics,
             *aggregate,
@@ -285,7 +285,7 @@ fn main() -> anyhow::Result<()> {
             ints,
             delimiter,
             shard_by,
-        } => run_ingest(
+        } => commands::ingest::run(
             input, output, time, metrics, strings, ints, *delimiter, *shard_by,
         ),
         Command::Sql {
@@ -293,183 +293,8 @@ fn main() -> anyhow::Result<()> {
             query,
             cache_dir,
             cache_size,
-        } => run_sql(source, query, cache_dir.as_deref(), cache_size),
+        } => commands::sql::run(source, query, cache_dir.as_deref(), cache_size),
     }
-}
-
-// Args mirror the CLI flag count, which is the user-facing surface.
-#[allow(clippy::too_many_arguments)]
-fn run_ingest(
-    input: &std::path::Path,
-    output: &str,
-    time: &str,
-    metrics: &[String],
-    strings: &[String],
-    ints: &[String],
-    delimiter: char,
-    shard_by: ShardByArg,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    if !delimiter.is_ascii() {
-        anyhow::bail!("delimiter must be a single ASCII byte (got {delimiter:?})");
-    }
-    let delimiter_byte = delimiter as u8;
-    let opts = IngestOptions {
-        time: time.to_string(),
-        metrics: metrics.to_vec(),
-        strings: strings.to_vec(),
-        ints: ints.to_vec(),
-        delimiter: delimiter_byte,
-        shard_by: shard_by.into(),
-    };
-    match ingest::IngestDestination::parse(output)? {
-        ingest::IngestDestination::Local(local) => {
-            let n = ingest::ingest_csv(input, &local, &opts)?;
-            println!("wrote {n} docs to {}", local.display());
-        }
-        ingest::IngestDestination::Remote(url) => {
-            let staging = tempfile::tempdir().context("create ingest staging tempdir")?;
-            let n = ingest::ingest_csv(input, staging.path(), &opts)?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(ingest::upload_ingest_tree(staging.path(), &url))?;
-            println!("wrote {n} docs to {url}");
-        }
-    }
-    Ok(())
-}
-
-// Args mirror the CLI flag count, which is the user-facing surface.
-#[allow(clippy::too_many_arguments)]
-fn run_query(
-    source: &str,
-    metrics: &[String],
-    aggregate: Aggregate,
-    filters: &[String],
-    from: Option<&str>,
-    to: Option<&str>,
-    cache_dir: Option<&std::path::Path>,
-    cache_size: &str,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-
-    // clap's `required = true` on `metrics` guarantees non-empty.
-    let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
-    let parsed_filters = parse_filters(filters)?;
-    let time_range = parse_time_range(from, to)?;
-    let url = shard_source::resolve_source_url(source)?;
-    let cache_dir = resolve_cache_dir(cache_dir);
-    let size_cap = tutankhamun_server::cache::size::parse_cache_size(cache_size, &cache_dir)
-        .context("parse --cache-size")?;
-    let registry = StorageRegistry::from_url(&url)?;
-    let cache =
-        tutankhamun_server::cache::Cache::open(cache_dir, registry.store(), url.clone(), size_cap)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    let output = runtime.block_on(shard_source::query_dataset(
-        &url,
-        &cache,
-        &parsed_filters,
-        &metric_refs,
-        time_range,
-    ))?;
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    shard_source::render_dataset_query_output(
-        &mut out,
-        &output,
-        &parsed_filters,
-        &metric_refs,
-        aggregate,
-    )?;
-    Ok(())
-}
-
-/// Run a SQL `query` over the dataset at `source` via `DataFusion`,
-/// registering it as table `t`, and print the result as a table.
-fn run_sql(
-    source: &str,
-    query: &str,
-    cache_dir: Option<&std::path::Path>,
-    cache_size: &str,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-    use std::sync::Arc;
-    use tutankhamun_server::cache::Cache;
-    use tutankhamun_server::sql::{self, TutankhamunTableProvider};
-
-    let url = shard_source::resolve_source_url(source)?;
-    let cache_dir = resolve_cache_dir(cache_dir);
-    let size_cap = tutankhamun_server::cache::size::parse_cache_size(cache_size, &cache_dir)
-        .context("parse --cache-size")?;
-    let registry = StorageRegistry::from_url(&url)?;
-
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let cache = Arc::new(Cache::open(
-            cache_dir,
-            registry.store(),
-            url.clone(),
-            size_cap,
-        )?);
-        let provider = TutankhamunTableProvider::try_new(url, cache).await?;
-        // GROUP BY pushdown rule + planner wired in; falls back to
-        // DataFusion's own aggregation for unsupported queries.
-        let ctx = sql::session_context();
-        ctx.register_table("t", Arc::new(provider))
-            .context("register table t")?;
-        let batches = ctx.sql(query).await?.collect().await?;
-        let rendered = arrow::util::pretty::pretty_format_batches(&batches)?;
-        println!("{rendered}");
-        anyhow::Ok(())
-    })
-}
-
-/// Turn a user-supplied `source` (bare path or `object_store` URL)
-/// into an `object_store` URL. Bare paths are canonicalised against
-/// the current working directory and converted to `file://`.
-fn resolve_cache_dir(overridden: Option<&std::path::Path>) -> PathBuf {
-    overridden.map_or_else(
-        tutankhamun_server::config::default_cache_dir,
-        std::path::Path::to_path_buf,
-    )
-}
-
-/// Resolve `--from` / `--to` into the closed interval expected by
-/// `query_dataset`. Returns `None` when both are absent (preserves
-/// today's "scan every shard" behaviour); otherwise the missing
-/// half is filled in with `i64::MIN` / `i64::MAX`.
-fn parse_time_range(from: Option<&str>, to: Option<&str>) -> anyhow::Result<Option<(i64, i64)>> {
-    use anyhow::Context as _;
-    if from.is_none() && to.is_none() {
-        return Ok(None);
-    }
-    let from = from
-        .map(ingest::parse_time_str)
-        .transpose()
-        .context("parse --from")?
-        .unwrap_or(i64::MIN);
-    let to = to
-        .map(parse_to_inclusive)
-        .transpose()
-        .context("parse --to")?
-        .unwrap_or(i64::MAX);
-    Ok(Some((from, to)))
-}
-
-/// `--to` accepts the same formats as `--from`, but a bare date is
-/// bumped to end-of-day (`23:59:59Z`) so `--to 2023-01-14` covers
-/// the whole of Jan 14 rather than stopping at midnight. Explicit
-/// datetimes pass through unchanged.
-fn parse_to_inclusive(s: &str) -> anyhow::Result<i64> {
-    if let Some(start_of_day) = ingest::parse_date_only(s) {
-        return Ok(start_of_day + 86_399);
-    }
-    ingest::parse_time_str(s)
 }
 
 fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
@@ -552,138 +377,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_storage(args: &StorageArgs) -> anyhow::Result<()> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    match &args.command {
-        StorageCommand::Check { url, prefix } => {
-            runtime.block_on(run_storage_check(url, prefix.as_deref()))
-        }
-    }
-}
-
-async fn run_storage_check(url: &str, prefix: Option<&str>) -> anyhow::Result<()> {
-    let registry = StorageRegistry::from_url(url)?;
-    storage::check(&*registry.store(), prefix).await.map(|_| ())
-}
-
-fn run_shard(args: &ShardArgs) -> anyhow::Result<()> {
-    match &args.command {
-        ShardCommand::Inspect { path } => {
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
-            shard::inspect(path, &mut out)
-        }
-        ShardCommand::List { url } => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(run_shard_list(url))
-        }
-        ShardCommand::Query {
-            path,
-            metrics,
-            aggregate,
-            filters,
-        } => {
-            // clap's `required = true` on `metrics` guarantees non-empty.
-            let metric_refs: Vec<&str> = metrics.iter().map(String::as_str).collect();
-            let parsed_filters = parse_filters(filters)?;
-            let result = shard::query_shard(path, &parsed_filters, &metric_refs)?;
-            let stdout = io::stdout();
-            let mut out = stdout.lock();
-            writeln!(out, "shard:    {}", path.display())?;
-            shard::write_query_summary(
-                &mut out,
-                &parsed_filters,
-                &metric_refs,
-                *aggregate,
-                &result,
-            )?;
-            Ok(())
-        }
-    }
-}
-
-/// Parse every `--filter` argument in `raw` into [`FilterClause`]s in
-/// the same order. Borrows from `raw` — caller keeps it alive for the
-/// duration of the query.
-fn parse_filters(raw: &[String]) -> anyhow::Result<Vec<shard::FilterClause<'_>>> {
-    raw.iter().map(|s| parse_filter(s)).collect()
-}
-
-/// Parse a `--filter` argument into a structured [`FilterClause`].
-///
-/// Syntax:
-/// - `field=term`        — exact match (the existing form).
-/// - `field=lo..hi`      — inclusive range over the field's index.
-/// - `field=lo..` / `field=..hi` — open-ended range.
-///
-/// Splits on the first `=` (so terms may contain further `=`s);
-/// inclusive-range bounds are split on the first `..` in the RHS.
-/// Both ends of a range being empty is rejected — it would match
-/// every doc, which the user almost certainly didn't mean.
-fn parse_filter(s: &str) -> anyhow::Result<shard::FilterClause<'_>> {
-    use shard::{FilterClause, FilterOp};
-
-    let (field, rhs) = s
-        .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("filter must be `<field>=<value>` (got {s:?})"))?;
-    if field.is_empty() {
-        anyhow::bail!("filter field name must be non-empty (got {s:?})");
-    }
-    let op = if let Some((lo, hi)) = rhs.split_once("..") {
-        let lo = (!lo.is_empty()).then_some(lo);
-        let hi = (!hi.is_empty()).then_some(hi);
-        if lo.is_none() && hi.is_none() {
-            anyhow::bail!(
-                "range filter must have at least one bound (got `{s}`); use `field=value` for exact match"
-            );
-        }
-        FilterOp::Range { lo, hi }
-    } else if rhs.is_empty() {
-        anyhow::bail!("filter must be `<field>=<value>` with non-empty value (got {s:?})");
-    } else {
-        FilterOp::Equals(rhs)
-    };
-    Ok(FilterClause { field, op })
-}
-
-async fn run_shard_list(url: &str) -> anyhow::Result<()> {
-    let registry = StorageRegistry::from_url(url)?;
-    let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(registry.store()));
-    let mut manager = ShardManager::new(source);
-    manager.refresh().await?;
-
-    let shards = manager.all_shards();
-    if shards.is_empty() {
-        println!("no shards discovered at {url}");
-        return Ok(());
-    }
-
-    let widest_loc = shards
-        .iter()
-        .map(|s| s.location.as_ref().len())
-        .max()
-        .unwrap_or(0);
-    for s in shards {
-        println!(
-            "{:<width$}  {:>10} docs  {} .. {}",
-            s.location.as_ref(),
-            s.metadata.num_docs,
-            s.metadata.time_range_start,
-            s.metadata.time_range_end,
-            width = widest_loc,
-        );
-    }
-    println!("---");
-    let total: u64 = shards.iter().map(|s| s.metadata.num_docs).sum();
-    let word = if shards.len() == 1 { "shard" } else { "shards" };
-    println!("{} {word}, {total} total docs", shards.len());
-    Ok(())
-}
-
 async fn log_shard_scan(store: Arc<dyn object_store::ObjectStore>) {
     let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(store));
     let mut manager = ShardManager::new(source);
@@ -744,84 +437,5 @@ fn init_tracing() {
         fmt().json().with_env_filter(filter).init();
     } else {
         fmt().with_env_filter(filter).init();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tutankhamun_server::shard::FilterOp;
-
-    #[test]
-    fn parse_filter_equals_simple() {
-        let c = parse_filter("country=us").unwrap();
-        assert_eq!(c.field, "country");
-        assert!(matches!(c.op, FilterOp::Equals("us")));
-    }
-
-    #[test]
-    fn parse_filter_equals_allows_equals_in_value() {
-        let c = parse_filter("query=a=b").unwrap();
-        assert_eq!(c.field, "query");
-        assert!(matches!(c.op, FilterOp::Equals("a=b")));
-    }
-
-    #[test]
-    fn parse_filter_range_both_bounds() {
-        let c = parse_filter("v=100..200").unwrap();
-        assert_eq!(c.field, "v");
-        assert!(matches!(
-            c.op,
-            FilterOp::Range {
-                lo: Some("100"),
-                hi: Some("200"),
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_filter_range_open_lower() {
-        let c = parse_filter("v=..200").unwrap();
-        assert!(matches!(
-            c.op,
-            FilterOp::Range {
-                lo: None,
-                hi: Some("200"),
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_filter_range_open_upper() {
-        let c = parse_filter("v=100..").unwrap();
-        assert!(matches!(
-            c.op,
-            FilterOp::Range {
-                lo: Some("100"),
-                hi: None,
-            }
-        ));
-    }
-
-    #[test]
-    fn parse_filter_rejects_double_open_range() {
-        let err = parse_filter("v=..").expect_err("`..` alone matches everything; rejected");
-        let msg = err.to_string();
-        assert!(msg.contains("at least one bound"), "{msg}");
-    }
-
-    #[test]
-    fn parse_filter_rejects_empty_value() {
-        assert!(parse_filter("v=").is_err());
-    }
-
-    #[test]
-    fn parse_filter_rejects_missing_equals() {
-        assert!(parse_filter("v100").is_err());
-    }
-
-    #[test]
-    fn parse_filter_rejects_empty_field() {
-        assert!(parse_filter("=us").is_err());
     }
 }
