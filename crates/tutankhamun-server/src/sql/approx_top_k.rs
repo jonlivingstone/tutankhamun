@@ -13,19 +13,16 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, Int64Array, ListArray, RecordBatch, StructArray, new_empty_array,
-};
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema};
+use arrow::array::{Array, ArrayRef, Int64Array, ListArray, StructArray, new_empty_array};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 
 use datafusion::common::utils::SingleRowListArrayBuilder;
-use datafusion::common::{Result, ScalarValue, internal_err, not_impl_err};
+use datafusion::common::{Result, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
-use datafusion::logical_expr::{
-    Accumulator, AggregateUDFImpl, ColumnarValue, Signature, Volatility,
-};
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::logical_expr::{Accumulator, AggregateUDFImpl, Signature, Volatility};
+
+use super::udaf_util::{check_value_type, scalar_usize};
 
 /// `approx_top_k` aggregate. Arg types are validated in
 /// [`return_type`](AggregateUDFImpl::return_type) /
@@ -63,15 +60,6 @@ fn item_field(value_type: DataType) -> Field {
     )
 }
 
-/// A column type `approx_top_k` accepts as its value (and how `value`
-/// renders): `Utf8` strings or `Int64`.
-fn check_value_type(dt: &DataType) -> Result<DataType> {
-    match dt {
-        DataType::Utf8 | DataType::Int64 => Ok(dt.clone()),
-        other => not_impl_err!("approx_top_k supports Utf8 or Int64 columns, got {other}"),
-    }
-}
-
 impl AggregateUDFImpl for ApproxTopK {
     fn as_any(&self) -> &dyn Any {
         self
@@ -93,6 +81,7 @@ impl AggregateUDFImpl for ApproxTopK {
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(DataType::List(Arc::new(item_field(check_value_type(
+            "approx_top_k",
             &arg_types[0],
         )?))))
     }
@@ -100,7 +89,7 @@ impl AggregateUDFImpl for ApproxTopK {
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         // The partial state is the top-`capacity` list (NOT top-`k`), so
         // the cross-partition merge keeps enough tail to stay accurate.
-        let value_type = check_value_type(args.input_fields[0].data_type())?;
+        let value_type = check_value_type("approx_top_k", args.input_fields[0].data_type())?;
         Ok(vec![Arc::new(Field::new(
             format_state_name(args.name, "counts"),
             DataType::List(Arc::new(item_field(value_type))),
@@ -109,7 +98,10 @@ impl AggregateUDFImpl for ApproxTopK {
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        let value_type = check_value_type(&acc_args.exprs[0].data_type(acc_args.schema)?)?;
+        let value_type = check_value_type(
+            "approx_top_k",
+            &acc_args.exprs[0].data_type(acc_args.schema)?,
+        )?;
         let k = scalar_usize(&acc_args.exprs[1])?;
         // `capacity` is at least `k` — fewer candidates than `k` couldn't
         // return a full top-k.
@@ -125,28 +117,6 @@ impl AggregateUDFImpl for ApproxTopK {
             capacity,
         }))
     }
-}
-
-/// Read a positive-integer literal arg by evaluating it against an empty
-/// batch — the same trick `approx_percentile_cont` uses for its percentile.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-pub(crate) fn scalar_usize(expr: &Arc<dyn PhysicalExpr>) -> Result<usize> {
-    let empty = RecordBatch::new_empty(Arc::new(Schema::empty()));
-    let ColumnarValue::Scalar(scalar) = expr.evaluate(&empty)? else {
-        return internal_err!("approx_top_k expects a literal k/capacity, got an array");
-    };
-    let n = match scalar {
-        ScalarValue::Int64(Some(v)) if v > 0 => v as usize,
-        ScalarValue::Int32(Some(v)) if v > 0 => v as usize,
-        ScalarValue::UInt64(Some(v)) if v > 0 => v as usize,
-        ScalarValue::UInt32(Some(v)) if v > 0 => v as usize,
-        other => {
-            return not_impl_err!(
-                "approx_top_k k/capacity must be a positive integer literal, got {other:?}"
-            );
-        }
-    };
-    Ok(n)
 }
 
 /// Exact frequency counter keyed by the (`Utf8`/`Int64`) value. Counts

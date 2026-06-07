@@ -17,7 +17,7 @@ use arrow::array::{Array, ArrayRef, Int64Array, Int64Builder, StringArray};
 use arrow::datatypes::{DataType, Field, FieldRef};
 
 use datafusion::common::cast::as_binary_array;
-use datafusion::common::{DataFusionError, Result, ScalarValue, not_impl_err};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
 use datafusion::logical_expr::{
@@ -25,7 +25,7 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use super::approx_top_k::scalar_usize;
+use super::udaf_util::{check_value_type, scalar_usize};
 use crate::sketches::ThetaSketch;
 
 /// `theta` aggregate. The column may be `Utf8` or `Int64` (validated in
@@ -40,14 +40,6 @@ impl Default for Theta {
         Self {
             signature: Signature::user_defined(Volatility::Immutable),
         }
-    }
-}
-
-/// A column type `theta` accepts: `Utf8` (hash term bytes) or `Int64`.
-fn check_value_type(dt: &DataType) -> Result<DataType> {
-    match dt {
-        DataType::Utf8 | DataType::Int64 => Ok(dt.clone()),
-        other => not_impl_err!("theta supports Utf8 or Int64 columns, got {other}"),
     }
 }
 
@@ -82,7 +74,7 @@ impl AggregateUDFImpl for Theta {
     }
 
     fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
-        let value_type = check_value_type(&acc_args.exprs[0].data_type(acc_args.schema)?)?;
+        let value_type = check_value_type("theta", &acc_args.exprs[0].data_type(acc_args.schema)?)?;
         let nominal = match acc_args.exprs.get(1) {
             Some(e) => scalar_usize(e)?,
             None => ThetaSketch::DEFAULT_NOMINAL,
