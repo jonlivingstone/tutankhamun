@@ -26,23 +26,27 @@
 //! a shard directory after it has been finalized; doing so undefines
 //! the behavior of any concurrently-open [`DiskShard`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
-use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::datatypes::DataType;
 use arrow::ipc::reader::FileReader;
-use arrow::ipc::writer::FileWriter;
 use chrono::DateTime;
 use fst::{IntoStreamer, Streamer};
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
+
+mod filter;
+mod writer;
+
+use filter::combine_filters;
+pub use filter::{FilterClause, FilterOp, FilterResult, matched_doc_set};
+pub use writer::DiskShardWriter;
 
 pub(crate) const METADATA_FILE: &str = "metadata.json";
 const METRICS_FILE: &str = "metrics.arrow";
@@ -414,30 +418,6 @@ fn posting_path(dir: &Path, field: &str, ext: &str) -> PathBuf {
     dir.join(POSTINGS_DIR).join(format!("{field}.{ext}"))
 }
 
-/// Sibling temp path used by [`write_atomic`]: same directory as
-/// `path`, filename prefixed with `.` and suffixed with `.tmp`.
-fn tmp_sibling(path: &Path) -> PathBuf {
-    let parent = path.parent().expect("shard files always have a parent dir");
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .expect("shard files have UTF-8 names");
-    parent.join(format!(".{name}.tmp"))
-}
-
-/// Write to a sibling `.tmp` file then atomically rename it into
-/// place. A crashed writer leaves the `.tmp` behind but never a
-/// half-written final file.
-fn write_atomic<F>(final_path: &Path, write_fn: F) -> Result<()>
-where
-    F: FnOnce(&Path) -> Result<()>,
-{
-    let tmp = tmp_sibling(final_path);
-    write_fn(&tmp)?;
-    fs::rename(&tmp, final_path).with_context(|| format!("rename {} into place", tmp.display()))?;
-    Ok(())
-}
-
 fn validate_schema_matches(
     metadata: &Metadata,
     batch: &RecordBatch,
@@ -479,275 +459,6 @@ fn validate_schema_matches(
         }
     }
     Ok(())
-}
-
-/// Build a shard directory on disk.
-///
-/// All metric columns must have the same length. `finalize` writes
-/// every file to a `.tmp` sibling and atomically renames it into
-/// place, so a crashed run leaves no partially-written shard visible
-/// to readers.
-pub struct DiskShardWriter {
-    dir: PathBuf,
-    time_range: (i64, i64),
-    forward_cols: Vec<ForwardCol>,
-    string_fields: Vec<(String, BTreeMap<String, RoaringBitmap>)>,
-    num_docs: Option<u64>,
-    time_field: Option<String>,
-}
-
-/// One forward-column field, used for both `Metric` and `Int` kinds.
-/// `kind` is preserved so finalize can emit it in `metadata.fields`
-/// and (for `Int`) also derive the inverted index from `values`.
-struct ForwardCol {
-    name: String,
-    values: Vec<i64>,
-    kind: FieldKind,
-}
-
-impl DiskShardWriter {
-    pub fn new(dir: &Path, time_range: (i64, i64)) -> Result<Self> {
-        fs::create_dir_all(dir).with_context(|| format!("create shard dir {}", dir.display()))?;
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            time_range,
-            forward_cols: Vec::new(),
-            string_fields: Vec::new(),
-            num_docs: None,
-            time_field: None,
-        })
-    }
-
-    /// Record which field holds each doc's time (an `Int` field added
-    /// separately via [`add_int_field`]). Stamped into
-    /// [`Metadata::time_field`] at finalize so the query layer can
-    /// present it as a timestamp and prune shards by it.
-    pub fn set_time_field(&mut self, name: &str) {
-        self.time_field = Some(name.to_string());
-    }
-
-    /// Add a metric (`Int64`) column — aggregatable, not filterable.
-    /// All forward columns added to one writer must have the same
-    /// length; the first call fixes the row count and subsequent
-    /// mismatches return an error.
-    ///
-    /// `values` is owned so [`Int64Array::from`] can take it without a
-    /// copy on `finalize`.
-    pub fn add_metric(&mut self, name: &str, values: Vec<i64>) -> Result<()> {
-        self.add_forward_col(name, values, FieldKind::Metric)
-    }
-
-    /// Add an `Int` field — int64 forward column AND inverted index
-    /// over the values. Same row-count rules as [`add_metric`]; at
-    /// finalize the values double as the source for the inverted
-    /// index (one term per distinct value, keys
-    /// [`encode_int_key`]-encoded so FST lex order matches numeric
-    /// order).
-    pub fn add_int_field(&mut self, name: &str, values: Vec<i64>) -> Result<()> {
-        self.add_forward_col(name, values, FieldKind::Int)
-    }
-
-    fn add_forward_col(&mut self, name: &str, values: Vec<i64>, kind: FieldKind) -> Result<()> {
-        let len = values.len() as u64;
-        match self.num_docs {
-            None => self.num_docs = Some(len),
-            Some(existing) if existing != len => {
-                bail!("column {name:?} has {len} rows but previous columns have {existing}")
-            }
-            Some(_) => {}
-        }
-        self.ensure_unused_name(name)?;
-        self.forward_cols.push(ForwardCol {
-            name: name.to_string(),
-            values,
-            kind,
-        });
-        Ok(())
-    }
-
-    /// Add a string field's inverted index. `postings` maps each term
-    /// to its doc-ID bitmap; the `BTreeMap` ensures lex-sorted
-    /// iteration, which the FST builder requires.
-    ///
-    /// `postings` must contain at least one term — an empty index
-    /// would produce a zero-byte postings file that fails to mmap on
-    /// read. Callers should simply omit the field instead.
-    ///
-    /// Per-term bitmaps are sparse; callers may include only docs that
-    /// have a term. Doc IDs are validated against `num_docs` at
-    /// [`finalize`].
-    pub fn add_string_field(
-        &mut self,
-        name: &str,
-        postings: BTreeMap<String, RoaringBitmap>,
-    ) -> Result<()> {
-        if postings.is_empty() {
-            bail!("string field {name:?}: postings map is empty; omit the field instead");
-        }
-        self.ensure_unused_name(name)?;
-        self.string_fields.push((name.to_string(), postings));
-        Ok(())
-    }
-
-    fn ensure_unused_name(&self, name: &str) -> Result<()> {
-        if self.forward_cols.iter().any(|c| c.name == name)
-            || self.string_fields.iter().any(|(n, _)| n == name)
-        {
-            bail!("field {name:?} already added");
-        }
-        Ok(())
-    }
-
-    pub fn finalize(self) -> Result<()> {
-        // num_docs is the doc-ID universe size. Forward columns
-        // (Metric or Int) fix it explicitly via their row count;
-        // string fields are sparse over that universe. When no
-        // forward column declares it, derive num_docs from the
-        // highest doc ID any string bitmap touches.
-        let max_string_doc = self
-            .string_fields
-            .iter()
-            .flat_map(|(_, postings)| postings.values())
-            .filter_map(RoaringBitmap::max)
-            .max();
-        let num_docs = match (self.num_docs, max_string_doc) {
-            (Some(declared), Some(max)) if u64::from(max) >= declared => {
-                bail!(
-                    "string-field bitmap references doc ID {max} but num_docs is {declared}; \
-                     bitmap doc IDs must be < num_docs"
-                );
-            }
-            (Some(declared), _) => declared,
-            (None, Some(max)) => u64::from(max) + 1,
-            (None, None) => 0,
-        };
-
-        // Build Int-field postings now — must run before
-        // `self.forward_cols.into_iter()` below moves the values into
-        // the Arrow arrays. For each int field, doc_id N gets a bit in
-        // the bitmap for term encode_int_key(values[N]).
-        //
-        // `BTreeMap<[u8; 8], _>` (not `Vec<u8>`) so the per-row key
-        // doesn't heap-allocate: 8-byte arrays are `Ord`
-        // lexicographically, which equals numeric order via the
-        // encoding, and `[u8; 8]: AsRef<[u8]>` so `write_indexed_field`
-        // accepts them unchanged.
-        let mut int_postings: Vec<(String, BTreeMap<[u8; 8], RoaringBitmap>)> = Vec::new();
-        for col in &self.forward_cols {
-            if col.kind != FieldKind::Int {
-                continue;
-            }
-            let mut postings: BTreeMap<[u8; 8], RoaringBitmap> = BTreeMap::new();
-            for (doc_id, &v) in col.values.iter().enumerate() {
-                postings
-                    .entry(encode_int_key(v))
-                    .or_default()
-                    .insert(u32::try_from(doc_id).expect("doc_id within u32 (writer enforced)"));
-            }
-            int_postings.push((col.name.clone(), postings));
-        }
-
-        // metadata.fields: forward_cols in insertion order (so they
-        // line up with the Arrow batch's columns, which
-        // validate_schema_matches relies on), then string fields.
-        let mut fields: Vec<FieldSchema> =
-            Vec::with_capacity(self.forward_cols.len() + self.string_fields.len());
-        for col in &self.forward_cols {
-            fields.push(FieldSchema {
-                name: col.name.clone(),
-                kind: col.kind,
-            });
-        }
-        for (name, _) in &self.string_fields {
-            fields.push(FieldSchema {
-                name: name.clone(),
-                kind: FieldKind::String,
-            });
-        }
-        let mut metadata = Metadata {
-            format_version: FORMAT_VERSION,
-            num_docs,
-            time_range_start: self.time_range.0,
-            time_range_end: self.time_range.1,
-            fields,
-            content_hashes: BTreeMap::new(),
-            time_field: self.time_field.clone(),
-        };
-
-        let arrow_fields: Vec<Field> = self
-            .forward_cols
-            .iter()
-            .map(|c| Field::new(&c.name, DataType::Int64, false))
-            .collect();
-        let schema = Arc::new(Schema::new(arrow_fields));
-
-        let arrays: Vec<ArrayRef> = self
-            .forward_cols
-            .into_iter()
-            .map(|c| Arc::new(Int64Array::from(c.values)) as ArrayRef)
-            .collect();
-
-        // Required when there are no forward columns (string-only
-        // shards): RecordBatch can't infer row count from zero arrays.
-        let options = arrow::array::RecordBatchOptions::new().with_row_count(Some(
-            usize::try_from(num_docs).expect("num_docs fits in usize"),
-        ));
-        let batch = RecordBatch::try_new_with_options(Arc::clone(&schema), arrays, &options)
-            .context("build record batch")?;
-
-        // Ordering: metrics.arrow and all postings files are renamed
-        // into place before metadata.json, so a reader that sees
-        // metadata.json is guaranteed to find every file it claims.
-        write_atomic(&self.dir.join(METRICS_FILE), |tmp| {
-            let file =
-                fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
-            let mut writer = FileWriter::try_new(file, &schema)
-                .with_context(|| format!("init Arrow IPC writer for {}", tmp.display()))?;
-            writer
-                .write(&batch)
-                .with_context(|| format!("write record batch to {}", tmp.display()))?;
-            writer
-                .finish()
-                .with_context(|| format!("finalise {}", tmp.display()))?;
-            Ok(())
-        })?;
-
-        if !self.string_fields.is_empty() || !int_postings.is_empty() {
-            let postings_dir = self.dir.join(POSTINGS_DIR);
-            fs::create_dir_all(&postings_dir)
-                .with_context(|| format!("create {}", postings_dir.display()))?;
-            for (name, postings) in &self.string_fields {
-                write_indexed_field(&self.dir, name, postings)?;
-            }
-            for (name, postings) in &int_postings {
-                write_indexed_field(&self.dir, name, postings)?;
-            }
-        }
-
-        metadata.content_hashes = hash_payload_files(&self.dir)?;
-        let metadata_json = serde_json::to_vec_pretty(&metadata).context("serialise metadata")?;
-        write_atomic(&self.dir.join(METADATA_FILE), |tmp| {
-            fs::write(tmp, &metadata_json).with_context(|| format!("write {}", tmp.display()))
-        })?;
-
-        Ok(())
-    }
-}
-
-/// Walk `dir` and hash every payload file (everything except
-/// `metadata.json` itself). Returns a map of `<rel-path>` →
-/// `"sha256:<hex>"`. Rel-paths use `/` separators regardless of host
-/// platform so the same shard reads back the same on any OS.
-fn hash_payload_files(dir: &Path) -> Result<BTreeMap<String, String>> {
-    let mut out = BTreeMap::new();
-    walk_files(dir, dir, &mut |abs_path, rel_path| {
-        if rel_path == METADATA_FILE {
-            return Ok(());
-        }
-        out.insert(rel_path.to_string(), sha256_file(abs_path)?);
-        Ok(())
-    })?;
-    Ok(out)
 }
 
 /// SHA-256 of `path`'s contents, formatted as `"sha256:<hex>"` — the
@@ -793,66 +504,6 @@ pub(crate) fn walk_files(
             f(&path, &rel)?;
         }
     }
-    Ok(())
-}
-
-/// Write `<field>.posting` (concatenated bitmaps) and `<field>.fst`
-/// (term → byte offset into postings) for one indexed field. Posting
-/// is renamed in first so a reader seeing the `.fst` is guaranteed
-/// the offsets resolve.
-///
-/// Generic over key type so `String` (UTF-8) and `Vec<u8>`
-/// (order-preserving int encoding) both work through one path. The
-/// `BTreeMap` iteration order = byte order in both cases, which is
-/// what the FST builder requires.
-fn write_indexed_field<K>(
-    dir: &Path,
-    name: &str,
-    postings: &BTreeMap<K, RoaringBitmap>,
-) -> Result<()>
-where
-    K: AsRef<[u8]>,
-{
-    // Copy keys to owned Vec<u8> so the second pass (FST build) can
-    // see them after the first pass (posting writes) borrows
-    // `postings` to iterate. Per-key copy is tiny vs the bitmap
-    // serialisation cost.
-    let mut offsets: Vec<(Vec<u8>, u64)> = Vec::with_capacity(postings.len());
-    write_atomic(&posting_path(dir, name, POSTING_EXT), |tmp| {
-        let file = fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let mut writer = io::BufWriter::new(file);
-        let mut cursor: u64 = 0;
-        for (key, bitmap) in postings {
-            offsets.push((key.as_ref().to_vec(), cursor));
-            bitmap
-                .serialize_into(&mut writer)
-                .with_context(|| format!("serialise bitmap for field {name:?}"))?;
-            cursor += bitmap.serialized_size() as u64;
-        }
-        writer
-            .flush()
-            .with_context(|| format!("flush {}", tmp.display()))?;
-        Ok(())
-    })?;
-
-    write_atomic(&posting_path(dir, name, FST_EXT), |tmp| {
-        let file = fs::File::create(tmp).with_context(|| format!("create {}", tmp.display()))?;
-        let mut builder = fst::MapBuilder::new(io::BufWriter::new(file))
-            .with_context(|| format!("init FST builder for {}", tmp.display()))?;
-        for (key, offset) in &offsets {
-            builder
-                .insert(key, *offset)
-                .with_context(|| format!("insert key into FST for field {name:?}"))?;
-        }
-        // into_inner finalises the FST (writes the footer); the second
-        // call unwraps the BufWriter to flush it to disk.
-        builder
-            .into_inner()
-            .with_context(|| format!("finalise FST {}", tmp.display()))?
-            .into_inner()
-            .with_context(|| format!("flush FST {}", tmp.display()))?;
-        Ok(())
-    })?;
     Ok(())
 }
 
@@ -994,61 +645,6 @@ impl QueryResult {
     }
 }
 
-/// What `--filter` resolves to: a single-term equality or an
-/// inclusive range with optionally open ends. The CLI parser
-/// constructs these; the engine consumes them.
-#[derive(Debug, Clone, Copy)]
-pub struct FilterClause<'a> {
-    pub field: &'a str,
-    pub op: FilterOp<'a>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum FilterOp<'a> {
-    /// Exact-term match against the field's inverted index.
-    Equals(&'a str),
-    /// Inclusive range. `None` on either side means unbounded.
-    /// `lo` and `hi` both `None` is rejected upstream — it would
-    /// match every doc, which the user almost certainly didn't mean.
-    Range {
-        lo: Option<&'a str>,
-        hi: Option<&'a str>,
-    },
-}
-
-impl<'a> FilterClause<'a> {
-    #[must_use]
-    pub fn equals(field: &'a str, term: &'a str) -> Self {
-        Self {
-            field,
-            op: FilterOp::Equals(term),
-        }
-    }
-
-    #[must_use]
-    pub fn range(field: &'a str, lo: Option<&'a str>, hi: Option<&'a str>) -> Self {
-        Self {
-            field,
-            op: FilterOp::Range { lo, hi },
-        }
-    }
-}
-
-impl std::fmt::Display for FilterClause<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.op {
-            FilterOp::Equals(term) => write!(f, "{} = {:?}", self.field, term),
-            FilterOp::Range { lo, hi } => write!(
-                f,
-                "{} = {}..{}",
-                self.field,
-                lo.unwrap_or(""),
-                hi.unwrap_or(""),
-            ),
-        }
-    }
-}
-
 /// Open the shard at `path`, optionally restrict to docs matching
 /// every clause in `filters` (AND semantics; empty slice = match
 /// all), and compute sum/min/max for each named metric over the
@@ -1109,143 +705,6 @@ pub fn query_shard(
         matched,
         aggregates,
     })
-}
-
-/// Outcome of intersecting every filter clause: either no filter was
-/// supplied (match every doc), some clause matched no docs (whole
-/// result is empty, short-circuiting the rest), or a concrete doc set.
-/// Public form of the engine's per-shard filter-resolution result.
-/// Used internally by [`query_shard`] for aggregate dispatch and
-/// externally by the SQL `TableProvider` to drive row-set
-/// materialisation.
-#[derive(Debug)]
-pub enum FilterResult {
-    /// No filter supplied — every doc matches.
-    All,
-    /// Filter matched zero docs (or some clause hit zero terms in
-    /// the index and short-circuited the intersection).
-    Empty,
-    /// Concrete matched doc set.
-    Bitmap(RoaringBitmap),
-}
-
-/// Resolve every clause in `filters` against `shard`, AND-intersect
-/// the per-clause bitmaps, and return the [`FilterResult`] dispatch
-/// shape. Empty `filters` slice → `All`; any clause that hits zero
-/// terms short-circuits the whole result to `Empty`.
-pub fn matched_doc_set(shard: &DiskShard, filters: &[FilterClause<'_>]) -> Result<FilterResult> {
-    let metadata = shard.metadata();
-    combine_filters(shard, metadata, filters)
-}
-
-fn combine_filters(
-    shard: &DiskShard,
-    metadata: &Metadata,
-    filters: &[FilterClause<'_>],
-) -> Result<FilterResult> {
-    use roaring::MultiOps;
-
-    if filters.is_empty() {
-        return Ok(FilterResult::All);
-    }
-    let mut resolved: Vec<RoaringBitmap> = Vec::with_capacity(filters.len());
-    for clause in filters {
-        match resolve_filter(shard, metadata, clause)? {
-            Some(bm) => resolved.push(bm),
-            None => return Ok(FilterResult::Empty),
-        }
-    }
-    // Tree-reduced k-way intersection — beats pairwise `&=` when
-    // bitmaps differ in size (smallest pair reduced first).
-    let intersection: RoaringBitmap = resolved.into_iter().intersection();
-    Ok(if intersection.is_empty() {
-        FilterResult::Empty
-    } else {
-        FilterResult::Bitmap(intersection)
-    })
-}
-
-/// Resolve one filter clause to its matched doc set, or `None` if no
-/// docs match (a clause whose term/range hits zero terms in the
-/// inverted index).
-fn resolve_filter(
-    shard: &DiskShard,
-    metadata: &Metadata,
-    clause: &FilterClause<'_>,
-) -> Result<Option<RoaringBitmap>> {
-    // String or Int field — both have an inverted index, but the
-    // term encoding differs: String uses UTF-8 bytes directly, Int
-    // parses the decimal term and encodes via encode_int_key.
-    let filter_field = require_field(metadata, clause.field, &[FieldKind::String, FieldKind::Int])?;
-    let idx = shard
-        .inverted_index(clause.field)
-        .expect("indexed field kind validated above");
-    match clause.op {
-        FilterOp::Equals(term) => {
-            let key = encode_bound(filter_field.kind, clause.field, Some(term))?
-                .expect("Some bound yields Some encoded key");
-            Ok(idx.lookup_bytes(&key))
-        }
-        FilterOp::Range { lo, hi } => {
-            use roaring::MultiOps;
-            if lo.is_none() && hi.is_none() {
-                // Reachable only via a programmatic
-                // `FilterClause::range(_, None, None)`; the CLI
-                // parser rejects `field=..` upstream. Hard-fail so
-                // the misuse can't silently match every doc.
-                bail!(
-                    "range filter for field {field:?} must have at least one bound",
-                    field = clause.field,
-                );
-            }
-            let lo_bytes = encode_bound(filter_field.kind, clause.field, lo)?;
-            let hi_bytes = encode_bound(filter_field.kind, clause.field, hi)?;
-            // Encoded byte order matches the desired range semantics
-            // for both kinds (UTF-8 lex for String, numeric via
-            // encode_int_key for Int), so a byte compare catches
-            // inverted ranges across both.
-            if let (Some(l), Some(h)) = (&lo_bytes, &hi_bytes)
-                && l > h
-            {
-                bail!(
-                    "range filter for field {field:?}: lower bound {lo:?} exceeds upper bound {hi:?}",
-                    field = clause.field,
-                    lo = lo.expect("checked above"),
-                    hi = hi.expect("checked above"),
-                );
-            }
-            // Tree-reduced k-way union — for wide ranges over
-            // high-cardinality fields this beats pairwise `|=`
-            // because intermediate bitmap sizes stay smaller.
-            let union: RoaringBitmap = idx
-                .range_bytes(lo_bytes.as_deref(), hi_bytes.as_deref())
-                .map(|(_, bm)| bm)
-                .union();
-            Ok(if union.is_empty() { None } else { Some(union) })
-        }
-    }
-}
-
-/// Encode a single filter bound (either side of a range, or the
-/// equality term) for an inverted-index lookup. `None` bound →
-/// `None` byte vec (the open-range case in
-/// [`InvertedIndex::range_bytes`]). String fields use UTF-8 bytes
-/// directly; Int fields parse the bound as i64 and encode via
-/// [`encode_int_key`] so the FST's byte order matches numeric order.
-fn encode_bound(kind: FieldKind, field: &str, bound: Option<&str>) -> Result<Option<Vec<u8>>> {
-    let Some(bound) = bound else {
-        return Ok(None);
-    };
-    match kind {
-        FieldKind::String => Ok(Some(bound.as_bytes().to_vec())),
-        FieldKind::Int => {
-            let v: i64 = bound.parse().with_context(|| {
-                format!("filter value {bound:?} is not a valid int64 for field {field:?}")
-            })?;
-            Ok(Some(encode_int_key(v).to_vec()))
-        }
-        FieldKind::Metric => unreachable!("require_field rejected non-indexed kind"),
-    }
 }
 
 /// Empty iterator yields `MetricAggregates::default()` (sum=0,
