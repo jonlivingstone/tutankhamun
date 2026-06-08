@@ -45,9 +45,15 @@ tempfile = { workspace = true }
 datafusion = "50"
 hyperloglogplus = "0.4"
 tdigest = "0.2"
+arrow-flight = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio-stream = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
+arrow-flight = { workspace = true }
+tonic = { workspace = true }
 
 [lints.rust]
 unsafe_code = "warn"

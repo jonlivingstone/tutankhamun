@@ -5,6 +5,7 @@
 pub mod bit_tree;
 pub mod cache;
 pub mod config;
+pub mod flight_sql;
 pub mod ftgs;
 pub mod group_lookup;
 pub mod ingest;

@@ -157,14 +157,21 @@ directly.
 
 ## Wire / protocol
 
-- [ ] `tonic` gRPC server setup over HTTP/2 — §1.2
+- [x] `tonic` gRPC server setup over HTTP/2 — §1.2
+      (`flight_sql::serve` runs a `tonic::Server` on `grpc_addr`, bound before
+      readiness and drained via the shared `ShutdownHandle`, mirroring the ops
+      HTTP task)
 - [ ] `tutankhamun.v1.SessionControl` protobuf definitions
       (`OpenSession`, `CloseSession`, `Regroup`, `PushStat`,
       `PopStat`, `MetricRegroup`, `GetStatus`, etc.) — §1.2
 - [ ] `SessionControl` service implementation — §1.2
-- [ ] `arrow.flight.protocol.FlightService` registration — §1.2
-- [ ] `DoGet(Ticket)` for FTGS result streaming as Arrow record
-      batches — §1.2
+- [x] `arrow.flight.protocol.FlightService` registration — §1.2
+      (registered via `arrow-flight`'s `FlightServiceServer` wrapping the
+      `FlightSqlService` impl)
+- [~] `DoGet(Ticket)` for FTGS result streaming as Arrow record
+      batches — §1.2 (statement `DoGet` works — `do_get_statement` streams SQL
+      results via `FlightDataEncoderBuilder`; the FTGS-native ticket and the
+      `SessionControl` streaming path land with the session slice)
 - [x] DataFusion embedded as a dependency — §3.2
 - [x] Tutankhamun `TableProvider` implementation (Tier 1: projection
       + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
@@ -182,7 +189,12 @@ directly.
       works on `String` args too, hashing the inverted-index terms (no forward
       column) so the sketch still merges across shards; unsupported shapes fall
       back to DataFusion)
-- [ ] FlightSQL service implementation — §3.2
+- [~] FlightSQL service implementation — §3.2
+      (ad-hoc statement path: `get_flight_info_statement` plans for the output
+      schema and `do_get_statement` executes through the in-process DataFusion
+      engine [`sql::session_context`]; datasets under the storage root are
+      addressable as tables by name via a lazy `SchemaProvider`. Prepared
+      statements, transactions, and catalog-metadata RPCs remain)
 - [ ] Session-aware SQL execution — DataFusion planner reuses
       session state when new query's filter refines previous — §3.2
 - [ ] Session-affinity metadata header

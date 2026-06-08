@@ -59,6 +59,15 @@ bytes = "1"
 # Columnar storage format (shard forward columns)
 arrow = { version = "56", default-features = false, features = ["ipc"] }
 
+# gRPC transport + Arrow Flight / FlightSQL data-plane. arrow-flight tracks
+# arrow's version in lockstep; keeping them equal (56) is what guarantees a
+# single arrow in the tree, so Flight's RecordBatch/Schema types unify with
+# DataFusion's. tonic/prost are pinned to match what arrow-flight 56 pulls.
+arrow-flight = { version = "56", features = ["flight-sql-experimental"] }
+tonic = "0.13"
+prost = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+
 # Inverted index (shard postings)
 roaring = "0.10"
 fst = "0.4"

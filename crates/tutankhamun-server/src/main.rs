@@ -10,7 +10,9 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
+use tutankhamun_server::cache;
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
+use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
 use tutankhamun_server::ingest::ShardBy;
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
@@ -333,6 +335,26 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         }
     });
 
+    // FlightSQL data-plane. Per-dataset shard caches are created lazily and
+    // reused across queries (see `flight_sql`); the gRPC listener is bound
+    // before marking ready so /readyz only flips once both ops and gRPC are live.
+    let grpc_addr = config.grpc_addr.parse()?;
+    let grpc_listener = flight_sql::bind(grpc_addr).await?;
+    let cache_cap = cache::size::parse_cache_size("10GB", &config.cache_dir)?;
+    let grpc_task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        let svc = TutankhamunFlightSqlService::new(
+            config.storage_url.clone(),
+            config.cache_dir.clone(),
+            cache_cap,
+        );
+        async move {
+            if let Err(e) = flight_sql::serve(grpc_listener, svc, shutdown).await {
+                error!(error = ?e, "gRPC FlightSQL server failed");
+            }
+        }
+    });
+
     ops_state.mark_ready();
     info!(
         ops_addr = %config.ops_addr,
@@ -369,7 +391,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     let timeout = Duration::from_secs(config.shutdown_timeout_secs);
     shutdown::drain_with_timeout(timeout, async {
-        let _ = ops_task.await;
+        let _ = tokio::join!(ops_task, grpc_task);
     })
     .await;
 
