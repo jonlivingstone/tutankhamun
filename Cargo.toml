@@ -68,6 +68,9 @@ tonic = "0.13"
 prost = "0.13"
 tokio-stream = { version = "0.1", features = ["net"] }
 
+# Opaque session tokens (FlightSQL handshake → server-issued bearer token)
+uuid = { version = "1", features = ["v4"] }
+
 # Inverted index (shard postings)
 roaring = "0.10"
 fst = "0.4"

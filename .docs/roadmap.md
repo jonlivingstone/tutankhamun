@@ -141,19 +141,31 @@ directly.
 
 ## Engine — sessions
 
-- [ ] Session struct (group lookup, stat stack, dynamic metrics,
-      shard handles, memory handle) — §2.4
-- [ ] `OpenSession` handler — admission check, shard set
-      selection by time range, token issuance — §2.4
-- [ ] `CloseSession` handler — explicit teardown — §2.4
-- [ ] Idle timeout reaper (default 30 min, configurable) — §2.4
-- [ ] Hard maximum age reaper (default 4 h, configurable) — §2.4
-- [ ] `SessionLost` error on daemon-crashed-mid-session — §2.4
-- [ ] Opaque token format (don't leak internals) — §2.4
-- [ ] Stat stack — `PushStat`, `PopStat`, `GetNumStats` — §2.6
-- [ ] Dynamic metric allocation + update — §2.6
-- [ ] Regroup operations (filter, bucket, query-based, regex,
-      random, intersect, etc. — full Imhotep parity) — §2.6
+- [~] Session struct — §2.4 (`flight_sql::Session`: a persistent
+      `SessionContext` + liveness timestamps. Per §2.8 the group lookup /
+      stat stack / dynamic metrics are SQL state inside the context, not a
+      typed struct; the memory handle waits on §2.2)
+- [x] `OpenSession` handler — token issuance — §2.4 (the FlightSQL
+      handshake doubles as session-open: mints an opaque server-issued token
+      the client echoes as a bearer. Admission check waits on §2.2;
+      time-range shard selection happens per-query in the scan)
+- [ ] `CloseSession` handler — explicit teardown — §2.4 (idle/max-age
+      reaping covers it for now; an explicit close action is deferred)
+- [x] Idle timeout reaper (default 30 min) — §2.4 (const; configurable
+      knob deferred)
+- [x] Hard maximum age reaper (default 4 h) — §2.4 (const; configurable
+      knob deferred)
+- [x] `SessionLost` error on daemon-crashed-mid-session — §2.4
+      (an unknown/expired token returns `not_found`; the client reopens)
+- [x] Opaque token format (don't leak internals) — §2.4 (UUID v4,
+      server-issued; client echoes, never parses)
+- [~] Stat stack — §2.6 (per §2.8 expressed as SQL computed columns;
+      native `PushStat`/`PopStat` deferred unless a workflow needs them)
+- [~] Dynamic metric allocation + update — §2.6 (per §2.8 a computed
+      column / `CREATE VIEW`; native typed op deferred)
+- [~] Regroup operations (filter, bucket, query-based, regex,
+      random, intersect) — §2.6 (per §2.8 expressed as SQL `WHERE` /
+      subqueries / temp views; native typed regroup deferred)
 
 ## Wire / protocol
 
@@ -192,14 +204,20 @@ directly.
 - [~] FlightSQL service implementation — §3.2
       (ad-hoc statement path: `get_flight_info_statement` plans for the output
       schema and `do_get_statement` executes through the in-process DataFusion
-      engine [`sql::session_context`]; datasets under the storage root are
-      addressable as tables by name via a lazy `SchemaProvider`. Prepared
-      statements, transactions, and catalog-metadata RPCs remain)
-- [ ] Session-aware SQL execution — DataFusion planner reuses
-      session state when new query's filter refines previous — §3.2
-- [ ] Session-affinity metadata header
+      engine [`sql::session_context`]; `do_handshake` opens a session and
+      `do_put_statement_update` runs DDL/DML — `CREATE VIEW` etc. — against the
+      session context; datasets under the storage root are addressable as tables
+      by name via a lazy, registerable `SchemaProvider`. Prepared statements,
+      transactions, and catalog-metadata RPCs remain)
+- [~] Session-aware SQL execution — §3.2 (sessions now persist a
+      `SessionContext` across calls, so session-scoped temp views/tables survive
+      — the §2.8 name layer. The deeper part — reusing a cached doc-set bitmap
+      when a query's filter refines the previous (monotone narrowing) — is the
+      next slice)
+- [x] Session-affinity metadata header
       (`x-tutankhamun-session-id`) published in gRPC responses —
-      §2.4
+      §2.4 (set on the handshake response; also accepted as an input
+      fallback to the bearer token for proxy mode)
 
 ## Routing
 

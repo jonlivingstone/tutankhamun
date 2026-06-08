@@ -49,6 +49,7 @@ arrow-flight = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
