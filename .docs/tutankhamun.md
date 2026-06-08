@@ -238,6 +238,12 @@ custom binary over QUIC.
 - `tonic` and `arrow-flight` crates are added to the dependency
   baseline.
 
+**Revised (see §2.8):** the custom `SessionControl` service is now
+*deferred*. Session lifecycle and group-state mutation are modelled as
+session-aware SQL over cached views, not a separate typed protocol;
+FlightSQL is the primary surface. `SessionControl` returns only if a
+workflow proves SQL cannot serve it cheaply.
+
 ### 1.3 Deployment design discipline
 
 **Decision:** Confirm a deployment-agnostic binary design discipline.
@@ -895,6 +901,91 @@ the same merge function is reused at both levels.
 
 Decided in §3.1 (net-new capability over Imhotep — HLL + t-digest +
 theta sketches, `approx_` prefix, query-time only in v1).
+
+### 2.8 Session state as cached views — native control dissolves into session-aware SQL
+
+**Decision (refines §1.2, §2.4):** Do not build a separate typed
+`SessionControl` protocol up front. Model session and group state as
+**incrementally-maintained materialized views over the immutable shard
+set**, exposed through **session-aware FlightSQL** (§3.2). The Imhotep
+regroup vocabulary dissolves into ordinary SQL over a session-scoped,
+group-lookup-backed relation; the native typed protocol becomes a
+*deferred option*, justified only by a concrete workflow SQL cannot serve
+cheaply.
+
+**The reframing.** Imhotep's per-doc group lookup *is a relation*,
+`groups(doc_id, group_id)`. Every regroup derives a new such relation;
+"operate on group 3" is `WHERE group_id = 3` — addressable, because it is
+a column. The typed ops map onto SQL:
+
+| Imhotep op | SQL form |
+|---|---|
+| Regroup (replace) | `CREATE OR REPLACE TEMP VIEW _g AS SELECT doc_id, <expr> AS group_id …` |
+| Regroup (refine group 3) | derive a new `_g` from the old, narrowing `group_id = 3` |
+| "operate on group 3" | `… WHERE group_id = 3` |
+| PushStat | a computed column (`… , clicks*cpc AS revenue`) |
+| top-N-by-X regroup | a subquery (`WHERE term IN (SELECT … ORDER BY … LIMIT n)`) — predicate-definable, computed server-side |
+| push an *external* set | the one genuinely opaque case: upload via Flight `DoPut` into a session-private relation, then semi-join |
+
+**Realization, not re-evaluation.** A classical view re-evaluates per
+reference; here the realization is **cached and reused**. The cached
+artifact is the doc-set as a Roaring bitmap (§2.1 already stores postings
+this way). Refinement on a narrowing predicate (`old AND extra`) is a
+bitmap **intersection**, not a rescan — Lucene's cached-`DocIdSet` model.
+The cache is a tree of nested predicates: a new query reuses its nearest
+cached ancestor and applies the delta. The cheap path is **monotone
+narrowing**; widening or a non-subset jump falls back to the nearest
+ancestor or a fresh scan. Imhotep exploration is overwhelmingly
+narrowing — that is the structural reason this works.
+
+**Why it is safe and stale-proof.** A session pins a shard set and shards
+are immutable (§2.1), so a realized result is a pure function of
+`(normalized sub-plan, shard set)` — **content-addressable, never stale
+within a session, and shareable across sessions.**
+
+**Name scope ≠ realization scope.** A session-private *name* can point at
+a daemon-shared *realization*. Three scopes:
+
+| Scope | Holds | Lifetime |
+|---|---|---|
+| Session | the mutable cursor (current grouping, stat stack) and views over session-private (`DoPut`-pinned) data | reaped with the session |
+| Daemon (shared cache) | content-addressed realizations of deterministic sub-plans over immutable shards (bitmaps, FTGS sub-results) | LRU; rebuildable; lost on restart |
+| Cluster (catalog) | persisted *named* view definitions (shared cohorts), in object storage | survives restarts; realized per-daemon into the shared cache on use |
+
+This mirrors the shard-file cache (§1.5), already daemon-scoped and
+shared; the derived-result cache is the same idea one level up.
+`CREATE TEMP VIEW` is a session-scoped name, `CREATE VIEW` persists the
+definition to the catalog, and "promotion" just publishes the name — the
+bytes were already shared. What *forces* session scope is narrow: the
+mutable cursor, and any view over session-private uploaded data.
+Everything deterministic over base data is shareable, and should be — 50
+analysts who all start with `country = 'US'` compute that bitmap once.
+
+**Caveats reserved now (not built in v1):**
+
+- **Memory budget.** A daemon-wide shared cache competes with session
+  working sets; it needs the `MemoryBudget` / `SessionMemoryHandle`
+  accounting of §2.2. Until that lands the shared cache stays small/off.
+- **Authorization boundary.** Keying the shared cache on
+  `(plan, shard set)` is correct only while every session sees the same
+  data. The key must reserve a visibility/tenant dimension so v2 auth
+  (§1.6) cannot leak rows across users via a shared bitmap — trivial in
+  v1 (claimed identity, no enforcement), but the slot must exist now.
+
+**Engine deliverable.** Transparency reduces to one component: a
+session/daemon **cache keyed by normalized logical sub-plan → Roaring
+bitmap**, plus a planner rule that probes the cache and recognizes
+monotone narrowing (intersect, not rescan). The group-lookup backings
+(§2.5) are the in-memory representation of a session-scoped `_g`, and the
+FTGS scan (§2.6) already consumes a `&GroupLookup` positionally — so the
+join against `groups(doc_id, …)` is an array lookup, not a hash join. No
+second wire surface.
+
+**What stays open.** Whether `SessionControl` is ever needed is decided by
+real usage of the one ergonomically-awkward case — pushing a large
+*external* set (`DoPut` + semi-join). Build it only if that proves
+load-bearing; it would still ride the shared engine and session layer,
+not a parallel implementation.
 
 ---
 
