@@ -27,6 +27,7 @@ use datafusion::physical_plan::{
 
 use super::pushdown::PushedFilter;
 use super::scan::{block_on_scan, chunked_stream, fetch_selected_shards};
+use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::memory::SessionMemoryHandle;
 use crate::shard::{DiskShard, FilterResult, Shard};
@@ -113,6 +114,7 @@ impl ExecutionPlan for TutankhamunExec {
         let mem = context
             .session_config()
             .get_extension::<SessionMemoryHandle>();
+        let bitmap_cache = context.session_config().get_extension::<BitmapCache>();
         let batches = block_on_scan(|| {
             collect_batches(
                 &self.url,
@@ -120,6 +122,7 @@ impl ExecutionPlan for TutankhamunExec {
                 &self.pushed,
                 &self.projected_schema,
                 mem.as_ref(),
+                bitmap_cache.as_ref(),
             )
         })?;
         // Each shard contributes one (possibly large) batch; cap every emitted
@@ -134,11 +137,13 @@ async fn collect_batches(
     pushed: &[PushedFilter],
     projected_schema: &SchemaRef,
     mem: Option<&Arc<SessionMemoryHandle>>,
+    bitmap_cache: Option<&Arc<BitmapCache>>,
 ) -> anyhow::Result<Vec<RecordBatch>> {
     // `_reservations` holds the per-shard memory charge for the scan; it drops
     // (releasing the budget) when this function returns, after the batches are
     // built from the now-resident shards.
-    let (shards, _reservations) = fetch_selected_shards(url, cache, pushed, mem).await?;
+    let (shards, _reservations) =
+        fetch_selected_shards(url, cache, pushed, mem, bitmap_cache).await?;
     let mut batches = Vec::with_capacity(shards.len());
     for (shard, selection) in &shards {
         let batch = build_record_batch(shard, selection, projected_schema)?;

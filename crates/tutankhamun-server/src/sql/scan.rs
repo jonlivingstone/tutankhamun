@@ -18,6 +18,7 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_plan::memory::MemoryStream;
 
 use super::pushdown::{PushedFilter, PushedOp};
+use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::memory::{SessionMemoryHandle, SessionReservation};
 use crate::shard::{DiskShard, FilterClause, FilterResult, METRICS_FILE, matched_doc_set};
@@ -64,18 +65,20 @@ where
 /// alongside the shards so the
 /// charge is held exactly as long as the shards are resident and released when
 /// the caller drops them. `None` (the `t9n sql` CLI) charges nothing.
+///
+/// When `bitmap_cache` is set, the matched-doc set is served through the §2.8
+/// cache (exact hit or monotone-narrowing reuse) instead of always rescanning the
+/// inverted index; `None` resolves directly via [`matched_doc_set`].
 pub(crate) async fn fetch_selected_shards(
     url: &str,
     cache: &Cache,
     pushed: &[PushedFilter],
     mem: Option<&Arc<SessionMemoryHandle>>,
+    bitmap_cache: Option<&Arc<BitmapCache>>,
 ) -> anyhow::Result<(Vec<(DiskShard, FilterResult)>, Vec<SessionReservation>)> {
     let registry = StorageRegistry::from_url(url)?;
     let source = ObjectStoreShardSource::new(registry.store());
     let summaries = source.discover().await?;
-
-    let filter_clauses: Vec<FilterClause<'_>> =
-        pushed.iter().map(PushedFilter::as_clause).collect();
 
     let mut out = Vec::with_capacity(summaries.len());
     let mut reservations = Vec::new();
@@ -99,7 +102,14 @@ pub(crate) async fn fetch_selected_shards(
             let bytes = std::fs::metadata(local_dir.join(METRICS_FILE)).map_or(0, |m| m.len());
             reservations.push(handle.reserve(bytes).map_err(|e| anyhow::anyhow!(e))?);
         }
-        let selection = matched_doc_set(&shard, &filter_clauses)?;
+        let selection = if let Some(bc) = bitmap_cache {
+            let id = BitmapCache::shard_id(url, summary.location.as_ref());
+            bc.resolve(&shard, id, pushed)?
+        } else {
+            let clauses: Vec<FilterClause<'_>> =
+                pushed.iter().map(PushedFilter::as_clause).collect();
+            matched_doc_set(&shard, &clauses)?
+        };
         out.push((shard, selection));
     }
     Ok((out, reservations))

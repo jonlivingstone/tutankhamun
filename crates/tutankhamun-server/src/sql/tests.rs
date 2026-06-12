@@ -1445,3 +1445,190 @@ async fn theta_intersect_counts_cohort_overlap() {
     let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
     assert_eq!(rows[0][0], 1);
 }
+
+// ---- §2.8 doc-set bitmap cache ----
+
+use crate::bitmap_cache::BitmapCache;
+use crate::memory::{MemoryBudget, SessionMemoryHandle};
+use crate::shard::{DiskShard, FilterResult, matched_doc_set};
+use crate::sql::pushdown::{PushedFilter, PushedOp};
+
+fn eq_filter(field: &str, term: &str) -> PushedFilter {
+    PushedFilter {
+        field: field.to_string(),
+        op: PushedOp::Equals(term.to_string()),
+        exact: true,
+    }
+}
+
+/// Matched doc ids of a `FilterResult`, in order (`All` is unexpected here).
+fn doc_ids(r: &FilterResult) -> Vec<u32> {
+    match r {
+        FilterResult::All => panic!("unexpected All"),
+        FilterResult::Empty => Vec::new(),
+        FilterResult::Bitmap(b) => b.iter().collect(),
+    }
+}
+
+fn ample_cache() -> BitmapCache {
+    BitmapCache::new(Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(u64::MAX)),
+        u64::MAX,
+    )))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_cache_exact_hit_narrowing_and_correctness() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let shard = DiskShard::open(&tmp.path().join("a")).expect("open shard a");
+    let sid = 1u64;
+    let cache = ample_cache();
+
+    // Cold miss: country='us' → {0,2}, cached.
+    let f_us = [eq_filter("country", "us")];
+    assert_eq!(
+        doc_ids(&cache.resolve(&shard, sid, &f_us).unwrap()),
+        vec![0, 2]
+    );
+    assert_eq!((cache.hits(), cache.narrows(), cache.misses()), (0, 0, 1));
+
+    // Exact hit: same filter again.
+    assert_eq!(
+        doc_ids(&cache.resolve(&shard, sid, &f_us).unwrap()),
+        vec![0, 2]
+    );
+    assert_eq!((cache.hits(), cache.narrows(), cache.misses()), (1, 0, 1));
+
+    // Narrowing: country='us' AND vendor_id=2 adds a conjunct. us docs {0,2}
+    // both have vendor_id 1, so the result is empty — and must equal a fresh
+    // matched_doc_set over the full filter (guards the cached ∩ delta math).
+    let f_narrow = [eq_filter("country", "us"), eq_filter("vendor_id", "2")];
+    let narrowed = cache.resolve(&shard, sid, &f_narrow).unwrap();
+    let clauses: Vec<_> = f_narrow.iter().map(PushedFilter::as_clause).collect();
+    let oracle = matched_doc_set(&shard, &clauses).unwrap();
+    assert_eq!(doc_ids(&narrowed), doc_ids(&oracle));
+    assert_eq!(doc_ids(&narrowed), Vec::<u32>::new());
+    assert_eq!((cache.hits(), cache.narrows(), cache.misses()), (1, 1, 1));
+
+    // Clause order is normalized away → the reversed filter is an exact hit.
+    let f_rev = [eq_filter("vendor_id", "2"), eq_filter("country", "us")];
+    assert!(matches!(
+        cache.resolve(&shard, sid, &f_rev).unwrap(),
+        FilterResult::Empty
+    ));
+    assert_eq!(cache.hits(), 2);
+
+    // A different shard id is an independent namespace → miss.
+    let _ = cache.resolve(&shard, 999, &f_us).unwrap();
+    assert_eq!(cache.misses(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_cache_evicts_lru_under_pressure() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let shard = DiskShard::open(&tmp.path().join("a")).expect("open shard a");
+
+    // Learn the size of one cached entry by observing the (cloned) handle.
+    let probe_handle = Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(u64::MAX)),
+        u64::MAX,
+    ));
+    let probe = BitmapCache::new(Arc::clone(&probe_handle));
+    probe
+        .resolve(&shard, 1, &[eq_filter("country", "us")])
+        .unwrap();
+    let one_entry = probe_handle.used();
+    assert!(one_entry > 0, "an entry charges some bytes");
+
+    // Cache capped to hold exactly one entry; 'us' and 'de' bitmaps are the same
+    // size (two docs each), so inserting 'de' must evict 'us'.
+    let handle = Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(u64::MAX)),
+        one_entry,
+    ));
+    let cache = BitmapCache::new(handle);
+    cache
+        .resolve(&shard, 1, &[eq_filter("country", "us")])
+        .unwrap(); // caches us
+    cache
+        .resolve(&shard, 1, &[eq_filter("country", "de")])
+        .unwrap(); // evicts us, caches de
+
+    // 'de' is still cached → exact hit; 'us' was evicted → miss (recomputed).
+    let hits_before = cache.hits();
+    assert!(matches!(
+        cache
+            .resolve(&shard, 1, &[eq_filter("country", "de")])
+            .unwrap(),
+        FilterResult::Bitmap(_)
+    ));
+    assert_eq!(cache.hits(), hits_before + 1, "de stayed cached");
+    let misses_before = cache.misses();
+    let _ = cache
+        .resolve(&shard, 1, &[eq_filter("country", "us")])
+        .unwrap();
+    assert_eq!(cache.misses(), misses_before + 1, "us was evicted");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_cache_disabled_when_budget_too_small() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let shard = DiskShard::open(&tmp.path().join("a")).expect("open shard a");
+
+    // A few bytes can't hold any bitmap → every insert is skipped, every probe
+    // misses, but results stay correct (resolve falls back to a fresh scan).
+    let cache = BitmapCache::new(Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(8)),
+        8,
+    )));
+    let f = [eq_filter("country", "us")];
+    assert_eq!(doc_ids(&cache.resolve(&shard, 1, &f).unwrap()), vec![0, 2]);
+    assert_eq!(doc_ids(&cache.resolve(&shard, 1, &f).unwrap()), vec![0, 2]);
+    assert_eq!(cache.hits(), 0, "tiny budget caches nothing");
+    assert_eq!(cache.misses(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bitmap_cache_threads_into_both_exec_paths() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+
+    // Inject a shared cache as a SessionConfig extension (as the daemon does in
+    // build_context) and hold a clone to read its counters.
+    let cache = Arc::new(ample_cache());
+    let ctx = super::session_context_with(SessionConfig::new().with_extension(Arc::clone(&cache)));
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    // Row scan with WHERE → TutankhamunExec → fetch_selected_shards → resolve.
+    // Two shards → two cold misses.
+    ctx.sql("SELECT vendor_id FROM trips WHERE country = 'us'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        cache.misses(),
+        2,
+        "row scan populated the cache (one per shard)"
+    );
+
+    // Same filter via the aggregate path → FtgsAggExec → the SAME chokepoint →
+    // exact hits, proving both execs share the daemon cache.
+    ctx.sql("SELECT count(*) FROM trips WHERE country = 'us'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(
+        cache.hits(),
+        2,
+        "aggregate path reused the bitmaps the row scan cached"
+    );
+    assert_eq!(cache.misses(), 2, "no new misses");
+}

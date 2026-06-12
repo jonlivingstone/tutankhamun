@@ -16,8 +16,9 @@ use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 use tonic::transport::Channel;
 
+use tutankhamun_server::bitmap_cache::BitmapCache;
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
-use tutankhamun_server::memory::MemoryBudget;
+use tutankhamun_server::memory::{MemoryBudget, SessionMemoryHandle};
 use tutankhamun_server::shard::DiskShardWriter;
 use tutankhamun_server::shutdown::ShutdownHandle;
 
@@ -99,12 +100,18 @@ async fn start_with_budget(
         .await
         .expect("bind grpc");
     let addr = listener.local_addr().expect("local addr");
+    let mem = Arc::new(MemoryBudget::new(budget));
+    let bitmap_cache = Arc::new(BitmapCache::new(Arc::new(SessionMemoryHandle::new(
+        Arc::clone(&mem),
+        budget,
+    ))));
     let svc = TutankhamunFlightSqlService::new(
         storage_url,
         cache.path().to_path_buf(),
         u64::MAX,
-        Arc::new(MemoryBudget::new(budget)),
+        mem,
         100,
+        bitmap_cache,
     );
     let server = tokio::spawn({
         let shutdown = shutdown.clone();

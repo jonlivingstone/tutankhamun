@@ -3,6 +3,7 @@
 //! See `.docs/tutankhamun.md` for the design.
 
 pub mod bit_tree;
+pub mod bitmap_cache;
 pub mod cache;
 pub mod config;
 pub mod flight_sql;

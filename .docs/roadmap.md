@@ -238,11 +238,21 @@ directly.
       key/XDBC-info RPCs. Transactions are intentionally left unimplemented —
       a pure no-op until there is mutable state to transact, so honest
       `unimplemented` beats a fake commit/rollback)
-- [~] Session-aware SQL execution — §3.2 (sessions now persist a
+- [x] Session-aware SQL execution — §3.2/§2.8 (sessions persist a
       `SessionContext` across calls, so session-scoped temp views/tables survive
-      — the §2.8 name layer. The deeper part — reusing a cached doc-set bitmap
-      when a query's filter refines the previous (monotone narrowing) — is the
-      next slice)
+      — the §2.8 name layer. The realization layer now lands too: a daemon-shared
+      `bitmap_cache::BitmapCache` keys per-shard matched-doc Roaring bitmaps by
+      `(shard identity, normalized clause set, visibility)` and serves exact hits
+      (cross-session reuse of identical filters) plus monotone narrowing — a new
+      filter that adds conjuncts reuses the cached bitmap and intersects only the
+      delta (`result = matched_doc_set(cached) ∩ matched_doc_set(delta)`) instead
+      of rescanning. Reached at the `fetch_selected_shards` chokepoint (both the
+      row scan and the FTGS aggregate) via a `SessionConfig` extension, the same
+      mechanism as the §2.2 memory handle; the `t9n sql` CLI sets no extension and
+      caches nothing. Bounded by a `SessionMemoryHandle` sub-budget
+      (`--bitmap-cache-pct`, default 25%, 0 disables) that charges the §2.2 global
+      budget, with LRU eviction. Reserved: a `Visibility` key slot for v2 auth.
+      Deferred: range-tightening narrowing and FTGS sub-result caching)
 - [x] Session-affinity metadata header
       (`x-tutankhamun-session-id`) published in gRPC responses —
       §2.4 (set on the handshake response; also accepted as an input

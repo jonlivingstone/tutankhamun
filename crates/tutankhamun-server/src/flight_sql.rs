@@ -65,6 +65,7 @@ use arrow_flight::{
 
 use object_store::ObjectStore;
 
+use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::shutdown::ShutdownHandle;
@@ -124,6 +125,9 @@ struct ServiceInner {
     budget: Arc<MemoryBudget>,
     /// Per-session cap as a percent of [`Self::budget`]'s limit.
     session_pct: u8,
+    /// Daemon-shared doc-set bitmap cache (§2.8); threaded into each context as a
+    /// `SessionConfig` extension so the scan can probe it.
+    bitmap_cache: Arc<BitmapCache>,
 }
 
 // Manual `Debug`: the cache and session maps hold `Cache`/`SessionContext`
@@ -228,6 +232,7 @@ impl TutankhamunFlightSqlService {
         size_cap: u64,
         budget: Arc<MemoryBudget>,
         session_pct: u8,
+        bitmap_cache: Arc<BitmapCache>,
     ) -> Self {
         Self {
             inner: Arc::new(ServiceInner {
@@ -239,6 +244,7 @@ impl TutankhamunFlightSqlService {
                 prepared: Mutex::new(HashMap::new()),
                 budget,
                 session_pct,
+                bitmap_cache,
             }),
         }
     }
@@ -269,7 +275,10 @@ impl TutankhamunFlightSqlService {
     /// session-agnostic) query execs can charge their forward-column working set
     /// to it via [`TaskContext::session_config`] (§2.2).
     fn build_context(&self, mem: Arc<SessionMemoryHandle>) -> SessionContext {
-        let ctx = sql::session_context_with(SessionConfig::new().with_extension(mem));
+        let config = SessionConfig::new()
+            .with_extension(mem)
+            .with_extension(Arc::clone(&self.inner.bitmap_cache));
+        let ctx = sql::session_context_with(config);
         let provider = Arc::new(DatasetSchemaProvider {
             inner: Arc::clone(&self.inner),
             registered: Mutex::new(HashMap::new()),
@@ -1001,12 +1010,18 @@ mod tests {
     }
 
     fn svc_with_budget(limit: u64) -> TutankhamunFlightSqlService {
+        let budget = Arc::new(MemoryBudget::new(limit));
+        let bitmap_cache = Arc::new(BitmapCache::new(Arc::new(SessionMemoryHandle::new(
+            Arc::clone(&budget),
+            limit,
+        ))));
         TutankhamunFlightSqlService::new(
             "memory:///".to_string(),
             std::env::temp_dir().join("t9n-session-test"),
             u64::MAX,
-            Arc::new(MemoryBudget::new(limit)),
+            budget,
             100, // per-session cap = 100% of global, so tests bind on the global
+            bitmap_cache,
         )
     }
 

@@ -10,6 +10,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
+use tutankhamun_server::bitmap_cache;
 use tutankhamun_server::cache;
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
@@ -349,7 +350,18 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     if pct == 0 || pct > 100 {
         anyhow::bail!("--max-session-memory-pct must be between 1 and 100 (got {pct})");
     }
+    // The bitmap cache may use 0% (disabled) up to 100% of the budget.
+    let cache_pct = config.bitmap_cache_pct;
+    if cache_pct > 100 {
+        anyhow::bail!("--bitmap-cache-pct must be between 0 and 100 (got {cache_pct})");
+    }
     let budget = Arc::new(memory::MemoryBudget::new(mem_limit));
+    // Daemon-shared doc-set bitmap cache (§2.8), bounded by a sub-budget of the
+    // global limit so it competes with session working sets and LRU-evicts.
+    let bitmap_cache_cap = mem_limit.saturating_mul(u64::from(cache_pct)) / 100;
+    let bitmap_cache = Arc::new(bitmap_cache::BitmapCache::new(Arc::new(
+        memory::SessionMemoryHandle::new(Arc::clone(&budget), bitmap_cache_cap),
+    )));
     info!(
         bytes = mem_limit,
         per_session_pct = config.max_session_memory_pct,
@@ -363,6 +375,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             cache_cap,
             budget,
             config.max_session_memory_pct,
+            bitmap_cache,
         );
         async move {
             if let Err(e) = flight_sql::serve(grpc_listener, svc, shutdown).await {

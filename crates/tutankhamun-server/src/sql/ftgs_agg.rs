@@ -31,6 +31,7 @@ use roaring::RoaringBitmap;
 use super::group_by::OwnedStat;
 use super::pushdown::PushedFilter;
 use super::scan::{block_on_scan, chunked_stream, fetch_selected_shards};
+use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::ftgs::{
     FtgsRow, OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped,
@@ -134,6 +135,7 @@ impl ExecutionPlan for FtgsAggExec {
         let mem = context
             .session_config()
             .get_extension::<SessionMemoryHandle>();
+        let bitmap_cache = context.session_config().get_extension::<BitmapCache>();
         let batch = block_on_scan(|| {
             aggregate_batch(
                 &self.url,
@@ -143,6 +145,7 @@ impl ExecutionPlan for FtgsAggExec {
                 &self.filters,
                 &self.schema,
                 mem.as_ref(),
+                bitmap_cache.as_ref(),
             )
         })?;
         // One row per group; cap every emitted batch to the session's
@@ -151,6 +154,7 @@ impl ExecutionPlan for FtgsAggExec {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn aggregate_batch(
     url: &str,
     cache: &Cache,
@@ -159,10 +163,12 @@ async fn aggregate_batch(
     filters: &[PushedFilter],
     schema: &SchemaRef,
     mem: Option<&Arc<SessionMemoryHandle>>,
+    bitmap_cache: Option<&Arc<BitmapCache>>,
 ) -> anyhow::Result<RecordBatch> {
     // `_reservations` holds the per-shard memory charge for the scan, released
     // when this function returns.
-    let (shards, _reservations) = fetch_selected_shards(url, cache, filters, mem).await?;
+    let (shards, _reservations) =
+        fetch_selected_shards(url, cache, filters, mem, bitmap_cache).await?;
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
     if group_cols.is_empty() {
         reshape_global(

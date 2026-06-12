@@ -24,6 +24,7 @@ pub mod env_vars {
     pub const LOG_JSON: &str = "TUT_LOG_JSON";
     pub const MEMORY_LIMIT: &str = "TUT_MEMORY_LIMIT";
     pub const MAX_SESSION_MEMORY_PCT: &str = "TUT_MAX_SESSION_MEMORY_PCT";
+    pub const BITMAP_CACHE_PCT: &str = "TUT_BITMAP_CACHE_PCT";
 
     /// Prefix figment uses to scan for env-driven overrides.
     pub const PREFIX: &str = "TUT_";
@@ -91,6 +92,12 @@ pub struct ServeArgs {
     #[arg(long, env = env_vars::MAX_SESSION_MEMORY_PCT)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_session_memory_pct: Option<u8>,
+
+    /// Doc-set bitmap cache size as a percent of the global memory budget
+    /// (0..=100; 0 disables the cache).
+    #[arg(long, env = env_vars::BITMAP_CACHE_PCT)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bitmap_cache_pct: Option<u8>,
 }
 
 /// Fully-resolved daemon configuration.
@@ -108,6 +115,8 @@ pub struct Config {
     pub memory_limit: String,
     /// Per-session memory cap as a percent of the global budget.
     pub max_session_memory_pct: u8,
+    /// Doc-set bitmap cache size as a percent of the global budget (0 disables).
+    pub bitmap_cache_pct: u8,
 }
 
 impl Default for Config {
@@ -123,6 +132,7 @@ impl Default for Config {
             shutdown_timeout_secs: 30,
             memory_limit: "4GB".into(),
             max_session_memory_pct: 20,
+            bitmap_cache_pct: 25,
         }
     }
 }
