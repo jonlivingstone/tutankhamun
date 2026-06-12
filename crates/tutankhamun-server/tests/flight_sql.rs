@@ -8,7 +8,9 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_flight::FlightInfo;
 use arrow_flight::sql::client::FlightSqlServiceClient;
+use arrow_flight::sql::{CommandGetDbSchemas, CommandGetTables};
 use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 use tonic::transport::Channel;
@@ -91,9 +93,7 @@ async fn run_query(client: &mut FlightSqlServiceClient<Channel>, sql: &str) -> V
         .execute(sql.to_string(), None)
         .await
         .expect("get_flight_info");
-    let ticket = info.endpoint[0].ticket.clone().expect("endpoint ticket");
-    let stream = client.do_get(ticket).await.expect("do_get");
-    stream.try_collect().await.expect("collect batches")
+    do_get(client, info).await
 }
 
 fn int64(batch: &RecordBatch, col: usize) -> &Int64Array {
@@ -102,6 +102,214 @@ fn int64(batch: &RecordBatch, col: usize) -> &Int64Array {
         .as_any()
         .downcast_ref()
         .expect("int64 col")
+}
+
+/// `DoGet` the single endpoint of a metadata/query `FlightInfo` and collect.
+async fn do_get(
+    client: &mut FlightSqlServiceClient<Channel>,
+    info: FlightInfo,
+) -> Vec<RecordBatch> {
+    let ticket = info.endpoint[0].ticket.clone().expect("endpoint ticket");
+    let stream = client.do_get(ticket).await.expect("do_get");
+    stream.try_collect().await.expect("collect batches")
+}
+
+/// Flatten a `Utf8` column across batches into owned strings.
+fn string_col(batches: &[RecordBatch], col: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for b in batches {
+        let a: &StringArray = b.column(col).as_any().downcast_ref().expect("utf8 col");
+        for i in 0..b.num_rows() {
+            out.push(a.value(i).to_string());
+        }
+    }
+    out
+}
+
+/// A `CommandGetTables` with no filters and the given `include_schema`.
+fn tables_cmd(include_schema: bool) -> CommandGetTables {
+    CommandGetTables {
+        catalog: None,
+        db_schema_filter_pattern: None,
+        table_name_filter_pattern: None,
+        table_types: vec![],
+        include_schema,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn prepared_statement_roundtrip() {
+    let (addr, shutdown, server, _storage, _cache) = start().await;
+    let mut client = connect(addr).await;
+
+    let mut stmt = client
+        .prepare("SELECT count(*) AS n FROM ds1".to_string(), None)
+        .await
+        .expect("prepare");
+    // No parameter binding yet → empty parameter schema; the dataset schema is
+    // the query's output (`n`).
+    assert_eq!(
+        stmt.parameter_schema()
+            .expect("param schema")
+            .fields()
+            .len(),
+        0,
+        "no bound parameters supported"
+    );
+    assert_eq!(
+        stmt.dataset_schema()
+            .expect("dataset schema")
+            .field(0)
+            .name(),
+        "n"
+    );
+
+    let info = stmt.execute().await.expect("execute prepared");
+    let batches = do_get(&mut client, info).await;
+    assert_eq!(int64(&batches[0], 0).value(0), 4, "count(*) over ds1");
+
+    // A prepared GROUP BY rides the same FTGS pushdown as the ad-hoc path.
+    let mut grp = client
+        .prepare(
+            "SELECT country, sum(fare) AS s FROM ds1 GROUP BY country".to_string(),
+            None,
+        )
+        .await
+        .expect("prepare group-by");
+    let info = grp.execute().await.expect("execute group-by");
+    let batches = do_get(&mut client, info).await;
+    let mut got = BTreeMap::new();
+    for b in &batches {
+        let countries: &StringArray = b.column(0).as_any().downcast_ref().expect("utf8 col");
+        let sums = int64(b, 1);
+        for i in 0..b.num_rows() {
+            got.insert(countries.value(i).to_string(), sums.value(i));
+        }
+    }
+    assert_eq!(got.get("us"), Some(&400));
+    assert_eq!(got.get("de"), Some(&600));
+
+    // Close releases each handle on the server.
+    grp.close().await.expect("close group-by");
+    stmt.close().await.expect("close count");
+
+    drop(client);
+    shutdown.trigger();
+    server
+        .await
+        .expect("server task join")
+        .expect("serve returned ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn catalog_metadata_lists_datasets_schemas_and_views() {
+    let (addr, shutdown, server, _storage, _cache) = start().await;
+
+    let mut client = connect(addr).await;
+
+    // Catalogs / schemas: the single engine namespace.
+    let info = client.get_catalogs().await.expect("get_catalogs");
+    let catalogs = string_col(&do_get(&mut client, info).await, 0);
+    assert!(catalogs.contains(&"datafusion".to_string()), "{catalogs:?}");
+
+    let info = client
+        .get_db_schemas(CommandGetDbSchemas {
+            catalog: None,
+            db_schema_filter_pattern: None,
+        })
+        .await
+        .expect("get_db_schemas");
+    let schemas = string_col(&do_get(&mut client, info).await, 1);
+    assert!(schemas.contains(&"public".to_string()), "{schemas:?}");
+
+    // Tables: the dataset on disk shows up as a TABLE (table_name col 2, type col 3).
+    let info = client
+        .get_tables(tables_cmd(false))
+        .await
+        .expect("get_tables");
+    let batches = do_get(&mut client, info).await;
+    let names = string_col(&batches, 2);
+    let types = string_col(&batches, 3);
+    assert!(names.contains(&"ds1".to_string()), "{names:?}");
+    let ds1_type = names
+        .iter()
+        .zip(&types)
+        .find(|(n, _)| n.as_str() == "ds1")
+        .map(|(_, t)| t.as_str());
+    assert_eq!(ds1_type, Some("TABLE"));
+
+    // include_schema=true adds the IPC-encoded per-table schema as a 5th column,
+    // built from each dataset's own metadata.
+    let info = client
+        .get_tables(tables_cmd(true))
+        .await
+        .expect("get_tables schema");
+    let batches = do_get(&mut client, info).await;
+    assert_eq!(batches[0].num_columns(), 5, "table_schema column present");
+    let names = string_col(&batches, 2);
+    let ds1_row = names.iter().position(|n| n == "ds1").expect("ds1 row");
+    let table_schema: &arrow::array::BinaryArray = batches[0]
+        .column(4)
+        .as_any()
+        .downcast_ref()
+        .expect("binary col");
+    assert!(
+        !table_schema.value(ds1_row).is_empty(),
+        "ds1 carries a non-empty IPC schema"
+    );
+
+    // The LIKE filter actually filters.
+    let mut hit = tables_cmd(false);
+    hit.table_name_filter_pattern = Some("ds1".to_string());
+    let info = client.get_tables(hit).await.expect("hit");
+    let names = string_col(&do_get(&mut client, info).await, 2);
+    assert!(names.contains(&"ds1".to_string()));
+
+    let mut miss = tables_cmd(false);
+    miss.table_name_filter_pattern = Some("nope".to_string());
+    let info = client.get_tables(miss).await.expect("miss");
+    let names = string_col(&do_get(&mut client, info).await, 2);
+    assert!(
+        !names.contains(&"ds1".to_string()),
+        "filter excluded ds1: {names:?}"
+    );
+
+    // Table types.
+    let info = client.get_table_types().await.expect("get_table_types");
+    let kinds = string_col(&do_get(&mut client, info).await, 0);
+    assert!(kinds.contains(&"TABLE".to_string()) && kinds.contains(&"VIEW".to_string()));
+
+    // A session temp view appears as a VIEW for that session.
+    let mut session = session_client(addr).await;
+    session
+        .execute_update(
+            "CREATE VIEW v1 AS SELECT country, fare FROM ds1".to_string(),
+            None,
+        )
+        .await
+        .expect("create view");
+    let info = session
+        .get_tables(tables_cmd(false))
+        .await
+        .expect("session tables");
+    let batches = do_get(&mut session, info).await;
+    let names = string_col(&batches, 2);
+    let types = string_col(&batches, 3);
+    assert!(names.contains(&"ds1".to_string()) && names.contains(&"v1".to_string()));
+    let v1_type = names
+        .iter()
+        .zip(&types)
+        .find(|(n, _)| n.as_str() == "v1")
+        .map(|(_, t)| t.as_str());
+    assert_eq!(v1_type, Some("VIEW"));
+
+    drop(client);
+    drop(session);
+    shutdown.trigger();
+    server
+        .await
+        .expect("server task join")
+        .expect("serve returned ok");
 }
 
 #[tokio::test(flavor = "multi_thread")]

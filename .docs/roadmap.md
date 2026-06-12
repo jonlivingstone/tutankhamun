@@ -149,8 +149,11 @@ directly.
       handshake doubles as session-open: mints an opaque server-issued token
       the client echoes as a bearer. Admission check waits on §2.2;
       time-range shard selection happens per-query in the scan)
-- [ ] `CloseSession` handler — explicit teardown — §2.4 (idle/max-age
-      reaping covers it for now; an explicit close action is deferred)
+- [x] `CloseSession` handler — explicit teardown — §2.4 (`FlightSQL` 56.2.1
+      has no native CloseSession action, so it's a custom `do_action`
+      advertised via `list_custom_actions` and handled in `do_action_fallback`:
+      removes the session named by the bearer token, freeing its state at once
+      rather than waiting for the idle/max-age reaper)
 - [x] Idle timeout reaper (default 30 min) — §2.4 (const; configurable
       knob deferred)
 - [x] Hard maximum age reaper (default 4 h) — §2.4 (const; configurable
@@ -207,8 +210,15 @@ directly.
       engine [`sql::session_context`]; `do_handshake` opens a session and
       `do_put_statement_update` runs DDL/DML — `CREATE VIEW` etc. — against the
       session context; datasets under the storage root are addressable as tables
-      by name via a lazy, registerable `SchemaProvider`. Prepared statements,
-      transactions, and catalog-metadata RPCs remain)
+      by name via a lazy, registerable `SchemaProvider`. Prepared statements
+      (create/get/`do_get`/update/close, no-parameter case) and the
+      catalog-metadata RPCs (catalogs/schemas/tables/table-types, datasets as
+      `TABLE` + session temp views as `VIEW`, reported under `datafusion`/`public`)
+      now work; an explicit `CloseSession` custom action frees a session. Still
+      remaining: prepared-statement *parameter binding*, `GetSqlInfo` and the
+      key/XDBC-info RPCs. Transactions are intentionally left unimplemented —
+      a pure no-op until there is mutable state to transact, so honest
+      `unimplemented` beats a fake commit/rollback)
 - [~] Session-aware SQL execution — §3.2 (sessions now persist a
       `SessionContext` across calls, so session-scoped temp views/tables survive
       — the §2.8 name layer. The deeper part — reusing a cached doc-set bitmap

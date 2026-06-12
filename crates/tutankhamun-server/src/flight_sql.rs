@@ -14,10 +14,14 @@
 //! context. Calls without a token run against a fresh ephemeral context, exactly
 //! as before. Idle (30 min) and aged (4 h) sessions are reaped.
 //!
-//! Prepared statements, transactions, and the catalog-metadata RPCs are left at
-//! their trait defaults; the FTGS-native `DoGet` and the §2.8 narrowing cache
-//! land later. Plain HTTP/2 — protected by network policy until auth lands, like
-//! the ops port.
+//! **Prepared statements** (create / get / `do_get` / update / close) and the
+//! **catalog-metadata RPCs** (catalogs / schemas / tables / table types) are
+//! implemented, and an explicit **`CloseSession`** custom action frees a session
+//! immediately. Still deferred: prepared-statement *parameter binding*,
+//! transactions / savepoints (a no-op until there is mutable state to transact),
+//! `GetSqlInfo` and the key/XDBC-info RPCs, the FTGS-native `DoGet`, and the §2.8
+//! narrowing cache. Plain HTTP/2 — protected by network policy until auth lands,
+//! like the ops port.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -28,7 +32,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::ipc::writer::IpcWriteOptions;
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::common::{DataFusionError, Result as DfResult};
@@ -46,11 +52,18 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
-    CommandStatementQuery, CommandStatementUpdate, ProstMessageExt, SqlInfo, TicketStatementQuery,
+    ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
+    ActionCreatePreparedStatementResult, CommandGetCatalogs, CommandGetDbSchemas,
+    CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
+    CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate,
+    DoPutPreparedStatementResult, ProstMessageExt, SqlInfo, TicketStatementQuery,
 };
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
+    Action, ActionType, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
+    HandshakeResponse, IpcMessage, Result as FlightResult, SchemaAsIpc, Ticket,
 };
+
+use object_store::ObjectStore;
 
 use crate::cache::Cache;
 use crate::shutdown::ShutdownHandle;
@@ -60,6 +73,11 @@ use crate::storage::StorageRegistry;
 /// Affinity header: the session id is published here on the handshake response
 /// (for proxy routing) and accepted here as an alternative to the bearer token.
 const SESSION_HEADER: &str = "x-tutankhamun-session-id";
+/// Custom `do_action` type for explicit session teardown. `FlightSQL` 56.2.1 has
+/// no native `CloseSession` action, so it is advertised via `list_custom_actions`
+/// and handled in `do_action_fallback`, freeing session state immediately rather
+/// than waiting for the idle/max-age reaper.
+const CLOSE_SESSION_ACTION: &str = "CloseSession";
 // §2.4 defaults, hardcoded for v1; exposing them as config knobs is deferred
 // (tracked in the roadmap, same call as the cache-cap default).
 /// How often the reaper sweeps the session registry.
@@ -90,6 +108,12 @@ struct ServiceInner {
     /// Live sessions keyed by their opaque token. Holds the persistent context
     /// (and its session-scoped temp views); reaped on idle / max age.
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// Prepared statements keyed by their opaque handle → the SQL text. The
+    /// handle is an unguessable UUID; execution re-resolves the session from
+    /// request metadata per call (like the ad-hoc statement path), so a prepared
+    /// statement sees its session's temp views. Entries are dropped on
+    /// `ClosePreparedStatement`. Parameter binding is not yet supported.
+    prepared: Mutex<HashMap<String, String>>,
 }
 
 // Manual `Debug`: the cache and session maps hold `Cache`/`SessionContext`
@@ -152,6 +176,24 @@ impl ServiceInner {
         Ok(cache)
     }
 
+    /// Dataset names under the storage root — the top-level directories. A
+    /// single delimited LIST (one round-trip, no shard reads); unlike a full
+    /// `discover`, it does not fetch every shard's `metadata.json` just to learn
+    /// the names. A non-dataset top-level dir would list too, but resolving it
+    /// as a table is then a clean "not found".
+    async fn list_datasets(&self) -> anyhow::Result<Vec<String>> {
+        let registry = StorageRegistry::from_url(&self.storage_url)?;
+        let listing = registry.store().list_with_delimiter(None).await?;
+        let mut names: Vec<String> = listing
+            .common_prefixes
+            .iter()
+            .filter_map(|p| p.parts().last().map(|seg| seg.as_ref().to_string()))
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     /// Drop sessions past their idle timeout or maximum age. Returns the count
     /// reaped.
     fn reap_expired(&self, now: Instant) -> usize {
@@ -172,6 +214,7 @@ impl TutankhamunFlightSqlService {
                 size_cap,
                 caches: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
+                prepared: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -246,6 +289,44 @@ impl TutankhamunFlightSqlService {
             None => self.build_context(),
         }
     }
+
+    /// Resolve a prepared-statement handle to its SQL text. An unknown handle
+    /// (never created, or already closed) is a clean `not_found`.
+    #[allow(clippy::result_large_err)]
+    fn prepared_sql(&self, handle: &bytes::Bytes) -> Result<String, Status> {
+        let key = String::from_utf8(handle.to_vec())
+            .map_err(|e| Status::invalid_argument(format!("prepared handle not UTF-8: {e}")))?;
+        self.inner
+            .prepared
+            .lock()
+            .expect("prepared lock")
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| Status::not_found("prepared statement not found or closed"))
+    }
+}
+
+/// IPC-encapsulate an Arrow schema as the `Bytes` the `FlightSQL`
+/// prepared-statement result carries for its dataset / parameter schemas.
+#[allow(clippy::result_large_err)]
+fn encode_schema(schema: &Schema) -> Result<bytes::Bytes, Status> {
+    let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
+        .try_into()
+        .map_err(|e| Status::internal(format!("encode schema: {e}")))?;
+    Ok(message.0)
+}
+
+/// Stream a single metadata `RecordBatch` as a `DoGet` response, the same
+/// encoder path the statement results use.
+fn batch_stream(
+    batch: RecordBatch,
+) -> Response<<TutankhamunFlightSqlService as FlightService>::DoGetStream> {
+    let schema = batch.schema();
+    let stream = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .build(futures::stream::iter(std::iter::once(Ok(batch))))
+        .map_err(Status::from);
+    Response::new(Box::pin(stream))
 }
 
 #[tonic::async_trait]
@@ -352,7 +433,356 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         Ok(0)
     }
 
+    // -- Prepared statements (no-parameter case; binding is deferred) --
+
+    async fn do_action_create_prepared_statement(
+        &self,
+        query: ActionCreatePreparedStatementRequest,
+        request: Request<Action>,
+    ) -> Result<ActionCreatePreparedStatementResult, Status> {
+        // Plan against the call's session so the dataset schema reflects its
+        // temp views; store the SQL under an opaque handle the client echoes.
+        let session = self.resolve_session(request.metadata())?;
+        let ctx = self.context_for(session.as_ref());
+        let (_df, schema) = plan(&ctx, &query.query).await?;
+
+        let handle = Uuid::new_v4().to_string();
+        self.inner
+            .prepared
+            .lock()
+            .expect("prepared lock")
+            .insert(handle.clone(), query.query);
+
+        Ok(ActionCreatePreparedStatementResult {
+            prepared_statement_handle: bytes::Bytes::from(handle.into_bytes()),
+            dataset_schema: encode_schema(schema.as_ref())?,
+            // No bound parameters are supported yet, so the parameter schema is
+            // empty: a prepared statement is a fixed SQL string.
+            parameter_schema: encode_schema(&Schema::empty())?,
+        })
+    }
+
+    async fn do_action_close_prepared_statement(
+        &self,
+        query: ActionClosePreparedStatementRequest,
+        _request: Request<Action>,
+    ) -> Result<(), Status> {
+        if let Ok(key) = String::from_utf8(query.prepared_statement_handle.to_vec()) {
+            self.inner
+                .prepared
+                .lock()
+                .expect("prepared lock")
+                .remove(&key);
+        }
+        Ok(())
+    }
+
+    async fn get_flight_info_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let sql = self.prepared_sql(&query.prepared_statement_handle)?;
+        let session = self.resolve_session(request.metadata())?;
+        let ctx = self.context_for(session.as_ref());
+        let (_df, schema) = plan(&ctx, &sql).await?;
+
+        // The ticket carries the prepared command (the handle); the blanket
+        // `do_get` routes it back to `do_get_prepared_statement`.
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        flight_info_for(schema.as_ref(), ticket, request)
+    }
+
+    async fn do_get_prepared_statement(
+        &self,
+        query: CommandPreparedStatementQuery,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let sql = self.prepared_sql(&query.prepared_statement_handle)?;
+        let session = self.resolve_session(request.metadata())?;
+        let ctx = self.context_for(session.as_ref());
+        let (df, schema) = plan(&ctx, &sql).await?;
+        let batches = df.collect().await.map_err(|e| plan_error(&e))?;
+
+        let stream = FlightDataEncoderBuilder::new()
+            .with_schema(schema)
+            .build(futures::stream::iter(batches.into_iter().map(Ok)))
+            .map_err(Status::from);
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn do_put_prepared_statement_query(
+        &self,
+        query: CommandPreparedStatementQuery,
+        _request: Request<PeekableFlightDataStream>,
+    ) -> Result<DoPutPreparedStatementResult, Status> {
+        // Parameter binding is deferred: we don't decode the bound parameter
+        // batch. Validate the handle and echo it so the client runs the query
+        // through `get_flight_info_prepared_statement` / `do_get`.
+        let _ = self.prepared_sql(&query.prepared_statement_handle)?;
+        Ok(DoPutPreparedStatementResult {
+            prepared_statement_handle: Some(query.prepared_statement_handle),
+        })
+    }
+
+    async fn do_put_prepared_statement_update(
+        &self,
+        query: CommandPreparedStatementUpdate,
+        request: Request<PeekableFlightDataStream>,
+    ) -> Result<i64, Status> {
+        let sql = self.prepared_sql(&query.prepared_statement_handle)?;
+        // An update (DDL/DML) only makes sense against a persistent session.
+        let session = self.resolve_session(request.metadata())?.ok_or_else(|| {
+            Status::failed_precondition("prepared update requires a session; handshake first")
+        })?;
+        session
+            .ctx
+            .sql(&sql)
+            .await
+            .map_err(|e| plan_error(&e))?
+            .collect()
+            .await
+            .map_err(|e| plan_error(&e))?;
+        Ok(0)
+    }
+
+    // -- Catalog metadata (catalogs / schemas / tables / table types) --
+
+    async fn get_flight_info_catalogs(
+        &self,
+        query: CommandGetCatalogs,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let schema = query.into_builder().schema();
+        flight_info_for(schema.as_ref(), ticket, request)
+    }
+
+    async fn do_get_catalogs(
+        &self,
+        query: CommandGetCatalogs,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let mut builder = query.into_builder();
+        builder.append(CATALOG_NAME);
+        let batch = builder.build().map_err(|e| metadata_error(&e))?;
+        Ok(batch_stream(batch))
+    }
+
+    async fn get_flight_info_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let schema = query.into_builder().schema();
+        flight_info_for(schema.as_ref(), ticket, request)
+    }
+
+    async fn do_get_schemas(
+        &self,
+        query: CommandGetDbSchemas,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let mut builder = query.into_builder();
+        builder.append(CATALOG_NAME, SCHEMA_NAME);
+        let batch = builder.build().map_err(|e| metadata_error(&e))?;
+        Ok(batch_stream(batch))
+    }
+
+    async fn get_flight_info_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let schema = query.into_builder().schema();
+        flight_info_for(schema.as_ref(), ticket, request)
+    }
+
+    async fn do_get_tables(
+        &self,
+        query: CommandGetTables,
+        request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let session = self.resolve_session(request.metadata())?;
+        let mut builder = query.into_builder();
+        let include = builder.include_schema();
+        let empty = Schema::empty();
+
+        // Datasets under the storage root are TABLEs. The builder applies the
+        // client's catalog / LIKE / table-type filters in `build`, so append
+        // every candidate.
+        for name in self
+            .inner
+            .list_datasets()
+            .await
+            .map_err(|e| Status::internal(format!("list datasets: {e}")))?
+        {
+            if include {
+                let base = self.inner.storage_url.trim_end_matches('/');
+                let url = format!("{base}/{name}");
+                let cache = self
+                    .inner
+                    .cache_for(&url)
+                    .map_err(|e| Status::internal(format!("cache: {e}")))?;
+                match TutankhamunTableProvider::try_new(url, cache).await {
+                    Ok(p) => builder
+                        .append(
+                            CATALOG_NAME,
+                            SCHEMA_NAME,
+                            &name,
+                            "TABLE",
+                            p.schema().as_ref(),
+                        )
+                        .map_err(|e| metadata_error(&e))?,
+                    // Raced with eviction / an empty dir — just skip it.
+                    Err(e) if e.to_string().contains("no shards") => {}
+                    Err(e) => return Err(Status::internal(format!("dataset schema: {e}"))),
+                }
+            } else {
+                builder
+                    .append(CATALOG_NAME, SCHEMA_NAME, &name, "TABLE", &empty)
+                    .map_err(|e| metadata_error(&e))?;
+            }
+        }
+
+        // Session-scoped temp views (from CREATE VIEW) are VIEWs.
+        if let Some(session) = &session
+            && let Some(sp) = session
+                .ctx
+                .catalog(CATALOG_NAME)
+                .and_then(|c| c.schema(SCHEMA_NAME))
+        {
+            for name in sp.table_names() {
+                if include {
+                    if let Some(t) = sp
+                        .table(&name)
+                        .await
+                        .map_err(|e| Status::internal(format!("view schema: {e}")))?
+                    {
+                        builder
+                            .append(
+                                CATALOG_NAME,
+                                SCHEMA_NAME,
+                                &name,
+                                "VIEW",
+                                t.schema().as_ref(),
+                            )
+                            .map_err(|e| metadata_error(&e))?;
+                    }
+                } else {
+                    builder
+                        .append(CATALOG_NAME, SCHEMA_NAME, &name, "VIEW", &empty)
+                        .map_err(|e| metadata_error(&e))?;
+                }
+            }
+        }
+
+        let batch = builder.build().map_err(|e| metadata_error(&e))?;
+        Ok(batch_stream(batch))
+    }
+
+    async fn get_flight_info_table_types(
+        &self,
+        query: CommandGetTableTypes,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        flight_info_for(table_types_schema().as_ref(), ticket, request)
+    }
+
+    async fn do_get_table_types(
+        &self,
+        _query: CommandGetTableTypes,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        Ok(batch_stream(table_types_batch()?))
+    }
+
+    // -- Custom actions: explicit session teardown --
+
+    async fn list_custom_actions(&self) -> Option<Vec<Result<ActionType, Status>>> {
+        Some(vec![Ok(ActionType {
+            r#type: CLOSE_SESSION_ACTION.to_string(),
+            description: "Closes the session named by the bearer token, freeing its \
+                          state immediately rather than waiting for the reaper."
+                .to_string(),
+        })])
+    }
+
+    async fn do_action_fallback(
+        &self,
+        request: Request<Action>,
+    ) -> Result<Response<<Self as FlightService>::DoActionStream>, Status> {
+        if request.get_ref().r#type == CLOSE_SESSION_ACTION {
+            // Idempotent: closing an already-reaped/unknown session is fine.
+            // Later calls with the token return SessionLost, as the client expects.
+            if let Some(token) = session_token(request.metadata()) {
+                self.inner
+                    .sessions
+                    .lock()
+                    .expect("sessions lock")
+                    .remove(&token);
+            }
+            let stream = futures::stream::empty::<Result<FlightResult, Status>>();
+            return Ok(Response::new(Box::pin(stream)));
+        }
+        Err(Status::invalid_argument(format!(
+            "unsupported action type: {}",
+            request.get_ref().r#type
+        )))
+    }
+
     async fn register_sql_info(&self, _id: i32, _result: &SqlInfo) {}
+}
+
+/// The single catalog / schema the engine resolves datasets under (the
+/// `DatasetSchemaProvider` is registered as `public` under catalog `datafusion`).
+/// Reporting these makes a qualified `"datafusion"."public"."<dataset>"` name
+/// round-trip through query resolution.
+const CATALOG_NAME: &str = "datafusion";
+const SCHEMA_NAME: &str = "public";
+
+/// `FlightSQL` `GetTableTypes` result schema: a single non-null `table_type` column.
+fn table_types_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new(
+        "table_type",
+        DataType::Utf8,
+        false,
+    )]))
+}
+
+/// The table types this server exposes: datasets are `TABLE`, temp views `VIEW`.
+#[allow(clippy::result_large_err)]
+fn table_types_batch() -> Result<RecordBatch, Status> {
+    RecordBatch::try_new(
+        table_types_schema(),
+        vec![Arc::new(StringArray::from(vec!["TABLE", "VIEW"]))],
+    )
+    .map_err(|e| Status::internal(format!("build table types: {e}")))
+}
+
+/// Build a metadata `FlightInfo`: output `schema`, a single endpoint whose ticket
+/// re-resolves the command, and the original descriptor.
+#[allow(clippy::result_large_err)]
+fn flight_info_for(
+    schema: &Schema,
+    ticket: Ticket,
+    request: Request<FlightDescriptor>,
+) -> Result<Response<FlightInfo>, Status> {
+    let endpoint = FlightEndpoint::new().with_ticket(ticket);
+    let info = FlightInfo::new()
+        .try_with_schema(schema)
+        .map_err(|e| Status::internal(format!("encode schema: {e}")))?
+        .with_endpoint(endpoint)
+        .with_descriptor(request.into_inner());
+    Ok(Response::new(info))
+}
+
+/// Map an error from a metadata builder onto a gRPC status.
+fn metadata_error(e: &arrow_flight::error::FlightError) -> Status {
+    Status::internal(format!("build metadata batch: {e}"))
 }
 
 /// Lazy + registerable schema provider. Resolves a table name first against the
@@ -554,5 +984,34 @@ mod tests {
         let map = svc.inner.sessions.lock().unwrap();
         assert!(map.contains_key("fresh"));
         assert!(!map.contains_key("stale"));
+    }
+
+    #[tokio::test]
+    async fn close_session_action_frees_the_session() {
+        let svc = svc();
+        let token = svc.open_session();
+
+        let mut md = MetadataMap::new();
+        md.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        assert!(
+            svc.resolve_session(&md).expect("resolve").is_some(),
+            "token resolves before close"
+        );
+
+        let mut req = Request::new(Action {
+            r#type: CLOSE_SESSION_ACTION.to_string(),
+            body: bytes::Bytes::new(),
+        });
+        req.metadata_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        FlightSqlService::do_action_fallback(&svc, req)
+            .await
+            .expect("close session action ok");
+
+        // After teardown the token is SessionLost.
+        assert!(
+            svc.resolve_session(&md).is_err(),
+            "closed token must not resolve"
+        );
     }
 }
