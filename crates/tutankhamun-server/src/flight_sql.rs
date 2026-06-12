@@ -38,7 +38,7 @@ use arrow::ipc::writer::IpcWriteOptions;
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::common::{DataFusionError, Result as DfResult};
-use datafusion::prelude::{DataFrame, SessionContext};
+use datafusion::prelude::{DataFrame, SessionConfig, SessionContext};
 use futures::{Stream, TryStreamExt};
 use prost::Message as _;
 use tokio::net::TcpListener;
@@ -66,6 +66,7 @@ use arrow_flight::{
 use object_store::ObjectStore;
 
 use crate::cache::Cache;
+use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
 use crate::storage::StorageRegistry;
@@ -87,6 +88,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// Hard maximum age — a session older than this is reaped regardless of activity
 /// (§2.4 default), bounding runaway sessions held by long-lived clients.
 const MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+/// Fixed memory charged per session on open — a rough floor for its persistent
+/// `SessionContext` and cursor state, and the lever for admission control: if
+/// this can't be reserved the daemon is at capacity (§2.2). Tunable.
+const SESSION_BASELINE_BYTES: u64 = 1 << 20; // 1 MiB
 
 /// `FlightSQL` service over a daemon's storage root. Cheap to clone (tonic
 /// clones the service per request): the state is a shared handle.
@@ -114,6 +119,11 @@ struct ServiceInner {
     /// statement sees its session's temp views. Entries are dropped on
     /// `ClosePreparedStatement`. Parameter binding is not yet supported.
     prepared: Mutex<HashMap<String, String>>,
+    /// Daemon-wide memory budget (§2.2). Every session's [`SessionMemoryHandle`]
+    /// charges through it; query scans reserve the forward-column working set.
+    budget: Arc<MemoryBudget>,
+    /// Per-session cap as a percent of [`Self::budget`]'s limit.
+    session_pct: u8,
 }
 
 // Manual `Debug`: the cache and session maps hold `Cache`/`SessionContext`
@@ -130,19 +140,25 @@ impl fmt::Debug for ServiceInner {
 }
 
 /// A live session: a persistent `DataFusion` context (holding any session-scoped
-/// temp views) plus liveness timestamps for the reaper.
+/// temp views) plus liveness timestamps for the reaper, and the baseline memory
+/// reservation. The session's [`SessionMemoryHandle`] is kept alive by both this
+/// reservation and the context's `SessionConfig` extension; all are released
+/// when the session is reaped (its `Arc` drops).
 struct Session {
     ctx: SessionContext,
     created_at: Instant,
     last_access: Mutex<Instant>,
+    #[allow(dead_code)] // RAII: returns the baseline to the budget on reap
+    baseline: SessionReservation,
 }
 
 impl Session {
-    fn new(ctx: SessionContext, now: Instant) -> Self {
+    fn new(ctx: SessionContext, now: Instant, baseline: SessionReservation) -> Self {
         Self {
             ctx,
             created_at: now,
             last_access: Mutex::new(now),
+            baseline,
         }
     }
 
@@ -206,7 +222,13 @@ impl ServiceInner {
 
 impl TutankhamunFlightSqlService {
     #[must_use]
-    pub fn new(storage_url: String, cache_dir: PathBuf, size_cap: u64) -> Self {
+    pub fn new(
+        storage_url: String,
+        cache_dir: PathBuf,
+        size_cap: u64,
+        budget: Arc<MemoryBudget>,
+        session_pct: u8,
+    ) -> Self {
         Self {
             inner: Arc::new(ServiceInner {
                 storage_url,
@@ -215,8 +237,25 @@ impl TutankhamunFlightSqlService {
                 caches: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 prepared: Mutex::new(HashMap::new()),
+                budget,
+                session_pct,
             }),
         }
+    }
+
+    /// Mint a fresh [`SessionMemoryHandle`] capped at `session_pct`% of the
+    /// global budget.
+    fn new_memory_handle(&self) -> Arc<SessionMemoryHandle> {
+        let cap = self
+            .inner
+            .budget
+            .limit()
+            .saturating_mul(u64::from(self.inner.session_pct))
+            / 100;
+        Arc::new(SessionMemoryHandle::new(
+            Arc::clone(&self.inner.budget),
+            cap,
+        ))
     }
 
     /// Build a `DataFusion` context: the FTGS-pushdown [`sql::session_context`]
@@ -225,8 +264,12 @@ impl TutankhamunFlightSqlService {
     /// (per-context) session-scoped map. The optimizer rule and planner are
     /// stateless, so building one is cheap; the expensive, stateful per-dataset
     /// caches are shared via [`ServiceInner`].
-    fn build_context(&self) -> SessionContext {
-        let ctx = sql::session_context();
+    ///
+    /// `mem` rides along as a `SessionConfig` extension so the (otherwise
+    /// session-agnostic) query execs can charge their forward-column working set
+    /// to it via [`TaskContext::session_config`] (§2.2).
+    fn build_context(&self, mem: Arc<SessionMemoryHandle>) -> SessionContext {
+        let ctx = sql::session_context_with(SessionConfig::new().with_extension(mem));
         let provider = Arc::new(DatasetSchemaProvider {
             inner: Arc::clone(&self.inner),
             registered: Mutex::new(HashMap::new()),
@@ -242,15 +285,27 @@ impl TutankhamunFlightSqlService {
 
     /// Mint an opaque session and return its token. The token is server-issued
     /// and unguessable (§2.4); the client echoes it but never parses it.
-    fn open_session(&self) -> String {
+    ///
+    /// Admission control (§2.2): a fixed baseline is reserved against the new
+    /// session's handle (and so the global budget). If it can't be satisfied the
+    /// daemon is at capacity and the session is refused before any work begins.
+    #[allow(clippy::result_large_err)]
+    fn open_session(&self) -> Result<String, Status> {
+        let mem = self.new_memory_handle();
+        let baseline = mem.reserve(SESSION_BASELINE_BYTES).map_err(|e| {
+            Status::resource_exhausted(format!("daemon at memory capacity, retry later: {e}"))
+        })?;
         let token = Uuid::new_v4().to_string();
-        let session = Arc::new(Session::new(self.build_context(), Instant::now()));
+        // `mem` is retained by `ctx` (the extension) and `baseline`; the local
+        // Arc drops here.
+        let ctx = self.build_context(mem);
+        let session = Arc::new(Session::new(ctx, Instant::now(), baseline));
         self.inner
             .sessions
             .lock()
             .expect("sessions lock")
             .insert(token.clone(), session);
-        token
+        Ok(token)
     }
 
     /// Resolve the session a request belongs to. `None` → no token (run
@@ -286,7 +341,10 @@ impl TutankhamunFlightSqlService {
     fn context_for(&self, session: Option<&Arc<Session>>) -> SessionContext {
         match session {
             Some(s) => s.ctx.clone(),
-            None => self.build_context(),
+            // Tokenless calls get a throwaway context with its own per-call
+            // handle (no baseline): queries are still capped and released, just
+            // not tied to a persistent session.
+            None => self.build_context(self.new_memory_handle()),
         }
     }
 
@@ -343,7 +401,7 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         // No auth in v1 (network-policy protected, like the ops port). The
         // handshake doubles as session-open: mint an opaque server-issued token
         // the client echoes as `authorization: Bearer <token>` afterwards (§2.4).
-        let token = self.open_session();
+        let token = self.open_session()?;
         let response = HandshakeResponse {
             protocol_version: 0,
             payload: bytes::Bytes::from(token.clone().into_bytes()),
@@ -939,17 +997,33 @@ mod tests {
     use super::*;
 
     fn svc() -> TutankhamunFlightSqlService {
+        svc_with_budget(u64::MAX)
+    }
+
+    fn svc_with_budget(limit: u64) -> TutankhamunFlightSqlService {
         TutankhamunFlightSqlService::new(
             "memory:///".to_string(),
             std::env::temp_dir().join("t9n-session-test"),
             u64::MAX,
+            Arc::new(MemoryBudget::new(limit)),
+            100, // per-session cap = 100% of global, so tests bind on the global
         )
+    }
+
+    /// A bare `Session` for the reaper tests, with a throwaway memory handle.
+    fn test_session(now: Instant) -> Session {
+        let mem = Arc::new(SessionMemoryHandle::new(
+            Arc::new(MemoryBudget::new(u64::MAX)),
+            u64::MAX,
+        ));
+        let baseline = mem.reserve(0).expect("baseline");
+        Session::new(SessionContext::new(), now, baseline)
     }
 
     #[test]
     fn is_expired_honours_idle_and_max_age() {
         let now = Instant::now();
-        let s = Session::new(SessionContext::new(), now);
+        let s = test_session(now);
         assert!(!s.is_expired(now, IDLE_TIMEOUT, MAX_AGE));
         // Idle exceeded.
         assert!(s.is_expired(
@@ -961,7 +1035,7 @@ mod tests {
         let old = now
             .checked_sub(MAX_AGE + Duration::from_secs(1))
             .expect("instant in range");
-        let aged = Session::new(SessionContext::new(), old);
+        let aged = test_session(old);
         aged.touch(now); // recently used, but created long ago
         assert!(aged.is_expired(now, IDLE_TIMEOUT, MAX_AGE));
     }
@@ -970,11 +1044,11 @@ mod tests {
     fn reap_expired_removes_only_stale_sessions() {
         let svc = svc();
         let now = Instant::now();
-        let fresh = Arc::new(Session::new(SessionContext::new(), now));
+        let fresh = Arc::new(test_session(now));
         let stale_at = now
             .checked_sub(IDLE_TIMEOUT + Duration::from_secs(60))
             .expect("instant in range");
-        let stale = Arc::new(Session::new(SessionContext::new(), stale_at));
+        let stale = Arc::new(test_session(stale_at));
         {
             let mut map = svc.inner.sessions.lock().unwrap();
             map.insert("fresh".to_string(), fresh);
@@ -986,10 +1060,25 @@ mod tests {
         assert!(!map.contains_key("stale"));
     }
 
+    #[test]
+    fn admission_rejects_when_budget_exhausted() {
+        // Global budget holds exactly one session's baseline.
+        let svc = svc_with_budget(SESSION_BASELINE_BYTES);
+        let _first = svc.open_session().expect("first session admitted");
+        let err = svc
+            .open_session()
+            .expect_err("second session rejected at capacity");
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+        // Reaping the first frees its baseline; a new session is admitted again.
+        svc.inner.sessions.lock().unwrap().clear();
+        svc.open_session()
+            .expect("re-admitted after capacity frees");
+    }
+
     #[tokio::test]
     async fn close_session_action_frees_the_session() {
         let svc = svc();
-        let token = svc.open_session();
+        let token = svc.open_session().expect("open session");
 
         let mut md = MetadataMap::new();
         md.insert("authorization", format!("Bearer {token}").parse().unwrap());

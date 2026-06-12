@@ -82,16 +82,33 @@ directly.
 
 ## Engine — memory model
 
-- [ ] `MemoryBudget` global struct with `AtomicU64` charge counter
-      — §2.2
-- [ ] `MemoryReservation` RAII guard (drop returns bytes) — §2.2
-- [ ] `SessionMemoryHandle` — per-session sub-budget with cap — §2.2
-- [ ] Hard claim-or-fail allocation API (`reserve(n) -> Result<...,
-      BudgetExceeded>`) — §2.2
-- [ ] Admission control in `OpenSession` handler — §2.2
-- [ ] Per-session cap (default 20 % of global, configurable) — §2.2
-- [ ] mmap accounting via forward-column file sizes on shard open
-      — §2.2
+- [x] `MemoryBudget` global struct with `AtomicU64` charge counter
+      — §2.2 (`memory::MemoryBudget`: a lock-free CAS-loop `reserve`; an
+      `Arc` owned by the daemon — built in `serve`, held in the FlightSQL
+      `ServiceInner` — rather than a process global, so it's testable)
+- [x] `MemoryReservation` RAII guard (drop returns bytes) — §2.2
+- [x] `SessionMemoryHandle` — per-session sub-budget with cap — §2.2
+      (charges both the session counter and the global; `SessionReservation`
+      releases both on drop)
+- [x] Hard claim-or-fail allocation API (`reserve(n) -> Result<...,
+      BudgetExceeded>`) — §2.2 (`BudgetExceeded` carries the scope —
+      session vs global — requested, and available)
+- [x] Admission control in `OpenSession` handler — §2.2 (the handshake
+      reserves a fixed `SESSION_BASELINE_BYTES` baseline through the new
+      session's handle; if it can't be satisfied the daemon is at capacity
+      and the handshake returns `resource_exhausted`)
+- [x] Per-session cap (default 20 % of global, configurable) — §2.2
+      (`--max-session-memory-pct` / `TUT_MAX_SESSION_MEMORY_PCT`; global
+      cap is `--memory-limit` / `TUT_MEMORY_LIMIT`, an absolute size,
+      default 4GB — percent-of-RAM deferred)
+- [x] mmap accounting via forward-column file sizes on shard open
+      — §2.2 (the per-session handle threads to the otherwise
+      session-agnostic execs as a `DataFusion` `SessionConfig` extension;
+      `fetch_selected_shards` charges each opened shard's `metrics.arrow`
+      byte size and holds the reservation alongside the shard, so an
+      over-budget scan fails — per-query, session survives — and the
+      charge releases when the shard drops. The `t9n sql` CLI sets no
+      extension and charges nothing)
 
 ## Engine — group lookup
 
@@ -105,8 +122,10 @@ directly.
       thresholds — §2.5
 - [x] `next_group_callback(doc_ids, &mut BitTree)` dispatch — §2.5
 - [ ] Memory cost reporting to `SessionMemoryHandle` — §2.5
-      (`GroupLookup::memory_used()` exposed; wiring waits on §2.2's
-      `SessionMemoryHandle`)
+      (`GroupLookup::memory_used()` exposed; §2.2's `SessionMemoryHandle`
+      has now landed, so this is unblocked — thread the handle into the
+      FTGS rayon per-shard loop and reserve the group-lookup / stat
+      buffers, the natural next slice)
 
 ## Engine — FTGS
 

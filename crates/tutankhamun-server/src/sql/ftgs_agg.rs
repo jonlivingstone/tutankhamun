@@ -37,6 +37,7 @@ use crate::ftgs::{
     combine_stats, ftgs_scan_merge, render_term, term_map,
 };
 use crate::group_lookup::GroupLookup;
+use crate::memory::SessionMemoryHandle;
 use crate::shard::{DiskShard, FieldKind, FilterResult, Shard, decode_int_key, encode_int_key};
 use crate::sketches::ThetaSketch;
 
@@ -130,6 +131,9 @@ impl ExecutionPlan for FtgsAggExec {
         _partition: usize,
         context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
+        let mem = context
+            .session_config()
+            .get_extension::<SessionMemoryHandle>();
         let batch = block_on_scan(|| {
             aggregate_batch(
                 &self.url,
@@ -138,6 +142,7 @@ impl ExecutionPlan for FtgsAggExec {
                 &self.stats,
                 &self.filters,
                 &self.schema,
+                mem.as_ref(),
             )
         })?;
         // One row per group; cap every emitted batch to the session's
@@ -153,8 +158,11 @@ async fn aggregate_batch(
     stats: &[OwnedStat],
     filters: &[PushedFilter],
     schema: &SchemaRef,
+    mem: Option<&Arc<SessionMemoryHandle>>,
 ) -> anyhow::Result<RecordBatch> {
-    let shards = fetch_selected_shards(url, cache, filters).await?;
+    // `_reservations` holds the per-shard memory charge for the scan, released
+    // when this function returns.
+    let (shards, _reservations) = fetch_selected_shards(url, cache, filters, mem).await?;
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
     if group_cols.is_empty() {
         reshape_global(

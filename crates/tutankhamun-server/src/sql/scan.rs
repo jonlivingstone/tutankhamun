@@ -8,6 +8,7 @@
 //! this neutral module.
 
 use std::future::Future;
+use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -18,7 +19,8 @@ use datafusion::physical_plan::memory::MemoryStream;
 
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::cache::Cache;
-use crate::shard::{DiskShard, FilterClause, FilterResult, matched_doc_set};
+use crate::memory::{SessionMemoryHandle, SessionReservation};
+use crate::shard::{DiskShard, FilterClause, FilterResult, METRICS_FILE, matched_doc_set};
 use crate::shard_source::{ObjectStoreShardSource, ShardSource};
 use crate::storage::StorageRegistry;
 
@@ -54,11 +56,20 @@ where
 /// resolve the pushed filters to a matched-doc set. The shared prelude
 /// for both the row scan ([`collect_batches`]) and the FTGS aggregate
 /// ([`aggregate_batch`]).
+///
+/// When `mem` is set (the daemon data plane — §2.2), each opened shard's
+/// forward-column working set (`metrics.arrow` byte size) is reserved against
+/// the session budget; a query that would exceed it fails here rather than
+/// letting resident memory blow past the cap. The reservations are returned
+/// alongside the shards so the
+/// charge is held exactly as long as the shards are resident and released when
+/// the caller drops them. `None` (the `t9n sql` CLI) charges nothing.
 pub(crate) async fn fetch_selected_shards(
     url: &str,
     cache: &Cache,
     pushed: &[PushedFilter],
-) -> anyhow::Result<Vec<(DiskShard, FilterResult)>> {
+    mem: Option<&Arc<SessionMemoryHandle>>,
+) -> anyhow::Result<(Vec<(DiskShard, FilterResult)>, Vec<SessionReservation>)> {
     let registry = StorageRegistry::from_url(url)?;
     let source = ObjectStoreShardSource::new(registry.store());
     let summaries = source.discover().await?;
@@ -67,6 +78,7 @@ pub(crate) async fn fetch_selected_shards(
         pushed.iter().map(PushedFilter::as_clause).collect();
 
     let mut out = Vec::with_capacity(summaries.len());
+    let mut reservations = Vec::new();
     for summary in &summaries {
         // Prune whole shards before fetching them: if the query
         // constrains the time field to a window that the shard's
@@ -81,10 +93,16 @@ pub(crate) async fn fetch_selected_shards(
         }
         let local_dir = cache.fetch_shard(summary).await?;
         let shard = DiskShard::open(&local_dir)?;
+        if let Some(handle) = mem {
+            // Rough resident estimate: the forward-column file size (§2.2). A
+            // missing file (statless edge) charges nothing rather than failing.
+            let bytes = std::fs::metadata(local_dir.join(METRICS_FILE)).map_or(0, |m| m.len());
+            reservations.push(handle.reserve(bytes).map_err(|e| anyhow::anyhow!(e))?);
+        }
         let selection = matched_doc_set(&shard, &filter_clauses)?;
         out.push((shard, selection));
     }
-    Ok(out)
+    Ok((out, reservations))
 }
 
 /// Split a batch into `<= batch_size`-row slices for streaming. Zero-copy —

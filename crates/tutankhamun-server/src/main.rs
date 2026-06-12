@@ -14,6 +14,7 @@ use tutankhamun_server::cache;
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
 use tutankhamun_server::ingest::ShardBy;
+use tutankhamun_server::memory;
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard::Aggregate;
@@ -341,12 +342,27 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let grpc_addr = config.grpc_addr.parse()?;
     let grpc_listener = flight_sql::bind(grpc_addr).await?;
     let cache_cap = cache::size::parse_cache_size("10GB", &config.cache_dir)?;
+    let mem_limit = cache::size::parse_byte_size(&config.memory_limit)?;
+    // A 0% cap would make every session's baseline reservation fail, rejecting
+    // all handshakes; >100% would let a session exceed the global budget.
+    let pct = config.max_session_memory_pct;
+    if pct == 0 || pct > 100 {
+        anyhow::bail!("--max-session-memory-pct must be between 1 and 100 (got {pct})");
+    }
+    let budget = Arc::new(memory::MemoryBudget::new(mem_limit));
+    info!(
+        bytes = mem_limit,
+        per_session_pct = config.max_session_memory_pct,
+        "memory budget initialised"
+    );
     let grpc_task = tokio::spawn({
         let shutdown = shutdown.clone();
         let svc = TutankhamunFlightSqlService::new(
             config.storage_url.clone(),
             config.cache_dir.clone(),
             cache_cap,
+            budget,
+            config.max_session_memory_pct,
         );
         async move {
             if let Err(e) = flight_sql::serve(grpc_listener, svc, shutdown).await {

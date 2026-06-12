@@ -49,7 +49,7 @@ pub use filter::{FilterClause, FilterOp, FilterResult, matched_doc_set};
 pub use writer::DiskShardWriter;
 
 pub(crate) const METADATA_FILE: &str = "metadata.json";
-const METRICS_FILE: &str = "metrics.arrow";
+pub(crate) const METRICS_FILE: &str = "metrics.arrow";
 const POSTINGS_DIR: &str = "postings";
 const POSTING_EXT: &str = "posting";
 const FST_EXT: &str = "fst";

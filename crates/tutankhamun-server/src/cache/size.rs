@@ -50,6 +50,20 @@ fn parse_percent(pct: &str, reference_path: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
+/// Resolve an absolute byte size (`8GB`, `512MiB`, `1024`). Unlike
+/// [`parse_cache_size`], percent values are rejected — there is no filesystem
+/// or system-RAM reference to resolve them against. Used for `--memory-limit`.
+pub fn parse_byte_size(raw: &str) -> Result<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        bail!("size must not be empty");
+    }
+    if raw.ends_with('%') {
+        bail!("percent values are not supported here; specify an absolute size like 8GB");
+    }
+    parse_units(raw)
+}
+
 fn parse_units(raw: &str) -> Result<u64> {
     let (number_part, multiplier) = split_unit(raw)?;
     let value: f64 = number_part
@@ -129,6 +143,17 @@ mod tests {
     #[test]
     fn rejects_unknown_unit() {
         assert!(parse_units("10XB").is_err());
+    }
+
+    #[test]
+    fn parse_byte_size_accepts_units_rejects_percent() {
+        assert_eq!(parse_byte_size("8GB").unwrap(), 8_000_000_000);
+        assert_eq!(parse_byte_size("512MiB").unwrap(), 512 * 1_048_576);
+        assert!(
+            parse_byte_size("50%").is_err(),
+            "percent has no reference here"
+        );
+        assert!(parse_byte_size("").is_err());
     }
 
     #[test]

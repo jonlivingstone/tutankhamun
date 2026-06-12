@@ -22,6 +22,8 @@ pub mod env_vars {
     pub const RAYON_WORKERS: &str = "TUT_RAYON_WORKERS";
     pub const SHUTDOWN_TIMEOUT_SECS: &str = "TUT_SHUTDOWN_TIMEOUT_SECS";
     pub const LOG_JSON: &str = "TUT_LOG_JSON";
+    pub const MEMORY_LIMIT: &str = "TUT_MEMORY_LIMIT";
+    pub const MAX_SESSION_MEMORY_PCT: &str = "TUT_MAX_SESSION_MEMORY_PCT";
 
     /// Prefix figment uses to scan for env-driven overrides.
     pub const PREFIX: &str = "TUT_";
@@ -78,6 +80,17 @@ pub struct ServeArgs {
     #[arg(long, env = env_vars::SHUTDOWN_TIMEOUT_SECS)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shutdown_timeout_secs: Option<u64>,
+
+    /// Daemon-wide memory budget as an absolute size (`8GB`, `512MiB`).
+    /// Percent-of-RAM is not supported — set it to your container/VM limit.
+    #[arg(long, env = env_vars::MEMORY_LIMIT)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<String>,
+
+    /// Per-session memory cap as a percent of the global budget (1..=100).
+    #[arg(long, env = env_vars::MAX_SESSION_MEMORY_PCT)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_session_memory_pct: Option<u8>,
 }
 
 /// Fully-resolved daemon configuration.
@@ -91,6 +104,10 @@ pub struct Config {
     pub tokio_workers: usize,
     pub rayon_workers: usize,
     pub shutdown_timeout_secs: u64,
+    /// Daemon-wide memory budget (absolute size string, resolved in `serve`).
+    pub memory_limit: String,
+    /// Per-session memory cap as a percent of the global budget.
+    pub max_session_memory_pct: u8,
 }
 
 impl Default for Config {
@@ -104,6 +121,8 @@ impl Default for Config {
             tokio_workers: cores.saturating_mul(2),
             rayon_workers: cores,
             shutdown_timeout_secs: 30,
+            memory_limit: "4GB".into(),
+            max_session_memory_pct: 20,
         }
     }
 }

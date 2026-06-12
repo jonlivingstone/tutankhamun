@@ -9,6 +9,7 @@ pub mod flight_sql;
 pub mod ftgs;
 pub mod group_lookup;
 pub mod ingest;
+pub mod memory;
 pub mod ops_http;
 pub mod runtime;
 pub mod shard;

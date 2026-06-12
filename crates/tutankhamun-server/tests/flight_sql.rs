@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_flight::FlightInfo;
@@ -16,8 +17,13 @@ use roaring::RoaringBitmap;
 use tonic::transport::Channel;
 
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
+use tutankhamun_server::memory::MemoryBudget;
 use tutankhamun_server::shard::DiskShardWriter;
 use tutankhamun_server::shutdown::ShutdownHandle;
+
+/// A budget large enough that the §2.2 accounting never trips in the
+/// functional tests (the per-session baseline plus shard mmap fit easily).
+const AMPLE_BUDGET: u64 = 1 << 30; // 1 GiB
 
 fn bitmap(docs: impl IntoIterator<Item = u32>) -> RoaringBitmap {
     let mut bm = RoaringBitmap::new();
@@ -66,6 +72,21 @@ async fn start() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
+    start_with_budget(AMPLE_BUDGET).await
+}
+
+/// Like [`start`] but with an explicit daemon memory budget (§2.2). The
+/// per-session cap is 100% of the budget, so the global limit is the binding
+/// constraint in tests.
+async fn start_with_budget(
+    budget: u64,
+) -> (
+    SocketAddr,
+    ShutdownHandle,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
     let storage = tempfile::tempdir().expect("storage tmp");
     let cache = tempfile::tempdir().expect("cache tmp");
     write_dataset(storage.path());
@@ -78,7 +99,13 @@ async fn start() -> (
         .await
         .expect("bind grpc");
     let addr = listener.local_addr().expect("local addr");
-    let svc = TutankhamunFlightSqlService::new(storage_url, cache.path().to_path_buf(), u64::MAX);
+    let svc = TutankhamunFlightSqlService::new(
+        storage_url,
+        cache.path().to_path_buf(),
+        u64::MAX,
+        Arc::new(MemoryBudget::new(budget)),
+        100,
+    );
     let server = tokio::spawn({
         let shutdown = shutdown.clone();
         async move { flight_sql::serve(listener, svc, shutdown).await }
@@ -390,6 +417,42 @@ async fn session_temp_view_persists_across_calls_and_is_isolated() {
             .is_err(),
         "unknown session token should error"
     );
+
+    drop(client);
+    shutdown.trigger();
+    server
+        .await
+        .expect("server task join")
+        .expect("serve returned ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn over_budget_query_fails_but_session_survives() {
+    // Budget = exactly one session's baseline (SESSION_BASELINE_BYTES, 1 MiB):
+    // the handshake is admitted, but there is zero headroom left to charge a
+    // shard's forward column, so any scan must fail (§2.2).
+    let (addr, shutdown, server, _storage, _cache) = start_with_budget(1 << 20).await;
+    let mut client = session_client(addr).await; // admitted: baseline fits
+
+    let info = client
+        .execute("SELECT count(*) AS n FROM ds1".to_string(), None)
+        .await
+        .expect("planning does not open shards");
+    let ticket = info.endpoint[0].ticket.clone().expect("ticket");
+    let failed = match client.do_get(ticket).await {
+        Err(_) => true,
+        Ok(stream) => stream.try_collect::<Vec<RecordBatch>>().await.is_err(),
+    };
+    assert!(failed, "scan over the memory budget must fail");
+
+    // The session is not killed (§2.2): a session-scoped, non-scanning call
+    // still works. `execute_update` routes through `do_put_statement_update`,
+    // which requires a live session (a reaped one would be SessionLost); a DDL
+    // statement opens no shards, so it runs within the baseline-full budget.
+    client
+        .execute_update("CREATE VIEW alive AS SELECT 1".to_string(), None)
+        .await
+        .expect("session still alive after the over-budget query");
 
     drop(client);
     shutdown.trigger();
