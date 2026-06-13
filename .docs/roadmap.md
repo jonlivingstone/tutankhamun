@@ -234,10 +234,22 @@ directly.
       catalog-metadata RPCs (catalogs/schemas/tables/table-types, datasets as
       `TABLE` + session temp views as `VIEW`, reported under `datafusion`/`public`)
       now work; an explicit `CloseSession` custom action frees a session. Still
-      remaining: prepared-statement *parameter binding*, `GetSqlInfo` and the
-      key/XDBC-info RPCs. Transactions are intentionally left unimplemented —
+      remaining: prepared-statement *parameter binding* and the key/XDBC-info
+      RPCs. Transactions are intentionally left unimplemented —
       a pure no-op until there is mutable state to transact, so honest
       `unimplemented` beats a fake commit/rollback)
+- [x] `GetSqlInfo` capability RPC (`get_flight_info_sql_info` /
+      `do_get_sql_info`) — §3.2. The connect-time capability probe JDBC/ADBC/GUI
+      clients (DBeaver, DataGrip) call during connection setup; previously returned
+      `unimplemented`, which could block them from connecting. Now serves a fixed
+      `SqlInfo` flag set (server name `Tutankhamun` + crate version, read-only =
+      false since `CREATE VIEW` DDL is accepted, SQL not Substrait, no
+      transactions, `"`-quoted lowercase-folded identifiers per DataFusion),
+      filtered to the codes the client requests. Browsing (catalog RPCs) and
+      querying (statement `do_get`) already worked; this closes the JDBC/native
+      connect path. **ODBC is out of scope server-side**: there is no first-party
+      Arrow Flight SQL ODBC driver — reaching us over ODBC needs a third-party /
+      ADBC-ODBC bridge, a client-side driver concern, not a t9n RPC)
 - [x] Session-aware SQL execution — §3.2/§2.8 (sessions persist a
       `SessionContext` across calls, so session-scoped temp views/tables survive
       — the §2.8 name layer. The realization layer now lands too: a daemon-shared

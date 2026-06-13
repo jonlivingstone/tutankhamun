@@ -14,14 +14,15 @@
 //! context. Calls without a token run against a fresh ephemeral context, exactly
 //! as before. Idle (30 min) and aged (4 h) sessions are reaped.
 //!
-//! **Prepared statements** (create / get / `do_get` / update / close) and the
-//! **catalog-metadata RPCs** (catalogs / schemas / tables / table types) are
-//! implemented, and an explicit **`CloseSession`** custom action frees a session
-//! immediately. Still deferred: prepared-statement *parameter binding*,
-//! transactions / savepoints (a no-op until there is mutable state to transact),
-//! `GetSqlInfo` and the key/XDBC-info RPCs, the FTGS-native `DoGet`, and the §2.8
-//! narrowing cache. Plain HTTP/2 — protected by network policy until auth lands,
-//! like the ops port.
+//! **Prepared statements** (create / get / `do_get` / update / close), the
+//! **catalog-metadata RPCs** (catalogs / schemas / tables / table types), and
+//! the **`GetSqlInfo`** capability probe (the connect-time RPC JDBC/ADBC/GUI
+//! clients call) are implemented, and an explicit **`CloseSession`** custom
+//! action frees a session immediately. Still deferred: prepared-statement
+//! *parameter binding*, transactions / savepoints (a no-op until there is
+//! mutable state to transact), the key/XDBC-info RPCs, the FTGS-native `DoGet`,
+//! and the §2.8 narrowing cache. Plain HTTP/2 — protected by network policy
+//! until auth lands, like the ops port.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -29,7 +30,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use arrow::array::{RecordBatch, StringArray};
@@ -50,13 +51,15 @@ use uuid::Uuid;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
+use arrow_flight::sql::metadata::{SqlInfoData, SqlInfoDataBuilder};
 use arrow_flight::sql::server::{FlightSqlService, PeekableFlightDataStream};
 use arrow_flight::sql::{
     ActionClosePreparedStatementRequest, ActionCreatePreparedStatementRequest,
     ActionCreatePreparedStatementResult, CommandGetCatalogs, CommandGetDbSchemas,
-    CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
+    CommandGetSqlInfo, CommandGetTableTypes, CommandGetTables, CommandPreparedStatementQuery,
     CommandPreparedStatementUpdate, CommandStatementQuery, CommandStatementUpdate,
-    DoPutPreparedStatementResult, ProstMessageExt, SqlInfo, TicketStatementQuery,
+    DoPutPreparedStatementResult, ProstMessageExt, SqlInfo, SqlSupportedCaseSensitivity,
+    SqlSupportedTransaction, TicketStatementQuery,
 };
 use arrow_flight::{
     Action, ActionType, FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest,
@@ -449,6 +452,37 @@ fn batch_stream(
     Response::new(Box::pin(stream))
 }
 
+/// Fixed `GetSqlInfo` capability set, built once. Identifier-case flags follow
+/// `DataFusion`'s dialect (unquoted folded to lowercase, `"`-quoted), and
+/// `read_only` is false because the session path accepts `CREATE VIEW` DDL.
+fn sql_info_data() -> &'static SqlInfoData {
+    static DATA: OnceLock<SqlInfoData> = OnceLock::new();
+    DATA.get_or_init(|| {
+        let mut b = SqlInfoDataBuilder::new();
+        b.append(SqlInfo::FlightSqlServerName, "Tutankhamun");
+        b.append(SqlInfo::FlightSqlServerVersion, env!("CARGO_PKG_VERSION"));
+        // FlightSqlServerArrowVersion is omitted: it's optional, and arrow
+        // exposes no version constant to derive it from without drift.
+        b.append(SqlInfo::FlightSqlServerReadOnly, false);
+        b.append(SqlInfo::FlightSqlServerSql, true);
+        b.append(SqlInfo::FlightSqlServerSubstrait, false);
+        b.append(
+            SqlInfo::FlightSqlServerTransaction,
+            SqlSupportedTransaction::None as i32,
+        );
+        b.append(SqlInfo::SqlIdentifierQuoteChar, "\"");
+        b.append(
+            SqlInfo::SqlIdentifierCase,
+            SqlSupportedCaseSensitivity::SqlCaseSensitivityLowercase as i32,
+        );
+        b.append(
+            SqlInfo::SqlQuotedIdentifierCase,
+            SqlSupportedCaseSensitivity::SqlCaseSensitivityUnknown as i32,
+        );
+        b.build().expect("static SqlInfo set builds")
+    })
+}
+
 #[tonic::async_trait]
 impl FlightSqlService for TutankhamunFlightSqlService {
     type FlightService = Self;
@@ -663,6 +697,32 @@ impl FlightSqlService for TutankhamunFlightSqlService {
             .await
             .map_err(|e| plan_error(&e))?;
         Ok(0)
+    }
+
+    // -- Capability probe (connect-time `GetSqlInfo`) --
+
+    // The connect-time RPC most JDBC/ADBC/GUI clients call before anything else.
+    // We serve a fixed flag set; the client filters to the codes it asked for.
+    async fn get_flight_info_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        request: Request<FlightDescriptor>,
+    ) -> Result<Response<FlightInfo>, Status> {
+        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let schema = query.into_builder(sql_info_data()).schema();
+        flight_info_for(schema.as_ref(), ticket, request)
+    }
+
+    async fn do_get_sql_info(
+        &self,
+        query: CommandGetSqlInfo,
+        _request: Request<Ticket>,
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let batch = query
+            .into_builder(sql_info_data())
+            .build()
+            .map_err(|e| metadata_error(&e))?;
+        Ok(batch_stream(batch))
     }
 
     // -- Catalog metadata (catalogs / schemas / tables / table types) --
@@ -1153,6 +1213,22 @@ mod tests {
         svc.inner.sessions.lock().unwrap().clear();
         svc.open_session()
             .expect("re-admitted after capacity frees");
+    }
+
+    #[test]
+    fn sql_info_data_serves_requested_codes() {
+        let data = sql_info_data();
+        // No specific request → the full flag set.
+        let all = data.record_batch(std::iter::empty()).expect("all infos");
+        assert_eq!(all.num_rows(), 9, "every appended flag is present");
+        // A single requested code → just that flag.
+        let one = data
+            .record_batch([SqlInfo::FlightSqlServerName as u32])
+            .expect("single info");
+        assert_eq!(one.num_rows(), 1);
+        // Unknown codes filter to nothing rather than erroring.
+        let none = data.record_batch([9_999]).expect("unknown info");
+        assert_eq!(none.num_rows(), 0);
     }
 
     #[tokio::test]

@@ -8,10 +8,10 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow::array::{Array, Int64Array, RecordBatch, StringArray, UInt32Array};
 use arrow_flight::FlightInfo;
 use arrow_flight::sql::client::FlightSqlServiceClient;
-use arrow_flight::sql::{CommandGetDbSchemas, CommandGetTables};
+use arrow_flight::sql::{CommandGetDbSchemas, CommandGetTables, SqlInfo};
 use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 use tonic::transport::Channel;
@@ -166,6 +166,16 @@ fn string_col(batches: &[RecordBatch], col: usize) -> Vec<String> {
     out
 }
 
+/// Flatten a `UInt32` column across batches.
+fn u32_col(batches: &[RecordBatch], col: usize) -> Vec<u32> {
+    let mut out = Vec::new();
+    for b in batches {
+        let a: &UInt32Array = b.column(col).as_any().downcast_ref().expect("u32 col");
+        out.extend((0..b.num_rows()).map(|i| a.value(i)));
+    }
+    out
+}
+
 /// A `CommandGetTables` with no filters and the given `include_schema`.
 fn tables_cmd(include_schema: bool) -> CommandGetTables {
     CommandGetTables {
@@ -239,6 +249,29 @@ async fn prepared_statement_roundtrip() {
         .await
         .expect("server task join")
         .expect("serve returned ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_sql_info_reports_capabilities() {
+    let (addr, _shutdown, _server, _storage, _cache) = start().await;
+    let mut client = connect(addr).await;
+
+    // Empty request → the full capability set; the server name flag is present.
+    let info = client.get_sql_info(vec![]).await.expect("get_sql_info");
+    let codes = u32_col(&do_get(&mut client, info).await, 0);
+    assert!(
+        codes.contains(&(SqlInfo::FlightSqlServerName as u32)),
+        "{codes:?}"
+    );
+
+    // A filtered request returns only the asked-for code — the path JDBC/ADBC
+    // drivers exercise when probing individual capabilities.
+    let info = client
+        .get_sql_info(vec![SqlInfo::FlightSqlServerName])
+        .await
+        .expect("filtered get_sql_info");
+    let codes = u32_col(&do_get(&mut client, info).await, 0);
+    assert_eq!(codes, vec![SqlInfo::FlightSqlServerName as u32]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
