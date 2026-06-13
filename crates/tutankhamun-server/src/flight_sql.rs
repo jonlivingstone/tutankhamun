@@ -68,6 +68,7 @@ use object_store::ObjectStore;
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
+use crate::metrics::Metrics;
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
 use crate::storage::StorageRegistry;
@@ -128,6 +129,8 @@ struct ServiceInner {
     /// Daemon-shared doc-set bitmap cache (§2.8); threaded into each context as a
     /// `SessionConfig` extension so the scan can probe it.
     bitmap_cache: Arc<BitmapCache>,
+    /// Daemon metrics (§3.4): session gauge + query latency/counters.
+    metrics: Arc<Metrics>,
 }
 
 // Manual `Debug`: the cache and session maps hold `Cache`/`SessionContext`
@@ -220,7 +223,12 @@ impl ServiceInner {
         let mut sessions = self.sessions.lock().expect("sessions lock");
         let before = sessions.len();
         sessions.retain(|_, s| !s.is_expired(now, IDLE_TIMEOUT, MAX_AGE));
-        before - sessions.len()
+        let reaped = before - sessions.len();
+        drop(sessions);
+        if reaped > 0 {
+            self.metrics.sessions_reaped(reaped);
+        }
+        reaped
     }
 }
 
@@ -233,6 +241,7 @@ impl TutankhamunFlightSqlService {
         budget: Arc<MemoryBudget>,
         session_pct: u8,
         bitmap_cache: Arc<BitmapCache>,
+        metrics: Arc<Metrics>,
     ) -> Self {
         Self {
             inner: Arc::new(ServiceInner {
@@ -245,6 +254,7 @@ impl TutankhamunFlightSqlService {
                 budget,
                 session_pct,
                 bitmap_cache,
+                metrics,
             }),
         }
     }
@@ -314,6 +324,7 @@ impl TutankhamunFlightSqlService {
             .lock()
             .expect("sessions lock")
             .insert(token.clone(), session);
+        self.inner.metrics.session_opened();
         Ok(token)
     }
 
@@ -469,7 +480,12 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         // `collect` drives the plan; the FTGS/scan execs bridge async→sync on
         // their own scoped threads (see `sql::scan`'s `block_on_scan`), so it is
         // safe to await here without parking a worker on a nested `block_on`.
-        let batches = df.collect().await.map_err(|e| plan_error(&e))?;
+        let started = Instant::now();
+        let result = df.collect().await;
+        self.inner
+            .metrics
+            .record_query(started.elapsed(), result.is_ok());
+        let batches = result.map_err(|e| plan_error(&e))?;
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -569,7 +585,12 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         let session = self.resolve_session(request.metadata())?;
         let ctx = self.context_for(session.as_ref());
         let (df, schema) = plan(&ctx, &sql).await?;
-        let batches = df.collect().await.map_err(|e| plan_error(&e))?;
+        let started = Instant::now();
+        let result = df.collect().await;
+        self.inner
+            .metrics
+            .record_query(started.elapsed(), result.is_ok());
+        let batches = result.map_err(|e| plan_error(&e))?;
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -786,11 +807,15 @@ impl FlightSqlService for TutankhamunFlightSqlService {
             // Idempotent: closing an already-reaped/unknown session is fine.
             // Later calls with the token return SessionLost, as the client expects.
             if let Some(token) = session_token(request.metadata()) {
-                self.inner
+                let removed = self
+                    .inner
                     .sessions
                     .lock()
                     .expect("sessions lock")
                     .remove(&token);
+                if removed.is_some() {
+                    self.inner.metrics.session_closed();
+                }
             }
             let stream = futures::stream::empty::<Result<FlightResult, Status>>();
             return Ok(Response::new(Box::pin(stream)));
@@ -1015,6 +1040,7 @@ mod tests {
             Arc::clone(&budget),
             limit,
         ))));
+        let metrics = Metrics::new(Arc::clone(&budget), Arc::clone(&bitmap_cache));
         TutankhamunFlightSqlService::new(
             "memory:///".to_string(),
             std::env::temp_dir().join("t9n-session-test"),
@@ -1022,6 +1048,7 @@ mod tests {
             budget,
             100, // per-session cap = 100% of global, so tests bind on the global
             bitmap_cache,
+            metrics,
         )
     }
 

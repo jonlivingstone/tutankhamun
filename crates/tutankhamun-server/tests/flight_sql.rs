@@ -19,6 +19,7 @@ use tonic::transport::Channel;
 use tutankhamun_server::bitmap_cache::BitmapCache;
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
 use tutankhamun_server::memory::{MemoryBudget, SessionMemoryHandle};
+use tutankhamun_server::metrics::Metrics;
 use tutankhamun_server::shard::DiskShardWriter;
 use tutankhamun_server::shutdown::ShutdownHandle;
 
@@ -73,10 +74,12 @@ async fn start() -> (
     tempfile::TempDir,
     tempfile::TempDir,
 ) {
-    start_with_budget(AMPLE_BUDGET).await
+    let (addr, shutdown, server, storage, cache, _metrics) = start_with_budget(AMPLE_BUDGET).await;
+    (addr, shutdown, server, storage, cache)
 }
 
-/// Like [`start`] but with an explicit daemon memory budget (§2.2). The
+/// Like [`start`] but with an explicit daemon memory budget (§2.2), and also
+/// returns the shared `Metrics` so tests can assert the gauges/counters. The
 /// per-session cap is 100% of the budget, so the global limit is the binding
 /// constraint in tests.
 async fn start_with_budget(
@@ -87,6 +90,7 @@ async fn start_with_budget(
     tokio::task::JoinHandle<anyhow::Result<()>>,
     tempfile::TempDir,
     tempfile::TempDir,
+    Arc<Metrics>,
 ) {
     let storage = tempfile::tempdir().expect("storage tmp");
     let cache = tempfile::tempdir().expect("cache tmp");
@@ -105,6 +109,7 @@ async fn start_with_budget(
         Arc::clone(&mem),
         budget,
     ))));
+    let metrics = Metrics::new(Arc::clone(&mem), Arc::clone(&bitmap_cache));
     let svc = TutankhamunFlightSqlService::new(
         storage_url,
         cache.path().to_path_buf(),
@@ -112,12 +117,13 @@ async fn start_with_budget(
         mem,
         100,
         bitmap_cache,
+        Arc::clone(&metrics),
     );
     let server = tokio::spawn({
         let shutdown = shutdown.clone();
         async move { flight_sql::serve(listener, svc, shutdown).await }
     });
-    (addr, shutdown, server, storage, cache)
+    (addr, shutdown, server, storage, cache, metrics)
 }
 
 /// Run `sql` through the ad-hoc statement path (`GetFlightInfo` → `DoGet`) and
@@ -438,7 +444,7 @@ async fn over_budget_query_fails_but_session_survives() {
     // Budget = exactly one session's baseline (SESSION_BASELINE_BYTES, 1 MiB):
     // the handshake is admitted, but there is zero headroom left to charge a
     // shard's forward column, so any scan must fail (§2.2).
-    let (addr, shutdown, server, _storage, _cache) = start_with_budget(1 << 20).await;
+    let (addr, shutdown, server, _storage, _cache, _metrics) = start_with_budget(1 << 20).await;
     let mut client = session_client(addr).await; // admitted: baseline fits
 
     let info = client
@@ -460,6 +466,31 @@ async fn over_budget_query_fails_but_session_survives() {
         .execute_update("CREATE VIEW alive AS SELECT 1".to_string(), None)
         .await
         .expect("session still alive after the over-budget query");
+
+    drop(client);
+    shutdown.trigger();
+    server
+        .await
+        .expect("server task join")
+        .expect("serve returned ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metrics_track_sessions_and_queries() {
+    let (addr, shutdown, server, _storage, _cache, metrics) = start_with_budget(AMPLE_BUDGET).await;
+
+    // A handshake opens a session → live gauge goes to 1.
+    let mut client = session_client(addr).await;
+    assert!(
+        metrics.render().contains("tut_sessions_live 1"),
+        "handshake should bump the live-session gauge"
+    );
+
+    // Running a SELECT through do_get records a query.
+    let _ = run_query(&mut client, "SELECT count(*) AS n FROM ds1").await;
+    let text = metrics.render();
+    assert!(text.contains("tut_queries_total 1"), "{text}");
+    assert!(text.contains("tut_query_errors_total 0"));
 
     drop(client);
     shutdown.trigger();

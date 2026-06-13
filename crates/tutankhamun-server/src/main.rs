@@ -16,6 +16,7 @@ use tutankhamun_server::config::{Config, ServeArgs, env_vars};
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
 use tutankhamun_server::ingest::ShardBy;
 use tutankhamun_server::memory;
+use tutankhamun_server::metrics;
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard::Aggregate;
@@ -323,25 +324,10 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     info!(storage_url = %config.storage_url, "storage backend ready");
 
     let shutdown = ShutdownHandle::new();
-    let ops_state = OpsState::new();
 
-    let ops_addr = config.ops_addr.parse()?;
-    let ops_listener = ops_http::bind(ops_addr).await?;
-    let ops_task = tokio::spawn({
-        let shutdown = shutdown.clone();
-        let state = ops_state.clone();
-        async move {
-            if let Err(e) = ops_http::serve(ops_listener, state, shutdown).await {
-                error!(error = ?e, "ops HTTP server failed");
-            }
-        }
-    });
-
-    // FlightSQL data-plane. Per-dataset shard caches are created lazily and
-    // reused across queries (see `flight_sql`); the gRPC listener is bound
-    // before marking ready so /readyz only flips once both ops and gRPC are live.
-    let grpc_addr = config.grpc_addr.parse()?;
-    let grpc_listener = flight_sql::bind(grpc_addr).await?;
+    // Resolve and validate the memory/cache config up front, then build the
+    // budget, the §2.8 bitmap cache, and the shared metrics surface — all needed
+    // before the ops server (which renders /metrics) and the flight service.
     let cache_cap = cache::size::parse_cache_size("10GB", &config.cache_dir)?;
     let mem_limit = cache::size::parse_byte_size(&config.memory_limit)?;
     // A 0% cap would make every session's baseline reservation fail, rejecting
@@ -362,11 +348,31 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     let bitmap_cache = Arc::new(bitmap_cache::BitmapCache::new(Arc::new(
         memory::SessionMemoryHandle::new(Arc::clone(&budget), bitmap_cache_cap),
     )));
+    let metrics = metrics::Metrics::new(Arc::clone(&budget), Arc::clone(&bitmap_cache));
     info!(
         bytes = mem_limit,
-        per_session_pct = config.max_session_memory_pct,
+        per_session_pct = pct,
         "memory budget initialised"
     );
+
+    let ops_state = OpsState::new(Arc::clone(&metrics));
+    let ops_addr = config.ops_addr.parse()?;
+    let ops_listener = ops_http::bind(ops_addr).await?;
+    let ops_task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        let state = ops_state.clone();
+        async move {
+            if let Err(e) = ops_http::serve(ops_listener, state, shutdown).await {
+                error!(error = ?e, "ops HTTP server failed");
+            }
+        }
+    });
+
+    // FlightSQL data-plane. Per-dataset shard caches are created lazily and
+    // reused across queries (see `flight_sql`); the gRPC listener is bound
+    // before marking ready so /readyz only flips once both ops and gRPC are live.
+    let grpc_addr = config.grpc_addr.parse()?;
+    let grpc_listener = flight_sql::bind(grpc_addr).await?;
     let grpc_task = tokio::spawn({
         let shutdown = shutdown.clone();
         let svc = TutankhamunFlightSqlService::new(
@@ -374,8 +380,9 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             config.cache_dir.clone(),
             cache_cap,
             budget,
-            config.max_session_memory_pct,
+            pct,
             bitmap_cache,
+            metrics,
         );
         async move {
             if let Err(e) = flight_sql::serve(grpc_listener, svc, shutdown).await {

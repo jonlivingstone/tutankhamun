@@ -332,10 +332,24 @@ directly.
 
 ## Observability
 
-- [ ] Prometheus `/metrics` endpoint on the ops port — §3.4
-- [ ] Standard metrics (request rates, latency histograms, pool
+- [x] Prometheus `/metrics` endpoint on the ops port — §3.4
+      (`metrics::Metrics`, a daemon-shared holder rendered as hand-rolled
+      Prometheus text on the axum ops server beside `/healthz`/`/readyz`;
+      no client-crate dependency)
+- [~] Standard metrics (request rates, latency histograms, pool
       queue depths, memory pool, session counts, shard cache
       hit/miss, mmap'd bytes, error counts) — §3.4
+      (shipped: `tut_memory_{limit,used}_bytes`, `tut_sessions_live`,
+      `tut_bitmap_cache_{hits,narrows,misses}_total` + `_used_bytes`,
+      `tut_build_info`, and query performance —
+      `tut_query_duration_seconds` histogram, `tut_queries_total`,
+      `tut_query_errors_total` (recorded around `df.collect()` in the
+      statement/prepared `do_get` paths). Gauges are pulled live from the
+      §2.2 budget / §2.8 cache; the session gauge + query counters are
+      bumped by the flight service. Deferred: per-RPC request counts for
+      the cheap metadata/DDL RPCs, shard-cache hit/miss + mmap'd bytes,
+      and pool queue depths (rayon exposes none; tokio needs
+      `tokio_unstable`))
 - [ ] OpenTelemetry tracing setup (OTLP exporter, configurable
       endpoint) — §3.4
 - [ ] Trace per query with span attributes (claimed user,

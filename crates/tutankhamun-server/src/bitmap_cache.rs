@@ -96,21 +96,22 @@ impl BitmapCache {
         h.finish()
     }
 
-    // Counters are incremented on the hot path always; only tests read them for
-    // now. §3.4 observability will expose them on `/metrics`.
-    #[cfg(test)]
+    // Counters and byte usage, surfaced on the §3.4 `/metrics` endpoint.
     pub(crate) fn hits(&self) -> u64 {
         self.hits.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     pub(crate) fn narrows(&self) -> u64 {
         self.narrows.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     pub(crate) fn misses(&self) -> u64 {
         self.misses.load(Ordering::Relaxed)
+    }
+
+    /// Bytes currently held by cached bitmaps (the cache's sub-budget usage).
+    pub(crate) fn used_bytes(&self) -> u64 {
+        self.budget.used()
     }
 
     /// Resolve `pushed` against `shard` to a matched-doc set, serving from cache

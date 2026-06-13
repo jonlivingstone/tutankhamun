@@ -12,28 +12,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use axum::Router;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use axum::routing::get;
 use tokio::net::TcpListener;
 use tracing::info;
 
+use crate::metrics::Metrics;
 use crate::shutdown::ShutdownHandle;
 
-/// Liveness + readiness state shared with handlers.
-#[derive(Clone, Default)]
+/// Liveness + readiness state plus the metrics surface, shared with handlers.
+#[derive(Clone)]
 pub struct OpsState {
     inner: Arc<OpsStateInner>,
 }
 
-#[derive(Default)]
 struct OpsStateInner {
     ready: AtomicBool,
+    metrics: Arc<Metrics>,
 }
 
 impl OpsState {
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            inner: Arc::new(OpsStateInner {
+                ready: AtomicBool::new(false),
+                metrics,
+            }),
+        }
     }
 
     /// Mark the daemon as ready to serve traffic. Called once the data-plane
@@ -67,6 +74,7 @@ fn router(state: OpsState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
         .with_state(state)
 }
 
@@ -100,12 +108,33 @@ async fn readyz(State(state): State<OpsState>) -> impl IntoResponse {
     }
 }
 
+/// Prometheus text exposition of the daemon's metrics (§3.4).
+async fn metrics(State(state): State<OpsState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.inner.metrics.render(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    use crate::bitmap_cache::BitmapCache;
+    use crate::memory::{MemoryBudget, SessionMemoryHandle};
+
+    fn test_state() -> OpsState {
+        let budget = Arc::new(MemoryBudget::new(u64::MAX));
+        let cache = Arc::new(BitmapCache::new(Arc::new(SessionMemoryHandle::new(
+            Arc::clone(&budget),
+            u64::MAX,
+        ))));
+        OpsState::new(Metrics::new(budget, cache))
+    }
 
     fn req(uri: &str) -> Request<Body> {
         Request::builder()
@@ -116,7 +145,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_returns_ok_regardless_of_readiness() {
-        let state = OpsState::new();
+        let state = test_state();
         let response = router(state.clone())
             .oneshot(req("/healthz"))
             .await
@@ -130,16 +159,13 @@ mod tests {
 
     #[tokio::test]
     async fn readyz_starts_not_ready() {
-        let response = router(OpsState::new())
-            .oneshot(req("/readyz"))
-            .await
-            .unwrap();
+        let response = router(test_state()).oneshot(req("/readyz")).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn readyz_reflects_mark_ready_toggles() {
-        let state = OpsState::new();
+        let state = test_state();
 
         state.mark_ready();
         let response = router(state.clone()).oneshot(req("/readyz")).await.unwrap();
@@ -148,5 +174,22 @@ mod tests {
         state.mark_not_ready();
         let response = router(state).oneshot(req("/readyz")).await.unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn metrics_returns_prometheus_text() {
+        let response = router(test_state()).oneshot(req("/metrics")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("tut_memory_limit_bytes"));
+        assert!(text.contains("tut_bitmap_cache_hits_total"));
+        assert!(text.contains("tut_query_duration_seconds_bucket"));
     }
 }
