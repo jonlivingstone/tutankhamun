@@ -45,7 +45,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::info;
+use tracing::{Instrument as _, info, info_span};
 use uuid::Uuid;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -302,6 +302,48 @@ impl TutankhamunFlightSqlService {
         ctx
     }
 
+    /// Plan and execute `query` against `ctx`, returning the output schema and
+    /// collected batches. Shared by the statement and prepared-statement `do_get`
+    /// paths. Wraps the work in a per-query span (§3.4) with `plan` / `execute`
+    /// sub-spans, records the metrics histogram, and records `rows` / `error` on
+    /// the query span. `prepared` distinguishes the two callers.
+    #[allow(clippy::result_large_err)]
+    async fn execute_query(
+        &self,
+        ctx: &SessionContext,
+        query: &str,
+        prepared: bool,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+        let span = info_span!(
+            "query",
+            sql = %sql_preview(query),
+            prepared,
+            rows = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        async {
+            let (df, schema) = plan(ctx, query).instrument(info_span!("plan")).await?;
+            let started = Instant::now();
+            let result = df.collect().instrument(info_span!("execute")).await;
+            self.inner
+                .metrics
+                .record_query(started.elapsed(), result.is_ok());
+            match result {
+                Ok(batches) => {
+                    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                    tracing::Span::current().record("rows", rows as u64);
+                    Ok((schema, batches))
+                }
+                Err(e) => {
+                    tracing::Span::current().record("error", "execute");
+                    Err(plan_error(&e))
+                }
+            }
+        }
+        .instrument(span)
+        .await
+    }
+
     /// Mint an opaque session and return its token. The token is server-issued
     /// and unguessable (§2.4); the client echoes it but never parses it.
     ///
@@ -476,16 +518,11 @@ impl FlightSqlService for TutankhamunFlightSqlService {
             .map_err(|e| Status::invalid_argument(format!("ticket handle not UTF-8 SQL: {e}")))?;
         let session = self.resolve_session(request.metadata())?;
         let ctx = self.context_for(session.as_ref());
-        let (df, schema) = plan(&ctx, &query).await?;
-        // `collect` drives the plan; the FTGS/scan execs bridge async→sync on
-        // their own scoped threads (see `sql::scan`'s `block_on_scan`), so it is
-        // safe to await here without parking a worker on a nested `block_on`.
-        let started = Instant::now();
-        let result = df.collect().await;
-        self.inner
-            .metrics
-            .record_query(started.elapsed(), result.is_ok());
-        let batches = result.map_err(|e| plan_error(&e))?;
+        // `execute_query` wraps this in a per-query span (§3.4). `collect` drives
+        // the plan; the FTGS/scan execs bridge async→sync on their own scoped
+        // threads (`block_on_scan`), so it is safe to await here without parking a
+        // worker on a nested `block_on`.
+        let (schema, batches) = self.execute_query(&ctx, &query, false).await?;
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -584,13 +621,7 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         let sql = self.prepared_sql(&query.prepared_statement_handle)?;
         let session = self.resolve_session(request.metadata())?;
         let ctx = self.context_for(session.as_ref());
-        let (df, schema) = plan(&ctx, &sql).await?;
-        let started = Instant::now();
-        let result = df.collect().await;
-        self.inner
-            .metrics
-            .record_query(started.elapsed(), result.is_ok());
-        let batches = result.map_err(|e| plan_error(&e))?;
+        let (schema, batches) = self.execute_query(&ctx, &sql, true).await?;
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -1024,6 +1055,13 @@ async fn run_reaper(svc: TutankhamunFlightSqlService, shutdown: ShutdownHandle) 
 /// surface it verbatim.
 fn plan_error(e: &DataFusionError) -> Status {
     Status::internal(format!("query failed: {e}"))
+}
+
+/// A bounded preview of the SQL text for a trace span attribute (standard
+/// cardinality discipline — the span carries the query, not unbounded labels).
+fn sql_preview(sql: &str) -> String {
+    const MAX: usize = 200;
+    sql.chars().take(MAX).collect()
 }
 
 #[cfg(test)]

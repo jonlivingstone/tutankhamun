@@ -50,6 +50,10 @@ tonic = { workspace = true }
 prost = { workspace = true }
 tokio-stream = { workspace = true }
 uuid = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }

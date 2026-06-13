@@ -25,6 +25,7 @@ pub mod env_vars {
     pub const MEMORY_LIMIT: &str = "TUT_MEMORY_LIMIT";
     pub const MAX_SESSION_MEMORY_PCT: &str = "TUT_MAX_SESSION_MEMORY_PCT";
     pub const BITMAP_CACHE_PCT: &str = "TUT_BITMAP_CACHE_PCT";
+    pub const OTLP_ENDPOINT: &str = "TUT_OTLP_ENDPOINT";
 
     /// Prefix figment uses to scan for env-driven overrides.
     pub const PREFIX: &str = "TUT_";
@@ -98,6 +99,12 @@ pub struct ServeArgs {
     #[arg(long, env = env_vars::BITMAP_CACHE_PCT)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitmap_cache_pct: Option<u8>,
+
+    /// OTLP/HTTP endpoint for OpenTelemetry trace export (e.g.
+    /// `http://localhost:4318`). Unset disables tracing export.
+    #[arg(long, env = env_vars::OTLP_ENDPOINT)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
 }
 
 /// Fully-resolved daemon configuration.
@@ -117,6 +124,8 @@ pub struct Config {
     pub max_session_memory_pct: u8,
     /// Doc-set bitmap cache size as a percent of the global budget (0 disables).
     pub bitmap_cache_pct: u8,
+    /// OTLP/HTTP trace-export endpoint; `None` disables tracing export.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for Config {
@@ -133,6 +142,7 @@ impl Default for Config {
             memory_limit: "4GB".into(),
             max_session_memory_pct: 20,
             bitmap_cache_pct: 25,
+            otlp_endpoint: None,
         }
     }
 }

@@ -254,9 +254,14 @@ pub(crate) enum StorageCommand {
 }
 
 fn main() -> anyhow::Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
+
+    // `serve` builds its own layered subscriber (fmt + optional OTLP) inside the
+    // tokio runtime — the OTLP batch exporter needs a runtime. Every other
+    // subcommand is one-shot and uses the simple fmt/json subscriber.
+    if !matches!(cli.command, Command::Serve(_)) {
+        init_tracing();
+    }
 
     match &cli.command {
         Command::Serve(args) => run_serve(args),
@@ -304,16 +309,24 @@ fn main() -> anyhow::Result<()> {
 
 fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
     let config = Config::resolve(args)?;
-    info!(?config, "loaded configuration");
-
-    runtime::init_rayon(config.rayon_workers)?;
-    info!(workers = config.rayon_workers, "rayon pool initialised");
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.tokio_workers)
         .thread_name("tk-tokio")
         .enable_all()
         .build()?;
+
+    // Init the layered subscriber inside the runtime (the OTLP batch exporter
+    // spawns a background task that needs it). Held across `serve` so the tracer
+    // flushes on shutdown. Logs below this line are captured by it.
+    let _telemetry = {
+        let _enter = runtime.enter();
+        init_serve_tracing(&config)?
+    };
+    info!(?config, "loaded configuration");
+
+    runtime::init_rayon(config.rayon_workers)?;
+    info!(workers = config.rayon_workers, "rayon pool initialised");
     info!(workers = config.tokio_workers, "tokio runtime initialised");
 
     runtime.block_on(serve(config))
@@ -485,6 +498,8 @@ async fn log_storage_scan(store: &dyn object_store::ObjectStore) {
     }
 }
 
+/// Simple fmt/json subscriber for one-shot subcommands (no OTLP). `TUT_LOG_JSON=1`
+/// selects JSON; the filter defaults to `info`.
 fn init_tracing() {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt;
@@ -495,5 +510,90 @@ fn init_tracing() {
         fmt().json().with_env_filter(filter).init();
     } else {
         fmt().with_env_filter(filter).init();
+    }
+}
+
+/// Holds the OTLP tracer provider so spans flush on a graceful shutdown; dropping
+/// it (when `run_serve` returns) shuts the batch exporter down. `None` when no
+/// `--otlp-endpoint` is configured.
+struct TelemetryGuard {
+    provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
+}
+
+impl Drop for TelemetryGuard {
+    fn drop(&mut self) {
+        if let Some(provider) = self.provider.take()
+            && let Err(e) = provider.shutdown()
+        {
+            eprintln!("otel tracer shutdown failed: {e}");
+        }
+    }
+}
+
+/// Build the daemon's layered subscriber: `EnvFilter` (default `info`) + an
+/// fmt/json layer (honoring `TUT_LOG_JSON`) + an optional OpenTelemetry layer that
+/// exports spans to `--otlp-endpoint` over OTLP/HTTP. Must run inside the tokio
+/// runtime (the batch exporter spawns a background task). One-shot: calls `.init()`.
+fn init_serve_tracing(config: &Config) -> anyhow::Result<TelemetryGuard> {
+    use opentelemetry::trace::TracerProvider as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{EnvFilter, Layer as _, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let json = std::env::var(env_vars::LOG_JSON).as_deref() == Ok("1");
+    let fmt_layer = if json {
+        fmt::layer().json().with_current_span(true).boxed()
+    } else {
+        fmt::layer().boxed()
+    };
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    let Some(endpoint) = config.otlp_endpoint.as_deref() else {
+        registry.init();
+        return Ok(TelemetryGuard { provider: None });
+    };
+
+    let provider = build_otlp_provider(endpoint)?;
+    let otel_layer =
+        tracing_opentelemetry::layer().with_tracer(provider.tracer(env!("CARGO_PKG_NAME")));
+    registry.with(otel_layer).init();
+    info!(otlp_endpoint = %endpoint, "OTLP trace export enabled");
+    Ok(TelemetryGuard {
+        provider: Some(provider),
+    })
+}
+
+/// Build an OTLP/HTTP span exporter + batch tracer provider for `endpoint`. Build
+/// is offline (no connection until spans export), so a dead collector is fine —
+/// exports just fail in the background. Must run inside a tokio runtime.
+fn build_otlp_provider(
+    endpoint: &str,
+) -> anyhow::Result<opentelemetry_sdk::trace::SdkTracerProvider> {
+    use opentelemetry_otlp::WithExportConfig as _;
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint)
+        .build()?;
+    let resource = opentelemetry_sdk::Resource::builder()
+        .with_service_name(env!("CARGO_PKG_NAME"))
+        .build();
+    Ok(opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
+        .build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn otlp_provider_builds_offline() {
+        // A dead/bogus endpoint must still build (export is async + best-effort);
+        // this exercises the otel API wiring without a live collector.
+        let provider = build_otlp_provider("http://127.0.0.1:4318").expect("build provider");
+        let _ = provider.shutdown();
     }
 }

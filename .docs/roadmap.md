@@ -350,15 +350,27 @@ directly.
       the cheap metadata/DDL RPCs, shard-cache hit/miss + mmap'd bytes,
       and pool queue depths (rayon exposes none; tokio needs
       `tokio_unstable`))
-- [ ] OpenTelemetry tracing setup (OTLP exporter, configurable
-      endpoint) — §3.4
-- [ ] Trace per query with span attributes (claimed user,
-      dataset, time range, memory claimed, rows scanned /
-      returned, error type) — §3.4
-- [ ] Sub-spans for parse / plan / scan-per-shard / FTGS /
-      merge / serialize — §3.4
-- [ ] Structured JSON logging to stdout, tagged with trace ID —
-      §3.4
+- [x] OpenTelemetry tracing setup (OTLP exporter, configurable
+      endpoint) — §3.4 (`--otlp-endpoint` / `TUT_OTLP_ENDPOINT`; unset disables
+      export. OTLP/HTTP exporter via the `hyper-client` (reusing the in-tree
+      hyper, not reqwest); `serve`'s layered subscriber — `EnvFilter` + fmt/json
+      + the otel layer — is built inside the runtime in `run_serve` and held by a
+      `TelemetryGuard` that flushes/shuts the batch exporter down on graceful
+      exit. One-shot subcommands keep the simple fmt/json `init_tracing`)
+- [~] Trace per query with span attributes — §3.4 (a `query` span per
+      `do_get_statement`/`do_get_prepared_statement` with `sql` (bounded preview),
+      `prepared`, `rows`, and `error`. Deferred attributes that need other
+      subsystems: `dataset`/`time_range` (plan introspection), `memory_claimed`,
+      and `claimed user` (the unwired §1.6 identity field))
+- [~] Sub-spans for parse / plan / scan-per-shard / FTGS /
+      merge / serialize — §3.4 (`plan` and `execute` sub-spans at the handler
+      boundary. The deep per-shard/FTGS/merge spans run inside `block_on_scan`'s
+      spawned thread, across which the parent span doesn't propagate without
+      explicit capture/re-entry — deferred)
+- [~] Structured JSON logging to stdout, tagged with trace ID —
+      §3.4 (`TUT_LOG_JSON=1` emits JSON with the current span's name/fields via
+      `with_current_span`; a literal `trace_id` field on every log line — a small
+      custom layer reading the otel span context — is deferred)
 
 ## Web UI
 

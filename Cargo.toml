@@ -38,6 +38,15 @@ rayon = "1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# OpenTelemetry tracing (§3.4). All four share one otel major (0.32). The OTLP
+# HTTP exporter uses the `hyper-client` (reusing the hyper already in the tree
+# via tonic/axum) rather than `reqwest-client`, which would add a second reqwest;
+# it still pulls a second prost (0.14) since opentelemetry-proto needs it and
+# arrow-flight pins 0.13 — an accepted, contained duplicate.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "hyper-client", "trace"] }
+tracing-opentelemetry = "0.33"
 
 # Errors
 anyhow = "1"
