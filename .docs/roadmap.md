@@ -158,6 +158,29 @@ directly.
 - [ ] Same merge code reused at client layer (cross-daemon) — §2.6
       (`merge_ftgs` is already the shared primitive; cross-daemon
       wiring still to build)
+- [ ] Per-shard partial-aggregate cache (lazy partial cube) — §2.6
+      (shards are immutable, so a per-`(shard content hash, dimension-set,
+      column, stat)` partial is permanently valid and composes across
+      shards via `StatSpec::combine` — a cuboid that never needs
+      maintenance. Cache at the `FtgsAggExec` per-shard boundary so repeat
+      aggregates skip the column re-scan and only re-merge. Scope:
+      - **Unfiltered only.** A filtered partial depends on the doc-set,
+        unbounded by predicate — already covered by the §2.8 bitmap cache.
+      - **Apex + low-cardinality GROUP BY.** Cache the no-group apex
+        cuboid and grouped cuboids whose group-lookup backing is
+        `Constant`/`BitSet`/`Byte`/`Char` (≤ ~65 K groups); fall back to
+        live scan when it spills to `Int`. The backing tier the FTGS run
+        already chose *is* the cardinality gate — no extra estimation.
+        High-card keys make a cuboid ≈ the raw column (no work saved) and
+        are typically one-off (no reuse); low-card cuboids are small, hot,
+        and roll up (`GROUP BY (a,b)` answers `GROUP BY a`).
+      - **Byte-accounted LRU, not entry-counted.** A scalar/`Avg` cell is
+        8–16 B; a sketch cell (`Hll`/`TDigest`/`Theta`/`TopK`) is ~KB, so
+        a grouped sketch cuboid is KB × group count. Cache sketches too —
+        they save the *most* recompute (a full hashing pass) and merge
+        exactly (register-wise max adds no error) — but charge them by
+        bytes so the `used_bytes` + LRU cap evicts the heavy sketch
+        cuboids first, mirroring the shard and bitmap caches.)
 
 ## Engine — sessions
 

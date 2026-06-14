@@ -897,6 +897,46 @@ Imhotep:** within a daemon (across that daemon's shards) and within
 the client library (across daemons). "Distribution is recursion" —
 the same merge function is reused at both levels.
 
+**Deferred — per-shard partial-aggregate cache (a lazy partial cube).**
+A per-shard partial is `(field, term, group, stats)` reduced over one
+shard; immutability makes it permanently valid, and `StatSpec::combine`
+already composes partials across shards. That is exactly a **cuboid**:
+caching the per-`(shard content hash, dimension-set, column, stat)`
+partial turns a repeat aggregate into a re-merge with no column re-scan.
+The framing matters because it sets the scope precisely:
+
+- **This is the cube's good 80% without the bad part.** The defining
+  cost of an OLAP cube is *maintenance* — keeping materialized cells
+  fresh as base data mutates. Immutable shards delete that problem: a
+  shard's cuboid is valid forever, new data is new shards, and they
+  merge at query time. We never invalidate, only accumulate. Imhotep ran
+  FTGS (dimensional aggregation) but always recomputed from bitmaps and
+  never materialized; cached cuboids are the step immutability now allows.
+- **Apex + low-cardinality GROUP BY only.** The no-group apex cuboid is
+  bytes-per-shard (free). A grouped cuboid's size is its *group
+  cardinality*, so it stays cheap exactly when the group-lookup backing
+  (§ above) is `Constant`/`BitSet`/`Byte`/`Char`; cache those and fall
+  back to live scan when it spills to `Int`. The backing the FTGS run
+  already chose *is* the cardinality gate. High-card keys make a cuboid ≈
+  the raw column (no work saved) and are typically one-off (no reuse);
+  low-card cuboids are small, hot, and roll up (`GROUP BY (a,b)` answers
+  `GROUP BY a`). Caching the *whole* lattice is never the plan — this is
+  a **lazy** cube: materialize only the cuboids queries actually issue.
+- **Unfiltered only.** A filtered partial depends on the doc-set, which
+  is unbounded by predicate; that is already what the §2.8 bitmap cache
+  composes. The partial-aggregate cache and the bitmap cache are
+  complementary, not overlapping.
+- **Byte-bounded LRU, because sketch cells dominate size.** A scalar /
+  `Avg` cell is 8–16 B; an `Hll`/`TDigest`/`Theta`/`TopK` cell is ~KB, so
+  a grouped sketch cuboid is KB × group count. Sketches are still worth
+  caching — they save the *most* recompute (a full hashing pass over the
+  column) and merge *exactly* (HLL register-wise `max` adds no error) —
+  but they must be charged by bytes so the `used_bytes` + LRU cap evicts
+  the heavy sketch cuboids first. An HLL sketch is itself a cached,
+  mergeable partial by design; persisting per-shard sketches is using it
+  as intended. The cache is therefore byte-accounted, not entry-counted,
+  mirroring the shard (§1.5) and bitmap (§2.8) caches.
+
 ### 2.7 Approximate aggregations
 
 Decided in §3.1 (net-new capability over Imhotep — HLL + t-digest +
