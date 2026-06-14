@@ -94,9 +94,11 @@ enum Command {
         #[arg(long, env = "T9N_CACHE_SIZE", default_value = "10GB")]
         cache_size: String,
     },
-    /// Build one or more shards from a CSV/TSV input file.
+    /// Build one or more shards from a CSV/TSV or Parquet input file.
     Ingest {
-        /// Path to the CSV/TSV input file (must have a header row).
+        /// Path to the input file: CSV/TSV (with a header row) or Parquet.
+        /// Format is inferred from the extension (`.parquet`/`.pq` →
+        /// Parquet); override with `--format`.
         input: PathBuf,
         /// Where to write the finalised shard(s). Accepts a local
         /// directory path or any `object_store` URL (`s3://`,
@@ -114,8 +116,10 @@ enum Command {
         /// `YYYYMMDD` columns to one of the above formats.
         #[arg(long)]
         time: String,
-        /// Header name of an int64 metric column (aggregatable
-        /// only). Repeatable.
+        /// Header name of a numeric metric column (aggregatable only).
+        /// For CSV the value must be int64; for Parquet, integer /
+        /// decimal / float columns are accepted (floats are scaled — see
+        /// `--scale`). Repeatable.
         #[arg(long = "metric")]
         metrics: Vec<String>,
         /// Header name of a string-field column (filterable only).
@@ -135,6 +139,15 @@ enum Command {
         /// produce one shard per day / hour under `--output`.
         #[arg(long, value_enum, default_value_t = ShardByArg::None)]
         shard_by: ShardByArg,
+        /// Per-column scale for Parquet float columns: `--scale
+        /// fare_amount=2` stores `round(value × 10^2)` (cents). Floats
+        /// default to scale 3. Repeatable. Decimal columns use their own
+        /// schema scale; not valid for CSV input.
+        #[arg(long = "scale", value_parser = parse_scale)]
+        scale: Vec<(String, i8)>,
+        /// Input format. Inferred from the file extension when omitted.
+        #[arg(long, value_enum)]
+        format: Option<FormatArg>,
     },
     /// Run a SQL query over a dataset via `DataFusion` and print the
     /// result table. The dataset is registered as a table named `t`.
@@ -177,6 +190,27 @@ impl From<ShardByArg> for ShardBy {
             ShardByArg::Hourly => ShardBy::Bucket { seconds: 3600 },
         }
     }
+}
+
+/// Input format for `t9n ingest`; inferred from the file extension when omitted.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum FormatArg {
+    Csv,
+    Parquet,
+}
+
+/// Parse a `--scale COL=N` argument into a `(column, scale)` pair.
+fn parse_scale(s: &str) -> Result<(String, i8), String> {
+    let (name, n) = s
+        .split_once('=')
+        .ok_or_else(|| format!("expected COL=SCALE, got {s:?}"))?;
+    if name.is_empty() {
+        return Err(format!("empty column name in {s:?}"));
+    }
+    let scale: i8 = n
+        .parse()
+        .map_err(|_| format!("invalid scale {n:?} in {s:?}"))?;
+    Ok((name.to_string(), scale))
 }
 
 #[derive(Args, Debug)]
@@ -295,8 +329,10 @@ fn main() -> anyhow::Result<()> {
             ints,
             delimiter,
             shard_by,
+            scale,
+            format,
         } => commands::ingest::run(
-            input, output, time, metrics, strings, ints, *delimiter, *shard_by,
+            input, output, time, metrics, strings, ints, *delimiter, *shard_by, scale, *format,
         ),
         Command::Sql {
             source,

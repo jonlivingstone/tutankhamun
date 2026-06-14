@@ -374,6 +374,7 @@ mod tests {
             fields: vec![FieldSchema {
                 name: "x".into(),
                 kind: FieldKind::Metric,
+                scale: 0,
             }],
             content_hashes: std::collections::BTreeMap::default(),
             time_field: None,

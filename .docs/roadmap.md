@@ -284,6 +284,13 @@ directly.
 - [x] Output Tutankhamun-format shards (Arrow IPC + Roaring +
       FST) — §3.3 v1
 - [x] Upload to object storage via `object_store` — §3.3 v1
+- [x] Native Parquet ingest — `t9n ingest file.parquet` reads the typed
+      Arrow schema directly (format inferred from extension or `--format`).
+      Numeric columns become scaled `i64`: integers as-is, `Decimal128(p,s)`
+      as the mantissa (scale from the schema), floats as `round(v × 10^scale)`
+      (`--scale`, default 3); the per-field scale is recorded in `metadata.json`.
+      Deferred: query-time decimal *presentation* (aggregates return the scaled
+      integer), schema-inferred column mapping, Decimal256, CSV float-via-scale
 - [ ] Daemon writable local state directory (configured via
       `--state-dir`) — for cache in v1; for WAL in v2 — §3.3 v1
 - [ ] `flamdex-to-tutankhamun` migration tool — read old Imhotep

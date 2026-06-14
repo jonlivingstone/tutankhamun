@@ -4073,6 +4073,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "parquet",
  "prost 0.13.5",
  "rayon",
  "roaring",

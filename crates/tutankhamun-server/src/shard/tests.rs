@@ -49,10 +49,12 @@ fn metadata_roundtrips_through_serde_json() {
             FieldSchema {
                 name: "a".into(),
                 kind: FieldKind::Metric,
+                scale: 0,
             },
             FieldSchema {
                 name: "country".into(),
                 kind: FieldKind::String,
+                scale: 0,
             },
         ],
         content_hashes: std::collections::BTreeMap::default(),

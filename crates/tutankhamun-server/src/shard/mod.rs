@@ -105,6 +105,19 @@ impl Metadata {
 pub struct FieldSchema {
     pub name: String,
     pub kind: FieldKind,
+    /// Decimal scale: the stored `i64` is the value × 10^`scale` (so a
+    /// `Decimal(p,2)` or a float ingested at scale 2 stores cents). 0 for plain
+    /// integers and strings. Recorded so a future read path can present the
+    /// scaled decimal; today aggregates return the raw integer. Optional in the
+    /// JSON (omitted when 0) so existing shards deserialize unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_scale")]
+    pub scale: i8,
+}
+
+// Signature dictated by serde's `skip_serializing_if` (takes `&T`).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_scale(scale: &i8) -> bool {
+    *scale == 0
 }
 
 /// Field type within a shard.

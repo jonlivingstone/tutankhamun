@@ -43,6 +43,9 @@ hex = { workspace = true }
 fs2 = { workspace = true }
 tempfile = { workspace = true }
 datafusion = "50"
+# Already resolved (56.2.1) transitively via DataFusion; declared directly so
+# `ingest` can read Parquet into Arrow without leaning on the re-export.
+parquet = "56"
 hyperloglogplus = "0.4"
 tdigest = "0.2"
 arrow-flight = { workspace = true }

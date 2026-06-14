@@ -59,6 +59,9 @@ pub struct DiskShardWriter {
     string_fields: Vec<(String, BTreeMap<String, RoaringBitmap>)>,
     num_docs: Option<u64>,
     time_field: Option<String>,
+    /// Decimal scale per field name; absent ⇒ 0. Stamped into each
+    /// `FieldSchema` at finalize (see [`set_field_scale`]).
+    scales: BTreeMap<String, i8>,
 }
 
 /// One forward-column field, used for both `Metric` and `Int` kinds.
@@ -80,7 +83,18 @@ impl DiskShardWriter {
             string_fields: Vec::new(),
             num_docs: None,
             time_field: None,
+            scales: BTreeMap::new(),
         })
+    }
+
+    /// Record a decimal scale for a forward-column field (the stored `i64` is
+    /// the value × 10^`scale`). No-op semantics for scale 0. Call after the
+    /// field's `add_metric`/`add_int_field`; finalize stamps it into the field's
+    /// `metadata.json` entry.
+    pub fn set_field_scale(&mut self, name: &str, scale: i8) {
+        if scale != 0 {
+            self.scales.insert(name.to_string(), scale);
+        }
     }
 
     /// Record which field holds each doc's time (an `Int` field added
@@ -163,6 +177,7 @@ impl DiskShardWriter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn finalize(self) -> Result<()> {
         // num_docs is the doc-ID universe size. Forward columns
         // (Metric or Int) fix it explicitly via their row count;
@@ -221,12 +236,14 @@ impl DiskShardWriter {
             fields.push(FieldSchema {
                 name: col.name.clone(),
                 kind: col.kind,
+                scale: self.scales.get(&col.name).copied().unwrap_or(0),
             });
         }
         for (name, _) in &self.string_fields {
             fields.push(FieldSchema {
                 name: name.clone(),
                 kind: FieldKind::String,
+                scale: 0,
             });
         }
         let mut metadata = Metadata {

@@ -1,8 +1,15 @@
-//! CSV/TSV → shard ingester.
+//! CSV/TSV and Parquet → shard ingester.
 //!
-//! [`ingest_csv`] reads a delimited text file, parses each row, and
-//! feeds the declared columns into [`crate::shard::DiskShardWriter`].
-//! Columns not declared in [`IngestOptions`] are silently dropped.
+//! [`ingest_csv`] reads a delimited text file and [`ingest_parquet`] reads a
+//! Parquet file (via its typed Arrow schema); both parse each row and feed the
+//! declared columns into [`crate::shard::DiskShardWriter`]. Columns not declared
+//! in [`IngestOptions`] are silently dropped.
+//!
+//! The storage format's metrics are `i64`, so numeric columns are stored as a
+//! scaled integer: integers as-is (scale 0), `Decimal128(p,s)` as the unscaled
+//! mantissa (scale `s`, from the schema), and floats as `round(v × 10^scale)`
+//! (scale defaults to [`DEFAULT_FLOAT_SCALE`], overridable per column). The scale
+//! is recorded in each field's `metadata.json` entry.
 //!
 //! Used by the `t9n ingest` CLI verb.
 
@@ -11,13 +18,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use arrow::array::{
+    Array, ArrayRef, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+};
+use arrow::datatypes::{DataType, TimeUnit};
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutPayload, WriteMultipart};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringBitmap;
 use tokio::io::AsyncReadExt;
 
 use crate::shard::{DiskShardWriter, FieldKind, METADATA_FILE};
+
+/// Default decimal scale applied to float columns at ingest (`round(v × 10^3)`),
+/// i.e. three fractional digits. Overridable per column via `--scale`.
+pub const DEFAULT_FLOAT_SCALE: i8 = 3;
 
 /// Files smaller than this go through a single `put`; larger files
 /// use `put_multipart` so we never buffer the full payload in
@@ -347,6 +366,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
             col_idx: find(name)?,
             values: Vec::new(),
             kind: FieldKind::Metric,
+            scale: 0,
         });
     }
     for name in &opts.ints {
@@ -355,6 +375,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
             col_idx: find(name)?,
             values: Vec::new(),
             kind: FieldKind::Int,
+            scale: 0,
         });
     }
     let strings_proto: Vec<StringCol> = opts
@@ -411,6 +432,241 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
     Ok(written)
 }
 
+/// Read `input` as Parquet (via its typed Arrow schema) and write shards,
+/// mirroring [`ingest_csv`]'s bucketing + finalize. `scales` overrides the
+/// per-column float scale (`--scale`) and is valid only on float columns.
+pub fn ingest_parquet(
+    input: &Path,
+    output: &Path,
+    opts: &IngestOptions,
+    scales: &BTreeMap<String, i8>,
+) -> Result<u64> {
+    check_no_duplicate_columns(opts)?;
+
+    let file = std::fs::File::open(input).with_context(|| format!("open {}", input.display()))?;
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .with_context(|| format!("open parquet {}", input.display()))?;
+    let schema = builder.schema().clone();
+
+    let find = |name: &str| -> Result<usize> {
+        schema
+            .index_of(name)
+            .map_err(|_| anyhow::anyhow!("column {name:?} not found in parquet schema"))
+    };
+
+    let time_idx = find(&opts.time)?;
+
+    let mut numeric_proto: Vec<NumericCol> = Vec::new();
+    for (names, kind) in [
+        (&opts.metrics, FieldKind::Metric),
+        (&opts.ints, FieldKind::Int),
+    ] {
+        for name in names {
+            let idx = find(name)?;
+            let scale = resolve_scale(name, schema.field(idx).data_type(), scales)?;
+            numeric_proto.push(NumericCol {
+                name: name.clone(),
+                col_idx: idx,
+                values: Vec::new(),
+                kind,
+                scale,
+            });
+        }
+    }
+    let strings_proto: Vec<StringCol> = opts
+        .strings
+        .iter()
+        .map(|name| {
+            Ok(StringCol {
+                name: name.clone(),
+                col_idx: find(name)?,
+                postings: BTreeMap::new(),
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    // A `--scale` key that names no ingested metric/int column is a user error
+    // (resolve_scale already rejects scale on int/decimal columns).
+    for key in scales.keys() {
+        if !numeric_proto.iter().any(|c| &c.name == key) {
+            bail!("--scale {key}: no metric/int column named {key:?}");
+        }
+    }
+
+    let reader = builder
+        .build()
+        .with_context(|| format!("read parquet {}", input.display()))?;
+
+    let mut buckets: BTreeMap<i64, BucketBuilder> = BTreeMap::new();
+    let mut total_rows: u64 = 0;
+    for batch in reader {
+        let batch =
+            batch.with_context(|| format!("read parquet batch from {}", input.display()))?;
+        let time_arr = batch.column(time_idx);
+        let mut numeric = Vec::with_capacity(numeric_proto.len());
+        let mut strings = Vec::with_capacity(strings_proto.len());
+        for row in 0..batch.num_rows() {
+            let t = extract_time(time_arr, row, &opts.time)?;
+            numeric.clear();
+            for col in &numeric_proto {
+                numeric.push(extract_numeric(
+                    batch.column(col.col_idx),
+                    row,
+                    &col.name,
+                    col.scale,
+                )?);
+            }
+            strings.clear();
+            for col in &strings_proto {
+                strings.push(extract_string(batch.column(col.col_idx), row, &col.name)?);
+            }
+            let key = opts.shard_by.bucket_key(t);
+            buckets
+                .entry(key)
+                .or_insert_with(|| BucketBuilder::new(&numeric_proto, &strings_proto, &opts.time))
+                .push_values(t, &numeric, &strings)?;
+            total_rows += 1;
+        }
+    }
+
+    if total_rows == 0 {
+        bail!("no data rows in {}", input.display());
+    }
+
+    let mut written: u64 = 0;
+    for (key, bucket) in buckets {
+        let shard_dir = opts.shard_by.output_dir(output, key);
+        written += bucket.finalize(&shard_dir)?;
+    }
+    Ok(written)
+}
+
+/// Resolve the decimal scale for a metric/int column from its Arrow type and the
+/// `--scale` overrides: decimals use their schema scale, floats default to
+/// [`DEFAULT_FLOAT_SCALE`] (overridable), integers are scale 0. `--scale` on a
+/// non-float column is a user error.
+fn resolve_scale(name: &str, dt: &DataType, scales: &BTreeMap<String, i8>) -> Result<i8> {
+    match dt {
+        DataType::Decimal128(_, s) => {
+            if scales.contains_key(name) {
+                bail!("--scale {name}: decimal columns carry their own scale; drop the override");
+            }
+            Ok(*s)
+        }
+        DataType::Float32 | DataType::Float64 => {
+            Ok(scales.get(name).copied().unwrap_or(DEFAULT_FLOAT_SCALE))
+        }
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => {
+            if scales.contains_key(name) {
+                bail!("--scale {name}: only float columns can be scaled (integers are exact)");
+            }
+            Ok(0)
+        }
+        other => {
+            bail!("column {name:?} has unsupported type {other:?} for a metric/int field")
+        }
+    }
+}
+
+/// Downcast an `ArrayRef` to a concrete Arrow array type. The type is dictated by
+/// the column's `DataType`, so a failure is an internal invariant break.
+fn downcast_array<'a, T: 'static>(array: &'a ArrayRef, name: &str) -> Result<&'a T> {
+    array
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| anyhow::anyhow!("column {name:?}: unexpected Arrow array layout"))
+}
+
+/// Extract a doc's time as epoch seconds from a Parquet column.
+fn extract_time(array: &ArrayRef, row: usize, name: &str) -> Result<i64> {
+    if array.is_null(row) {
+        bail!("row {row}: null in time column {name:?}");
+    }
+    let v = match array.data_type() {
+        DataType::Timestamp(unit, _) => match unit {
+            TimeUnit::Second => downcast_array::<TimestampSecondArray>(array, name)?.value(row),
+            TimeUnit::Millisecond => {
+                downcast_array::<TimestampMillisecondArray>(array, name)?.value(row) / 1_000
+            }
+            TimeUnit::Microsecond => {
+                downcast_array::<TimestampMicrosecondArray>(array, name)?.value(row) / 1_000_000
+            }
+            TimeUnit::Nanosecond => {
+                downcast_array::<TimestampNanosecondArray>(array, name)?.value(row) / 1_000_000_000
+            }
+        },
+        DataType::Date32 => {
+            i64::from(downcast_array::<Date32Array>(array, name)?.value(row)) * 86_400
+        }
+        DataType::Date64 => downcast_array::<Date64Array>(array, name)?.value(row) / 1_000,
+        DataType::Int64 => downcast_array::<Int64Array>(array, name)?.value(row),
+        DataType::Int32 => i64::from(downcast_array::<Int32Array>(array, name)?.value(row)),
+        DataType::Utf8 => parse_time_str(downcast_array::<StringArray>(array, name)?.value(row))?,
+        DataType::LargeUtf8 => {
+            parse_time_str(downcast_array::<LargeStringArray>(array, name)?.value(row))?
+        }
+        other => bail!("time column {name:?} has unsupported type {other:?}"),
+    };
+    Ok(v)
+}
+
+/// Extract a doc's numeric value as a scaled `i64` (see module docs).
+fn extract_numeric(array: &ArrayRef, row: usize, name: &str, scale: i8) -> Result<i64> {
+    if array.is_null(row) {
+        bail!("row {row}: null in numeric column {name:?}");
+    }
+    let v = match array.data_type() {
+        DataType::Int64 => downcast_array::<Int64Array>(array, name)?.value(row),
+        DataType::Int32 => i64::from(downcast_array::<Int32Array>(array, name)?.value(row)),
+        DataType::Int16 => i64::from(downcast_array::<Int16Array>(array, name)?.value(row)),
+        DataType::Int8 => i64::from(downcast_array::<Int8Array>(array, name)?.value(row)),
+        DataType::UInt32 => i64::from(downcast_array::<UInt32Array>(array, name)?.value(row)),
+        DataType::UInt16 => i64::from(downcast_array::<UInt16Array>(array, name)?.value(row)),
+        DataType::UInt8 => i64::from(downcast_array::<UInt8Array>(array, name)?.value(row)),
+        DataType::Decimal128(_, _) => {
+            let mantissa = downcast_array::<Decimal128Array>(array, name)?.value(row);
+            i64::try_from(mantissa).map_err(|_| {
+                anyhow::anyhow!("row {row}: decimal column {name:?} value {mantissa} overflows i64")
+            })?
+        }
+        DataType::Float64 => scale_float(
+            downcast_array::<Float64Array>(array, name)?.value(row),
+            scale,
+        ),
+        DataType::Float32 => scale_float(
+            f64::from(downcast_array::<Float32Array>(array, name)?.value(row)),
+            scale,
+        ),
+        other => bail!("column {name:?} has unsupported numeric type {other:?}"),
+    };
+    Ok(v)
+}
+
+/// Extract a doc's string term from a Parquet column.
+fn extract_string<'a>(array: &'a ArrayRef, row: usize, name: &str) -> Result<&'a str> {
+    if array.is_null(row) {
+        bail!("row {row}: null in string column {name:?}");
+    }
+    match array.data_type() {
+        DataType::Utf8 => Ok(downcast_array::<StringArray>(array, name)?.value(row)),
+        DataType::LargeUtf8 => Ok(downcast_array::<LargeStringArray>(array, name)?.value(row)),
+        other => bail!("string column {name:?} has unsupported type {other:?}"),
+    }
+}
+
+/// `round(v × 10^scale)`, saturating to `i64` (Rust float→int casts saturate, so
+/// pathological magnitudes clamp rather than wrap; exact for in-range values).
+#[allow(clippy::cast_possible_truncation)]
+fn scale_float(v: f64, scale: i8) -> i64 {
+    (v * 10f64.powi(i32::from(scale))).round() as i64
+}
+
 /// Reject before opening the CSV — failing after parsing millions of
 /// rows is a bad UX. `DiskShardWriter` also catches this via
 /// `ensure_unused_name`, but only at finalize time.
@@ -436,6 +692,8 @@ struct NumericCol {
     col_idx: usize,
     values: Vec<i64>,
     kind: FieldKind,
+    /// Decimal scale recorded for this column (0 for plain integers / CSV).
+    scale: i8,
 }
 
 struct StringCol {
@@ -469,6 +727,7 @@ impl BucketBuilder {
                     col_idx: c.col_idx,
                     values: Vec::new(),
                     kind: c.kind,
+                    scale: c.scale,
                 })
                 .collect(),
             strings: strings_proto
@@ -488,6 +747,8 @@ impl BucketBuilder {
     fn push_row(&mut self, row: &csv::StringRecord, line: u64, t: i64) -> Result<()> {
         self.time_values.push(t);
 
+        // Accumulate directly (no per-row scratch Vec) — the Parquet path uses
+        // `push_values` with already-extracted values instead.
         for col in &mut self.numeric {
             let raw = row
                 .get(col.col_idx)
@@ -506,6 +767,34 @@ impl BucketBuilder {
             let term = row
                 .get(col.col_idx)
                 .with_context(|| format!("line {line}: missing string column"))?;
+            if let Some(bm) = col.postings.get_mut(term) {
+                bm.insert(self.doc_id);
+            } else {
+                let mut bm = RoaringBitmap::new();
+                bm.insert(self.doc_id);
+                col.postings.insert(term.to_string(), bm);
+            }
+        }
+
+        self.doc_id = self
+            .doc_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("line {line}: doc ID overflow (> u32::MAX rows)"))?;
+        Ok(())
+    }
+
+    /// Append one doc's already-extracted values: its time, the numeric forward
+    /// columns (in proto order), then the string terms (in proto order). The
+    /// accumulation step for the Parquet front-end (values arrive typed, not as
+    /// text to parse).
+    fn push_values(&mut self, t: i64, numeric: &[i64], strings: &[&str]) -> Result<()> {
+        self.time_values.push(t);
+
+        for (col, &value) in self.numeric.iter_mut().zip(numeric) {
+            col.values.push(value);
+        }
+
+        for (col, &term) in self.strings.iter_mut().zip(strings) {
             // Look up first to avoid allocating a fresh String for terms
             // that already exist — low-cardinality columns repeat heavily.
             if let Some(bm) = col.postings.get_mut(term) {
@@ -520,7 +809,7 @@ impl BucketBuilder {
         self.doc_id = self
             .doc_id
             .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("line {line}: doc ID overflow (> u32::MAX rows)"))?;
+            .ok_or_else(|| anyhow::anyhow!("doc ID overflow (> u32::MAX rows)"))?;
         Ok(())
     }
 
@@ -545,15 +834,18 @@ impl BucketBuilder {
             .with_context(|| format!("add time field {:?}", self.time_name))?;
         writer.set_time_field(&self.time_name);
         for col in self.numeric {
+            let name = col.name;
+            let scale = col.scale;
             match col.kind {
                 FieldKind::Metric => writer
-                    .add_metric(&col.name, col.values)
-                    .with_context(|| format!("add metric {:?}", col.name))?,
+                    .add_metric(&name, col.values)
+                    .with_context(|| format!("add metric {name:?}"))?,
                 FieldKind::Int => writer
-                    .add_int_field(&col.name, col.values)
-                    .with_context(|| format!("add int field {:?}", col.name))?,
+                    .add_int_field(&name, col.values)
+                    .with_context(|| format!("add int field {name:?}"))?,
                 FieldKind::String => unreachable!("NumericCol only holds Metric or Int"),
             }
+            writer.set_field_scale(&name, scale);
         }
         for col in self.strings {
             writer
@@ -648,6 +940,85 @@ pub fn parse_date_only(s: &str) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::shard::{DiskShard, Shard};
+
+    #[test]
+    fn ingest_parquet_maps_types_and_records_scale() {
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        use crate::shard::{METADATA_FILE, Metadata};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("vendor", DataType::Int64, false),
+            Field::new("fare", DataType::Decimal128(10, 2), false),
+            Field::new("dist", DataType::Float64, false),
+            Field::new("payment", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![
+                    1_700_000_000,
+                    1_700_000_050,
+                ])),
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(
+                    Decimal128Array::from(vec![1234_i128, 5678])
+                        .with_precision_and_scale(10, 2)
+                        .unwrap(),
+                ),
+                Arc::new(Float64Array::from(vec![1.5_f64, 2.25])),
+                Arc::new(StringArray::from(vec!["card", "cash"])),
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("in.parquet");
+        {
+            let f = std::fs::File::create(&pq).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        let mk_opts = || IngestOptions {
+            time: "ts".into(),
+            metrics: vec!["fare".into(), "dist".into()],
+            strings: vec!["payment".into()],
+            ints: vec!["vendor".into()],
+            delimiter: b',',
+            shard_by: ShardBy::None,
+        };
+
+        // Default float scale (3); decimal scale from the schema (2); int scale 0.
+        let out = dir.path().join("out");
+        let n = ingest_parquet(&pq, &out, &mk_opts(), &BTreeMap::new()).unwrap();
+        assert_eq!(n, 2);
+        let shard = DiskShard::open(&out).unwrap();
+        assert_eq!(shard.forward_column("vendor").unwrap(), &[1, 2]);
+        assert_eq!(shard.forward_column("fare").unwrap(), &[1234, 5678]); // decimal mantissa
+        assert_eq!(shard.forward_column("dist").unwrap(), &[1500, 2250]); // float × 10^3
+        let meta: Metadata =
+            serde_json::from_reader(std::fs::File::open(out.join(METADATA_FILE)).unwrap()).unwrap();
+        let scale = |name: &str| meta.fields.iter().find(|f| f.name == name).unwrap().scale;
+        assert_eq!(scale("fare"), 2);
+        assert_eq!(scale("dist"), 3);
+        assert_eq!(scale("vendor"), 0);
+
+        // --scale override: dist at scale 2 → × 10^2.
+        let out2 = dir.path().join("out2");
+        let scales = BTreeMap::from([("dist".to_string(), 2_i8)]);
+        ingest_parquet(&pq, &out2, &mk_opts(), &scales).unwrap();
+        let shard2 = DiskShard::open(&out2).unwrap();
+        assert_eq!(shard2.forward_column("dist").unwrap(), &[150, 225]);
+
+        // --scale on a decimal column is rejected (schema scale is authoritative).
+        let bad = BTreeMap::from([("fare".to_string(), 2_i8)]);
+        assert!(ingest_parquet(&pq, &dir.path().join("out3"), &mk_opts(), &bad).is_err());
+    }
 
     fn write_csv(dir: &Path, contents: &str) -> std::path::PathBuf {
         let path = dir.join("input.csv");
