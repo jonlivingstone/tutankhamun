@@ -221,9 +221,16 @@ impl Cache {
         Ok(())
     }
 
+    /// Resident shard count and total bytes held in the local cache, for the
+    /// `/status` "loaded" view. Cheap in-memory read of the cache state.
+    pub(crate) fn resident(&self) -> (usize, u64) {
+        let state = self.state.lock().expect("cache state mutex");
+        (state.shards.len(), state.total_bytes)
+    }
+
     #[cfg(test)]
     fn total_bytes(&self) -> u64 {
-        self.state.lock().expect("cache state mutex").total_bytes
+        self.resident().1
     }
 }
 
@@ -503,8 +510,14 @@ mod tests {
         assert!(local_a.join("metadata.json").is_file());
         assert!(local_a.join("metrics.arrow").is_file());
 
+        // One shard resident, with a non-zero footprint (for /status).
+        let (shards, bytes) = cache.resident();
+        assert_eq!(shards, 1);
+        assert!(bytes > 0);
+
         let local_b = cache.fetch_shard(&summary).await.expect("hit");
         assert_eq!(local_a, local_b);
+        assert_eq!(cache.resident().0, 1, "repeat fetch stays one shard");
     }
 
     #[tokio::test]

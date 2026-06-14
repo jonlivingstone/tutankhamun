@@ -74,7 +74,7 @@ use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
-use crate::status::{DatasetsReport, SessionsSummary, StatusSource, StructuralReport};
+use crate::status::{DatasetLoad, DatasetsReport, SessionsSummary, StatusSource, StructuralReport};
 use crate::storage::StorageRegistry;
 
 /// Affinity header: the session id is published here on the handshake response
@@ -253,12 +253,40 @@ impl ServiceInner {
             reserved_bytes: count * SESSION_BASELINE_BYTES,
         }
     }
+
+    /// Per-dataset resident cache footprint for `/status`. Each cache is keyed
+    /// by its dataset URL (`{storage_url}/{name}`); strip the storage root to
+    /// recover the dataset name. Datasets never queried have no cache and so
+    /// don't appear — i.e. nothing loaded yet.
+    fn loaded_snapshot(&self) -> Vec<DatasetLoad> {
+        let base = self.storage_url.trim_end_matches('/');
+        let caches = self.caches.lock().expect("cache map lock");
+        let mut loaded: Vec<DatasetLoad> = caches
+            .iter()
+            .map(|(url, cache)| {
+                let name = url
+                    .strip_prefix(base)
+                    .unwrap_or(url)
+                    .trim_matches('/')
+                    .to_string();
+                let (shards, cached_bytes) = cache.resident();
+                DatasetLoad {
+                    name,
+                    shards: shards as u64,
+                    cached_bytes,
+                }
+            })
+            .collect();
+        loaded.sort_by(|a, b| a.name.cmp(&b.name));
+        loaded
+    }
 }
 
 #[async_trait]
 impl StatusSource for TutankhamunFlightSqlService {
     async fn structural_snapshot(&self) -> StructuralReport {
         let sessions = self.inner.sessions_snapshot();
+        let loaded = self.inner.loaded_snapshot();
         // A LIST failure must not fail the page — report datasets as unavailable.
         let datasets = match self.inner.list_datasets().await {
             Ok(names) => DatasetsReport { ok: true, names },
@@ -267,7 +295,11 @@ impl StatusSource for TutankhamunFlightSqlService {
                 names: Vec::new(),
             },
         };
-        StructuralReport { sessions, datasets }
+        StructuralReport {
+            sessions,
+            datasets,
+            loaded,
+        }
     }
 }
 

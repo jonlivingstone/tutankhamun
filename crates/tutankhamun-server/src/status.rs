@@ -86,6 +86,17 @@ pub struct RecentQueryView {
 pub struct StructuralReport {
     pub sessions: SessionsSummary,
     pub datasets: DatasetsReport,
+    /// Per-dataset resident cache footprint — what's loaded locally right now.
+    pub loaded: Vec<DatasetLoad>,
+}
+
+/// A dataset's resident footprint in the local shard cache. `cached_bytes` ≈
+/// mmap'd bytes, since a loaded shard is mmapped whole.
+#[derive(Serialize)]
+pub struct DatasetLoad {
+    pub name: String,
+    pub shards: u64,
+    pub cached_bytes: u64,
 }
 
 #[derive(Serialize)]

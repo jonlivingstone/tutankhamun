@@ -85,6 +85,13 @@
       <div class="names" id="datasets"></div>
     </section>
     <section class="wide">
+      <h2>Loaded (cached locally)</h2>
+      <table>
+        <thead><tr><th>Dataset</th><th class="num">Shards</th><th class="num">Cached</th></tr></thead>
+        <tbody id="loaded"></tbody>
+      </table>
+    </section>
+    <section class="wide">
       <h2>Recent queries</h2>
       <table>
         <thead><tr><th>SQL</th><th class="num">Rows</th><th class="num">ms</th><th class="num">Age</th><th></th></tr></thead>
@@ -160,6 +167,17 @@
         ds.innerHTML = `<span class="empty">none</span>`;
       } else {
         ds.innerHTML = d.datasets.names.map((n) => `<span>${esc(n)}</span>`).join("");
+      }
+
+      const loaded = document.getElementById("loaded");
+      if (d.loaded.length === 0) {
+        loaded.innerHTML = `<tr><td colspan="3" class="empty">nothing loaded yet — query a dataset to populate the cache</td></tr>`;
+      } else {
+        loaded.innerHTML = d.loaded.map((x) => `<tr>
+          <td>${esc(x.name)}</td>
+          <td class="num">${x.shards}</td>
+          <td class="num">${bytes(x.cached_bytes)}</td>
+        </tr>`).join("");
       }
 
       const recent = document.getElementById("recent");

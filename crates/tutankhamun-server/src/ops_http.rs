@@ -175,7 +175,7 @@ mod tests {
 
     use crate::bitmap_cache::BitmapCache;
     use crate::memory::{MemoryBudget, SessionMemoryHandle};
-    use crate::status::{DatasetsReport, SessionsSummary, StructuralReport};
+    use crate::status::{DatasetLoad, DatasetsReport, SessionsSummary, StructuralReport};
 
     /// Stand-in for the `FlightSQL` service so the ops routes can be tested without it.
     struct StubStatusSource;
@@ -193,6 +193,11 @@ mod tests {
                     ok: true,
                     names: vec!["events".to_string()],
                 },
+                loaded: vec![DatasetLoad {
+                    name: "events".to_string(),
+                    shards: 2,
+                    cached_bytes: 4096,
+                }],
             }
         }
     }
@@ -296,10 +301,13 @@ mod tests {
             "queries",
             "sessions",
             "datasets",
+            "loaded",
         ] {
             assert!(json.get(key).is_some(), "missing {key} in {json}");
         }
         assert_eq!(json["datasets"]["names"][0], "events");
+        assert_eq!(json["loaded"][0]["name"], "events");
+        assert_eq!(json["loaded"][0]["cached_bytes"], 4096);
     }
 
     #[tokio::test]

@@ -394,11 +394,14 @@ directly.
       internals; numeric state comes from the shared `Metrics`. `/favicon.svg`
       serves the embedded `t9n.svg` mark)
 - [x] Daemon health + build version display — §3.5 (version, uptime, readiness)
-- [~] Loaded shards table (dataset, time range, size on disk,
-      size mmap'd) — §3.5 (v1 lists dataset *names* only, via the cheap
-      `list_datasets` LIST. Deferred: per-shard time range / size-on-disk /
-      mmap'd — needs `Cache` resident-bytes accessors and shard-size accounting;
-      "loaded shards" isn't tracked since datasets are discovered lazily)
+- [x] Loaded shards table (dataset, time range, size on disk,
+      size mmap'd) — §3.5 (a per-dataset *resident* footprint on `/status` —
+      dataset name, shards loaded, and cached bytes (≈ mmap'd, since a loaded
+      shard is mmapped whole) — via `Cache::resident()` over the daemon's
+      per-dataset cache map. Reports what's actually loaded locally, not a
+      per-hit walk of all discoverable shards. Deferred: per-shard time range
+      and a full discoverable-shard inventory — both need the discovery walk we
+      avoid on the hot `/status` path)
 - [x] Active sessions table (count, oldest age, total memory) —
       §3.5 (count, oldest-session age, and total *baseline* reserved bytes — the
       admission floor; per-session live working-set is not metered)
