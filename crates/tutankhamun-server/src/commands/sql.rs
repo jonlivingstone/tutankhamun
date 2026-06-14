@@ -36,6 +36,7 @@ pub(crate) fn run(
             registry.store(),
             url.clone(),
             size_cap,
+            cache::Validation::Trust,
         )?);
         let provider = TutankhamunTableProvider::try_new(url, cache).await?;
         // GROUP BY pushdown rule + planner wired in; falls back to

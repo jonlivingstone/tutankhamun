@@ -358,6 +358,7 @@ mod tests {
             registry.store(),
             url.clone(),
             u64::MAX,
+            crate::cache::Validation::Trust,
         )?;
         let output = query_dataset(&url, &cache, filters, metrics, time_range).await?;
         render_dataset_query_output(out, &output, filters, metrics, aggregate)?;

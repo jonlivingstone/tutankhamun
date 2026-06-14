@@ -17,6 +17,7 @@ use roaring::RoaringBitmap;
 use tonic::transport::Channel;
 
 use tutankhamun_server::bitmap_cache::BitmapCache;
+use tutankhamun_server::cache::Validation;
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
 use tutankhamun_server::memory::{MemoryBudget, SessionMemoryHandle};
 use tutankhamun_server::metrics::Metrics;
@@ -114,6 +115,7 @@ async fn start_with_budget(
         storage_url,
         cache.path().to_path_buf(),
         u64::MAX,
+        Validation::Trust,
         mem,
         100,
         bitmap_cache,

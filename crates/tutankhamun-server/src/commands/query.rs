@@ -37,7 +37,13 @@ pub(crate) fn run(
     let size_cap =
         cache::size::parse_cache_size(cache_size, &cache_dir).context("parse --cache-size")?;
     let registry = StorageRegistry::from_url(&url)?;
-    let cache = Cache::open(cache_dir, registry.store(), url.clone(), size_cap)?;
+    let cache = Cache::open(
+        cache_dir,
+        registry.store(),
+        url.clone(),
+        size_cap,
+        cache::Validation::Trust,
+    )?;
     let runtime = super::current_thread_runtime()?;
     let output = runtime.block_on(shard_source::query_dataset(
         &url,

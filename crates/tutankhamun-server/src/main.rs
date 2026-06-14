@@ -409,10 +409,16 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // datasets); it's Clone-cheap (an `Arc` handle), so the gRPC task takes its
     // own clone. Per-dataset shard caches are created lazily and reused across
     // queries (see `flight_sql`).
+    let validation = if config.verify_shards {
+        cache::Validation::Verify
+    } else {
+        cache::Validation::Trust
+    };
     let svc = TutankhamunFlightSqlService::new(
         config.storage_url.clone(),
         config.cache_dir.clone(),
         cache_cap,
+        validation,
         budget,
         pct,
         bitmap_cache,

@@ -11,13 +11,16 @@
 //! larger than the cap is admitted anyway, leaving the cache
 //! temporarily over.
 //!
-//! Hash validation is gated on the writer's `format_version`. For
-//! shards at `format_version >= 2`, every fetch (hit or miss)
-//! re-hashes the local files and compares them to the per-file
-//! digests in [`Metadata::content_hashes`]; a mismatch (corrupt
-//! local copy or remote drift) triggers a re-download. Shards
-//! written under `format_version` 1 carry no hashes and load
-//! unvalidated.
+//! By default ([`Validation::Trust`]) a resident copy is trusted — no hashing on
+//! fetch. Installs are atomic (download into a temp dir, then rename into place),
+//! so a crashed download never leaves a partial shard that looks complete, and
+//! shards are immutable, so re-hashing 100s of MB on every query is pure waste.
+//! [`Validation::Verify`] (the daemon's `--verify-shards`) instead re-hashes the
+//! files against the per-file digests in [`Metadata::content_hashes`] on every
+//! fetch (`format_version >= 2`), re-downloading on mismatch — an opt-in bit-rot
+//! guard. Those digests are self-attached by the ingester, so this catches local
+//! corruption, not independent correctness. `format_version` 1 shards carry no
+//! hashes and load unvalidated.
 //!
 //! Concurrent `fetch_shard` calls for the *same* shard serialize on a
 //! per-shard lock, so the second caller waits for the first's download
@@ -53,6 +56,16 @@ const SHARD_KEY_LEN: usize = 16;
 /// unrelated fetches, which is negligible for I/O-bound downloads.
 const FETCH_LOCK_BUCKETS: usize = 256;
 
+/// Whether the cache re-verifies a resident shard's files against their recorded
+/// content hashes on fetch. `Trust` (default) skips hashing — installs are atomic
+/// and shards are immutable. `Verify` re-hashes on every fetch as a bit-rot guard
+/// (slower; opt-in via `--verify-shards`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Validation {
+    Trust,
+    Verify,
+}
+
 /// Hot-storage cache backed by a local directory.
 #[derive(Debug)]
 pub struct Cache {
@@ -60,6 +73,7 @@ pub struct Cache {
     store: Arc<dyn ObjectStore>,
     store_identity: String,
     size_cap: u64,
+    validation: Validation,
     state: Mutex<CacheState>,
     fetch_locks: Vec<tokio::sync::Mutex<()>>,
 }
@@ -91,6 +105,7 @@ impl Cache {
         store: Arc<dyn ObjectStore>,
         store_identity: String,
         size_cap: u64,
+        validation: Validation,
     ) -> Result<Self> {
         fs::create_dir_all(&dir).with_context(|| format!("create cache dir {}", dir.display()))?;
         let state = scan_existing(&dir)?;
@@ -99,6 +114,7 @@ impl Cache {
             store,
             store_identity,
             size_cap,
+            validation,
             state: Mutex::new(state),
             fetch_locks: (0..FETCH_LOCK_BUCKETS)
                 .map(|_| tokio::sync::Mutex::new(()))
@@ -106,23 +122,33 @@ impl Cache {
         })
     }
 
-    /// Materialise every file under `summary.location` into the
-    /// cache and return the local shard directory. Validates per-file
-    /// SHA-256 against [`Metadata::content_hashes`] when
-    /// `metadata.format_version >= 2`; older shards load unvalidated.
+    /// Materialise every file under `summary.location` into the cache and return
+    /// the local shard directory. With [`Validation::Trust`] (default) a resident
+    /// copy is returned as-is; only a missing copy is (atomically) downloaded.
+    /// With [`Validation::Verify`] the resident files are re-hashed against
+    /// [`Metadata::content_hashes`] (`format_version >= 2`) and re-downloaded on
+    /// mismatch — a bit-rot guard.
     pub async fn fetch_shard(&self, summary: &ShardSummary) -> Result<PathBuf> {
         let key = self.shard_key(&summary.location);
         let local_dir = self.dir.join(&key);
 
-        // Serialize concurrent fetches of this shard: the first downloads,
-        // any other waits here and then validates the now-complete dir
-        // below — so no one observes a half-written shard directory.
+        // Serialize concurrent fetches of this shard: the first downloads, any
+        // other waits here and then finds the complete dir — so no one observes a
+        // half-written shard. (Installs are atomic, so "complete" is all-or-nothing.)
         let _fetch_guard = self.fetch_locks[bucket(&key)].lock().await;
 
-        if validate_local(&local_dir, &summary.metadata).is_err() {
+        let stale = match self.validation {
+            // Trust: a present copy is good enough (immutable shards, atomic installs).
+            Validation::Trust => !local_present(&local_dir),
+            // Verify: re-hash the resident files against the manifest each fetch.
+            Validation::Verify => validate_local(&local_dir, &summary.metadata).is_err(),
+        };
+        if stale {
             self.download(&summary.location, &local_dir).await?;
-            validate_local(&local_dir, &summary.metadata)
-                .with_context(|| format!("validate {}", local_dir.display()))?;
+            if self.validation == Validation::Verify {
+                validate_local(&local_dir, &summary.metadata)
+                    .with_context(|| format!("validate {}", local_dir.display()))?;
+            }
         }
 
         let size = dir_size(&local_dir)?;
@@ -143,12 +169,17 @@ impl Cache {
         hex::encode(&digest[..SHARD_KEY_LEN])
     }
 
+    /// Download every file under `remote_dir` and install it **atomically** at
+    /// `local_dir`: stream into a temp sibling dir, then `rename` it into place.
+    /// A crash mid-download leaves only the temp dir, never a partial shard that
+    /// would look complete to [`local_present`].
     async fn download(&self, remote_dir: &Path, local_dir: &StdPath) -> Result<()> {
-        if local_dir.exists() {
-            fs::remove_dir_all(local_dir)
-                .with_context(|| format!("remove stale {}", local_dir.display()))?;
+        let tmp_dir = local_dir.with_extension("tmp");
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)
+                .with_context(|| format!("remove stale temp {}", tmp_dir.display()))?;
         }
-        fs::create_dir_all(local_dir).with_context(|| format!("create {}", local_dir.display()))?;
+        fs::create_dir_all(&tmp_dir).with_context(|| format!("create {}", tmp_dir.display()))?;
 
         let mut stream = self.store.list(Some(remote_dir));
         while let Some(meta) = stream.next().await {
@@ -159,7 +190,7 @@ impl Cache {
                     meta.location
                 )
             })?;
-            let dest = safe_join(local_dir, &rel)
+            let dest = safe_join(&tmp_dir, &rel)
                 .with_context(|| format!("reject suspicious remote path {}", meta.location))?;
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)
@@ -172,6 +203,14 @@ impl Cache {
                 .context("fetch shard file")?;
             stream_to_local(&dest, get.into_stream()).await?;
         }
+
+        // Atomic install: replace any stale copy, then rename the temp dir in.
+        if local_dir.exists() {
+            fs::remove_dir_all(local_dir)
+                .with_context(|| format!("remove stale {}", local_dir.display()))?;
+        }
+        fs::rename(&tmp_dir, local_dir)
+            .with_context(|| format!("install {} -> {}", tmp_dir.display(), local_dir.display()))?;
         Ok(())
     }
 
@@ -242,13 +281,16 @@ fn bucket(key: &str) -> usize {
     usize::from_str_radix(key.get(..2).unwrap_or("00"), 16).unwrap_or(0) % FETCH_LOCK_BUCKETS
 }
 
+/// Cheap presence check used by [`Validation::Trust`]: the shard dir and its
+/// `metadata.json` exist. Installs are atomic, so a present dir is a complete
+/// one — no need to hash to know it's usable.
+fn local_present(dir: &StdPath) -> bool {
+    dir.is_dir() && dir.join(crate::shard::METADATA_FILE).is_file()
+}
+
 fn validate_local(dir: &StdPath, metadata: &Metadata) -> Result<()> {
-    if !dir.is_dir() {
-        bail!("{} missing", dir.display());
-    }
-    let metadata_path = dir.join(crate::shard::METADATA_FILE);
-    if !metadata_path.is_file() {
-        bail!("{} missing", metadata_path.display());
+    if !local_present(dir) {
+        bail!("{} missing or incomplete", dir.display());
     }
     // Hash validation is gated on the writer version, not the
     // presence of hashes: a v2 shard whose `content_hashes` map is
@@ -503,6 +545,7 @@ mod tests {
             Arc::clone(&store),
             "memory:///".to_string(),
             10 * 1024 * 1024,
+            Validation::Trust,
         )
         .unwrap();
 
@@ -520,8 +563,8 @@ mod tests {
         assert_eq!(cache.resident().0, 1, "repeat fetch stays one shard");
     }
 
-    #[tokio::test]
-    async fn fetch_shard_re_downloads_on_corrupted_local_file() {
+    /// A shard uploaded to a memory store + a `cache_dir` to open caches over.
+    async fn corrupt_test_setup() -> (tempfile::TempDir, Arc<dyn ObjectStore>, ShardSummary) {
         let local_src = tempfile::tempdir().unwrap();
         write_local_shard(local_src.path(), vec![10, 20, 30]);
 
@@ -543,24 +586,68 @@ mod tests {
             location: Path::from("data/shard-000"),
             metadata,
         };
+        (tempfile::tempdir().unwrap(), store, summary)
+    }
 
-        let cache_dir = tempfile::tempdir().unwrap();
-        let cache = Cache::open(
-            cache_dir.path().to_path_buf(),
-            Arc::clone(&store),
+    fn open_cache(dir: &StdPath, store: &Arc<dyn ObjectStore>, validation: Validation) -> Cache {
+        Cache::open(
+            dir.to_path_buf(),
+            Arc::clone(store),
             "memory:///".to_string(),
             10 * 1024 * 1024,
+            validation,
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn fetch_shard_trusts_resident_copy_by_default() {
+        let (cache_dir, store, summary) = corrupt_test_setup().await;
+        let cache = open_cache(cache_dir.path(), &store, Validation::Trust);
+
+        let local = cache.fetch_shard(&summary).await.unwrap();
+        let metrics = local.join("metrics.arrow");
+
+        // Trust mode does not hash, so corrupting a resident data file goes undetected.
+        fs::write(&metrics, b"garbage").unwrap();
+        cache.fetch_shard(&summary).await.unwrap();
+        assert_eq!(
+            fs::read(&metrics).unwrap(),
+            b"garbage",
+            "trust mode does not re-hash resident data files"
+        );
+
+        // Presence keys on the manifest: losing metadata.json triggers a
+        // re-download, which atomically reinstalls every file (repairing metrics).
+        fs::remove_file(local.join("metadata.json")).unwrap();
+        cache.fetch_shard(&summary).await.unwrap();
+        assert!(
+            local.join("metadata.json").is_file(),
+            "missing manifest re-downloads"
+        );
+        assert_ne!(
+            fs::read(&metrics).unwrap(),
+            b"garbage",
+            "re-download reinstalls all files"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_shard_verify_mode_repairs_corruption() {
+        let (cache_dir, store, summary) = corrupt_test_setup().await;
+        let cache = open_cache(cache_dir.path(), &store, Validation::Verify);
 
         let local = cache.fetch_shard(&summary).await.unwrap();
         let metrics = local.join("metrics.arrow");
         fs::write(&metrics, b"garbage").unwrap();
 
-        let local2 = cache.fetch_shard(&summary).await.unwrap();
-        assert_eq!(local, local2);
-        let restored = fs::read(&metrics).unwrap();
-        assert_ne!(restored, b"garbage");
+        // Verify mode re-hashes every fetch, detects the corruption, re-downloads.
+        cache.fetch_shard(&summary).await.unwrap();
+        assert_ne!(
+            fs::read(&metrics).unwrap(),
+            b"garbage",
+            "verify mode repairs a corrupt resident copy"
+        );
     }
 
     #[tokio::test]
@@ -598,6 +685,7 @@ mod tests {
             Arc::clone(&store),
             "memory:///".to_string(),
             32 * 1024, // small cap forces eviction after first shard
+            Validation::Trust,
         )
         .unwrap();
 
@@ -659,6 +747,9 @@ mod tests {
             Arc::clone(&store),
             "memory:///".to_string(),
             10 * 1024 * 1024,
+            // The content-hash traversal guard lives in validate_local, which
+            // only runs under Verify.
+            Validation::Verify,
         )
         .unwrap();
 
@@ -757,6 +848,7 @@ mod tests {
             Arc::clone(&store),
             "memory:///".to_string(),
             100 * 1024 * 1024,
+            Validation::Trust,
         )
         .unwrap();
 
@@ -800,6 +892,7 @@ mod tests {
                 Arc::clone(&store),
                 "memory:///".to_string(),
                 100 * 1024 * 1024,
+                Validation::Trust,
             )
             .unwrap(),
         );

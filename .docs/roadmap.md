@@ -45,7 +45,8 @@ directly.
 - [ ] `--pin-datasets` always-keep flag — §1.5
 - [x] Persistent cache across restarts (scan cache dir, register
       existing files) — §1.5
-- [x] Content-hash validation on shard load — §1.5
+- [x] Content-hash validation on shard load — opt-in bit-rot guard
+      (`--verify-shards`); trust-by-default with atomic installs — §1.5
 - [ ] Configurable hot-set pre-warm (`--prewarm`) — §1.5
 
 ## Engine — storage format (shards)

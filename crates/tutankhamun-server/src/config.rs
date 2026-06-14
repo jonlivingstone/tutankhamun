@@ -26,6 +26,7 @@ pub mod env_vars {
     pub const MAX_SESSION_MEMORY_PCT: &str = "TUT_MAX_SESSION_MEMORY_PCT";
     pub const BITMAP_CACHE_PCT: &str = "TUT_BITMAP_CACHE_PCT";
     pub const OTLP_ENDPOINT: &str = "TUT_OTLP_ENDPOINT";
+    pub const VERIFY_SHARDS: &str = "TUT_VERIFY_SHARDS";
 
     /// Prefix figment uses to scan for env-driven overrides.
     pub const PREFIX: &str = "TUT_";
@@ -105,6 +106,15 @@ pub struct ServeArgs {
     #[arg(long, env = env_vars::OTLP_ENDPOINT)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub otlp_endpoint: Option<String>,
+
+    /// Re-verify cached shard files against their content hashes on every fetch
+    /// — a bit-rot guard. Off by default: shards are immutable and installed
+    /// atomically, so they're trusted once resident. Enabling this re-hashes
+    /// every shard on every query (slow). Accepts `--verify-shards` or
+    /// `--verify-shards=false`.
+    #[arg(long, env = env_vars::VERIFY_SHARDS, num_args = 0..=1, default_missing_value = "true")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verify_shards: Option<bool>,
 }
 
 /// Fully-resolved daemon configuration.
@@ -126,6 +136,9 @@ pub struct Config {
     pub bitmap_cache_pct: u8,
     /// OTLP/HTTP trace-export endpoint; `None` disables tracing export.
     pub otlp_endpoint: Option<String>,
+    /// Re-verify cached shards against their content hashes on every fetch
+    /// (bit-rot guard). Off by default — see [`ServeArgs::verify_shards`].
+    pub verify_shards: bool,
 }
 
 impl Default for Config {
@@ -143,6 +156,7 @@ impl Default for Config {
             max_session_memory_pct: 20,
             bitmap_cache_pct: 25,
             otlp_endpoint: None,
+            verify_shards: false,
         }
     }
 }

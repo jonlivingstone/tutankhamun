@@ -77,6 +77,7 @@ async fn provider_for(root: &Path) -> (TutankhamunTableProvider, TempDir) {
             registry.store(),
             url.clone(),
             u64::MAX,
+            crate::cache::Validation::Trust,
         )
         .expect("cache"),
     );

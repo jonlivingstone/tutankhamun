@@ -69,7 +69,7 @@ use arrow_flight::{
 use object_store::ObjectStore;
 
 use crate::bitmap_cache::BitmapCache;
-use crate::cache::Cache;
+use crate::cache::{Cache, Validation};
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownHandle;
@@ -110,6 +110,8 @@ struct ServiceInner {
     storage_url: String,
     cache_dir: PathBuf,
     size_cap: u64,
+    /// Whether per-dataset caches re-hash resident shards on fetch (`--verify-shards`).
+    validation: Validation,
     /// One [`Cache`] per dataset URL, created on first reference and reused
     /// across queries. A cache must be rooted at the same URL its dataset is
     /// discovered under — the cache fetches shard files by location relative to
@@ -198,6 +200,7 @@ impl ServiceInner {
             registry.store(),
             url.to_string(),
             self.size_cap,
+            self.validation,
         )?);
         caches.insert(url.to_string(), Arc::clone(&cache));
         Ok(cache)
@@ -305,10 +308,12 @@ impl StatusSource for TutankhamunFlightSqlService {
 
 impl TutankhamunFlightSqlService {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         storage_url: String,
         cache_dir: PathBuf,
         size_cap: u64,
+        validation: Validation,
         budget: Arc<MemoryBudget>,
         session_pct: u8,
         bitmap_cache: Arc<BitmapCache>,
@@ -319,6 +324,7 @@ impl TutankhamunFlightSqlService {
                 storage_url,
                 cache_dir,
                 size_cap,
+                validation,
                 caches: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 prepared: Mutex::new(HashMap::new()),
@@ -1215,6 +1221,7 @@ mod tests {
             "memory:///".to_string(),
             std::env::temp_dir().join("t9n-session-test"),
             u64::MAX,
+            Validation::Trust,
             budget,
             100, // per-session cap = 100% of global, so tests bind on the global
             bitmap_cache,

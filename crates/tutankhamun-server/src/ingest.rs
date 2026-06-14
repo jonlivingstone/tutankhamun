@@ -1546,6 +1546,7 @@ mod tests {
             registry.store(),
             url.clone(),
             10 * 1024 * 1024,
+            crate::cache::Validation::Trust,
         )
         .expect("cache");
 
