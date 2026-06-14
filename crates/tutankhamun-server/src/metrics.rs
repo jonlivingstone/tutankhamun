@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::bitmap_cache::BitmapCache;
 use crate::memory::MemoryBudget;
@@ -96,14 +96,14 @@ pub struct Metrics {
     recent: Mutex<VecDeque<RecentQuery>>,
 }
 
-/// One entry in the recent-query ring. Stores the observation instant; the
-/// page's `age_secs` is computed against it at snapshot time.
+/// One entry in the recent-query ring. Stores the wall-clock completion time so
+/// the `/status` page can show an absolute timestamp.
 struct RecentQuery {
     sql: String,
     rows: u64,
     ok: bool,
     duration_ms: u64,
-    at: Instant,
+    at: SystemTime,
 }
 
 impl Metrics {
@@ -159,16 +159,15 @@ impl Metrics {
             rows,
             ok,
             duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-            at: Instant::now(),
+            at: SystemTime::now(),
         });
         recent.truncate(RECENT_CAP);
     }
 
     /// Snapshot the numeric state for `/status.json`: memory budget, bitmap
-    /// cache, query counters, and the recent-query ring (with ages computed now).
+    /// cache, query counters, and the recent-query ring.
     #[must_use]
     pub fn status_snapshot(&self) -> MetricsSnapshot {
-        let now = Instant::now();
         let recent = self
             .recent
             .lock()
@@ -179,7 +178,10 @@ impl Metrics {
                 rows: r.rows,
                 ok: r.ok,
                 duration_ms: r.duration_ms,
-                age_secs: now.saturating_duration_since(r.at).as_secs(),
+                at_unix_ms: r
+                    .at
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
             })
             .collect();
         MetricsSnapshot {
@@ -373,6 +375,7 @@ mod tests {
         assert_eq!(newest.sql, format!("q{}", RECENT_CAP + 4));
         assert_eq!(newest.rows, (RECENT_CAP + 4) as u64);
         assert!(newest.ok);
+        assert!(newest.at_unix_ms > 0, "completion timestamp is recorded");
         // Aggregate counters still advance past the ring cap.
         assert_eq!(snap.queries.total, (RECENT_CAP + 5) as u64);
     }

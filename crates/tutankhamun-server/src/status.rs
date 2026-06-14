@@ -70,15 +70,15 @@ pub struct QueriesReport {
     pub recent: Vec<RecentQueryView>,
 }
 
-/// A recent query as rendered for the page — `age_secs` is computed at snapshot
-/// time from the stored instant, so no wall-clock dependency is needed.
+/// A recent query as rendered for the page. `at_unix_ms` is the wall-clock time
+/// the query completed (Unix epoch milliseconds); the page formats it locally.
 #[derive(Serialize)]
 pub struct RecentQueryView {
     pub sql: String,
     pub rows: u64,
     pub ok: bool,
     pub duration_ms: u64,
-    pub age_secs: u64,
+    pub at_unix_ms: u64,
 }
 
 /// Structural state from the [`StatusSource`].

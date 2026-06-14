@@ -34,11 +34,13 @@
     dt { color:var(--muted); }
     dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
     table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
-    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #1d3a63; }
+    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #1d3a63; white-space:nowrap; }
     th { color:var(--muted); font-weight:500; font-size:12px; }
     td.num { text-align:right; }
+    /* SQL takes the slack and ellipsizes; the other columns keep their natural
+       width (nowrap above) so e.g. the timestamp isn't crushed. */
     td.sql { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;
-             max-width:0; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+             max-width:0; width:100%; overflow:hidden; text-overflow:ellipsis; }
     .tag { font-size:11px; padding:1px 7px; border-radius:4px; }
     .tag.ok { background:rgba(63,164,91,.18); color:var(--ok); }
     .tag.err { background:rgba(210,96,58,.18); color:var(--err); }
@@ -94,7 +96,7 @@
     <section class="wide">
       <h2>Recent queries</h2>
       <table>
-        <thead><tr><th>SQL</th><th class="num">Rows</th><th class="num">ms</th><th class="num">Age</th><th></th></tr></thead>
+        <thead><tr><th>SQL</th><th class="num">Rows</th><th class="num">ms</th><th>Time</th><th></th></tr></thead>
         <tbody id="recent"></tbody>
       </table>
     </section>
@@ -117,6 +119,12 @@
       if (s < 60) return s + "s";
       if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
       return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    }
+    function fmtTime(ms) {
+      // Local "YYYY-MM-DD HH:MM:SS" from a unix-ms timestamp.
+      const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+             `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
     function dl(id, rows) {
       document.getElementById(id).innerHTML =
@@ -189,7 +197,7 @@
           <td class="sql" title="${esc(q.sql)}">${esc(q.sql)}</td>
           <td class="num">${q.rows}</td>
           <td class="num">${q.duration_ms}</td>
-          <td class="num">${dur(q.age_secs)}</td>
+          <td>${fmtTime(q.at_unix_ms)}</td>
           <td><span class="tag ${q.ok ? "ok" : "err"}">${q.ok ? "ok" : "err"}</span></td>
         </tr>`).join("");
       }
