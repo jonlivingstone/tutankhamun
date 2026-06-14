@@ -10,13 +10,19 @@
 //! crate would only add a dependency and a facade. Standard cardinality discipline:
 //! no per-user or per-query labels.
 
+use std::collections::VecDeque;
 use std::fmt::Write as _;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::bitmap_cache::BitmapCache;
 use crate::memory::MemoryBudget;
+use crate::status::{CacheReport, MemoryReport, MetricsSnapshot, QueriesReport, RecentQueryView};
+
+/// Most-recent queries retained for the `/status` page (§3.5). Bounded and small —
+/// status-only, never part of the Prometheus exposition.
+const RECENT_CAP: usize = 32;
 
 /// Upper bounds (seconds, inclusive) of the query-latency histogram buckets.
 const BUCKETS_SECS: [f64; 12] = [
@@ -86,6 +92,18 @@ pub struct Metrics {
     query_latency: Histogram,
     queries_total: AtomicU64,
     query_errors_total: AtomicU64,
+    /// Recent queries, newest-first, bounded to [`RECENT_CAP`] (for `/status`).
+    recent: Mutex<VecDeque<RecentQuery>>,
+}
+
+/// One entry in the recent-query ring. Stores the observation instant; the
+/// page's `age_secs` is computed against it at snapshot time.
+struct RecentQuery {
+    sql: String,
+    rows: u64,
+    ok: bool,
+    duration_ms: u64,
+    at: Instant,
 }
 
 impl Metrics {
@@ -98,6 +116,7 @@ impl Metrics {
             query_latency: Histogram::default(),
             queries_total: AtomicU64::new(0),
             query_errors_total: AtomicU64::new(0),
+            recent: Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
         })
     }
 
@@ -125,12 +144,61 @@ impl Metrics {
             });
     }
 
-    /// Record one query execution: its latency and whether it succeeded.
-    pub fn record_query(&self, elapsed: Duration, ok: bool) {
+    /// Record one query execution: its latency, success, the (bounded) SQL
+    /// preview, and rows returned (0 on failure). Feeds both the Prometheus
+    /// histogram/counters and the `/status` recent-query ring.
+    pub fn record_query(&self, elapsed: Duration, ok: bool, sql: String, rows: u64) {
         self.query_latency.observe(elapsed);
         self.queries_total.fetch_add(1, Ordering::Relaxed);
         if !ok {
             self.query_errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let mut recent = self.recent.lock().expect("recent lock");
+        recent.push_front(RecentQuery {
+            sql,
+            rows,
+            ok,
+            duration_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            at: Instant::now(),
+        });
+        recent.truncate(RECENT_CAP);
+    }
+
+    /// Snapshot the numeric state for `/status.json`: memory budget, bitmap
+    /// cache, query counters, and the recent-query ring (with ages computed now).
+    #[must_use]
+    pub fn status_snapshot(&self) -> MetricsSnapshot {
+        let now = Instant::now();
+        let recent = self
+            .recent
+            .lock()
+            .expect("recent lock")
+            .iter()
+            .map(|r| RecentQueryView {
+                sql: r.sql.clone(),
+                rows: r.rows,
+                ok: r.ok,
+                duration_ms: r.duration_ms,
+                age_secs: now.saturating_duration_since(r.at).as_secs(),
+            })
+            .collect();
+        MetricsSnapshot {
+            memory: MemoryReport {
+                limit_bytes: self.budget.limit(),
+                used_bytes: self.budget.used(),
+                available_bytes: self.budget.available(),
+            },
+            bitmap_cache: CacheReport {
+                used_bytes: self.bitmap_cache.used_bytes(),
+                hits: self.bitmap_cache.hits(),
+                narrows: self.bitmap_cache.narrows(),
+                misses: self.bitmap_cache.misses(),
+            },
+            queries: QueriesReport {
+                total: self.queries_total.load(Ordering::Relaxed),
+                errors: self.query_errors_total.load(Ordering::Relaxed),
+                recent,
+            },
         }
     }
 
@@ -278,9 +346,9 @@ mod tests {
     #[test]
     fn query_histogram_buckets_and_error_counter() {
         let m = metrics();
-        m.record_query(Duration::from_millis(2), true); // ≤ 0.005 bucket
-        m.record_query(Duration::from_millis(2), true);
-        m.record_query(Duration::from_secs(3), false); // ≤ 2.5? no → 5.0 bucket, error
+        m.record_query(Duration::from_millis(2), true, "q".into(), 1); // ≤ 0.005 bucket
+        m.record_query(Duration::from_millis(2), true, "q".into(), 1);
+        m.record_query(Duration::from_secs(3), false, "q".into(), 0); // → 5.0 bucket, error
         let text = m.render();
         assert!(text.contains("tut_queries_total 3"));
         assert!(text.contains("tut_query_errors_total 1"));
@@ -290,5 +358,22 @@ mod tests {
         // All three are ≤ 5s (cumulative includes the 3s one).
         assert!(text.contains("tut_query_duration_seconds_bucket{le=\"5\"} 3"));
         assert!(text.contains("tut_query_duration_seconds_bucket{le=\"+Inf\"} 3"));
+    }
+
+    #[test]
+    fn recent_query_ring_is_bounded_and_newest_first() {
+        let m = metrics();
+        for i in 0..(RECENT_CAP + 5) {
+            m.record_query(Duration::from_millis(1), true, format!("q{i}"), i as u64);
+        }
+        let snap = m.status_snapshot();
+        assert_eq!(snap.queries.recent.len(), RECENT_CAP, "ring is capped");
+        // Newest-first: the last recorded query is at the front.
+        let newest = &snap.queries.recent[0];
+        assert_eq!(newest.sql, format!("q{}", RECENT_CAP + 4));
+        assert_eq!(newest.rows, (RECENT_CAP + 4) as u64);
+        assert!(newest.ok);
+        // Aggregate counters still advance past the ring cap.
+        assert_eq!(snap.queries.total, (RECENT_CAP + 5) as u64);
     }
 }

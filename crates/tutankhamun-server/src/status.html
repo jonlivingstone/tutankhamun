@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>t9n status</title>
+  <link rel="icon" href="/favicon.svg">
+  <style>
+    :root { --bg:#0e2038; --panel:#13294a; --gold:#d9a636; --lapis:#2e6bc0;
+            --text:#e8eef7; --muted:#8da6c8; --ok:#3fa45b; --err:#d2603a; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--text);
+           font:14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    header { display:flex; align-items:center; gap:14px; padding:18px 24px;
+             border-bottom:1px solid #1d3a63; }
+    header img { width:40px; height:40px; }
+    header h1 { font-size:18px; margin:0; font-weight:600; }
+    header .sub { color:var(--muted); font-size:12px; }
+    .bar { margin-left:auto; display:flex; align-items:center; gap:12px; }
+    .pill { padding:3px 10px; border-radius:999px; font-size:12px; font-weight:600; }
+    .pill.ok { background:rgba(63,164,91,.18); color:var(--ok); }
+    .pill.err { background:rgba(210,96,58,.18); color:var(--err); }
+    button { background:var(--panel); color:var(--text); border:1px solid #29487a;
+             border-radius:6px; padding:5px 12px; cursor:pointer; font-size:12px; }
+    button:hover { border-color:var(--gold); }
+    main { padding:20px 24px; display:grid; gap:18px;
+           grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); }
+    section { background:var(--panel); border:1px solid #1d3a63; border-radius:10px;
+              padding:14px 16px; }
+    section.wide { grid-column:1/-1; }
+    h2 { font-size:12px; letter-spacing:.08em; text-transform:uppercase;
+         color:var(--gold); margin:0 0 10px; }
+    dl { display:grid; grid-template-columns:auto 1fr; gap:4px 16px; margin:0; }
+    dt { color:var(--muted); }
+    dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
+    table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+    th, td { text-align:left; padding:6px 8px; border-bottom:1px solid #1d3a63; }
+    th { color:var(--muted); font-weight:500; font-size:12px; }
+    td.num { text-align:right; }
+    td.sql { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:12px;
+             max-width:0; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .tag { font-size:11px; padding:1px 7px; border-radius:4px; }
+    .tag.ok { background:rgba(63,164,91,.18); color:var(--ok); }
+    .tag.err { background:rgba(210,96,58,.18); color:var(--err); }
+    .empty { color:var(--muted); font-style:italic; }
+    .names { display:flex; flex-wrap:wrap; gap:6px; }
+    .names span { background:#0e2038; border:1px solid #29487a; border-radius:6px;
+                  padding:2px 9px; font-size:13px; }
+    footer { color:var(--muted); font-size:11px; padding:8px 24px 24px; }
+    footer a { color:var(--lapis); }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="/favicon.svg" alt="t9n">
+    <div>
+      <h1>Tutankhamun <span class="sub" id="version"></span></h1>
+      <div class="sub" id="uptime"></div>
+    </div>
+    <div class="bar">
+      <span id="ready" class="pill"></span>
+      <button id="refresh" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Memory</h2>
+      <dl id="memory"></dl>
+    </section>
+    <section>
+      <h2>Bitmap cache</h2>
+      <dl id="cache"></dl>
+    </section>
+    <section>
+      <h2>Sessions</h2>
+      <dl id="sessions"></dl>
+    </section>
+    <section>
+      <h2>Queries</h2>
+      <dl id="queries"></dl>
+    </section>
+    <section class="wide">
+      <h2>Datasets</h2>
+      <div class="names" id="datasets"></div>
+    </section>
+    <section class="wide">
+      <h2>Recent queries</h2>
+      <table>
+        <thead><tr><th>SQL</th><th class="num">Rows</th><th class="num">ms</th><th class="num">Age</th><th></th></tr></thead>
+        <tbody id="recent"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    Auto-refreshing every 5s · raw JSON at <a href="/status.json">/status.json</a> ·
+    metrics at <a href="/metrics">/metrics</a>
+  </footer>
+
+  <script>
+    const KIB = 1024, MIB = KIB * 1024, GIB = MIB * 1024;
+    function bytes(n) {
+      if (n >= GIB) return (n / GIB).toFixed(2) + " GiB";
+      if (n >= MIB) return (n / MIB).toFixed(1) + " MiB";
+      if (n >= KIB) return (n / KIB).toFixed(1) + " KiB";
+      return n + " B";
+    }
+    function dur(s) {
+      if (s < 60) return s + "s";
+      if (s < 3600) return Math.floor(s / 60) + "m " + (s % 60) + "s";
+      return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m";
+    }
+    function dl(id, rows) {
+      document.getElementById(id).innerHTML =
+        rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+    }
+    const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+    async function refresh() {
+      let d;
+      try {
+        d = await (await fetch("/status.json", { cache: "no-store" })).json();
+      } catch (e) {
+        document.getElementById("ready").className = "pill err";
+        document.getElementById("ready").textContent = "unreachable";
+        return;
+      }
+      document.getElementById("version").textContent = "v" + d.version;
+      document.getElementById("uptime").textContent = "up " + dur(d.uptime_secs);
+      const ready = document.getElementById("ready");
+      ready.className = "pill " + (d.ready ? "ok" : "err");
+      ready.textContent = d.ready ? "ready" : "not ready";
+
+      const m = d.memory;
+      dl("memory", [
+        ["Used", `${bytes(m.used_bytes)} / ${bytes(m.limit_bytes)}`],
+        ["Available", bytes(m.available_bytes)],
+      ]);
+      const c = d.bitmap_cache;
+      dl("cache", [
+        ["Resident", bytes(c.used_bytes)],
+        ["Hits", c.hits], ["Narrows", c.narrows], ["Misses", c.misses],
+      ]);
+      const s = d.sessions;
+      dl("sessions", [
+        ["Open", s.count],
+        ["Oldest", dur(s.oldest_age_secs)],
+        ["Reserved", bytes(s.reserved_bytes)],
+      ]);
+      dl("queries", [
+        ["Total", d.queries.total],
+        ["Errors", d.queries.errors],
+      ]);
+
+      const ds = document.getElementById("datasets");
+      if (!d.datasets.ok) {
+        ds.innerHTML = `<span class="empty">storage unreachable</span>`;
+      } else if (d.datasets.names.length === 0) {
+        ds.innerHTML = `<span class="empty">none</span>`;
+      } else {
+        ds.innerHTML = d.datasets.names.map((n) => `<span>${esc(n)}</span>`).join("");
+      }
+
+      const recent = document.getElementById("recent");
+      const rows = d.queries.recent;
+      if (rows.length === 0) {
+        recent.innerHTML = `<tr><td colspan="5" class="empty">no queries yet</td></tr>`;
+      } else {
+        recent.innerHTML = rows.map((q) => `<tr>
+          <td class="sql" title="${esc(q.sql)}">${esc(q.sql)}</td>
+          <td class="num">${q.rows}</td>
+          <td class="num">${q.duration_ms}</td>
+          <td class="num">${dur(q.age_secs)}</td>
+          <td><span class="tag ${q.ok ? "ok" : "err"}">${q.ok ? "ok" : "err"}</span></td>
+        </tr>`).join("");
+      }
+    }
+
+    document.getElementById("refresh").addEventListener("click", refresh);
+    refresh();
+    setInterval(refresh, 5000);
+  </script>
+</body>
+</html>

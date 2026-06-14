@@ -19,4 +19,5 @@ pub mod shard_source;
 pub mod shutdown;
 pub mod sketches;
 pub mod sql;
+pub mod status;
 pub mod storage;

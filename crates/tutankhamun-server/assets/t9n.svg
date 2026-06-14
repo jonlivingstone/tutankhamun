@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Tutankhamun (t9n)">
+  <defs>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F4D06A"/>
+      <stop offset="1" stop-color="#D9A636"/>
+    </linearGradient>
+    <!-- The headdress silhouette: dome + the two flaring lappets, with a
+         notch at the bottom centre where the beard hangs. -->
+    <path id="nemes" d="M32 7
+      C 21 7, 14 15, 13 26
+      C 12.5 31, 12 34, 12.5 39
+      C 13 46, 14 50, 17 53
+      L 26 53 L 26 39 L 38 39 L 38 53 L 47 53
+      C 50 50, 51 46, 51.5 39
+      C 52 34, 51.5 31, 51 26
+      C 50 15, 43 7, 32 7 Z"/>
+    <clipPath id="headClip"><use href="#nemes"/></clipPath>
+    <clipPath id="beardClip"><rect x="29" y="39" width="6" height="12" rx="2"/></clipPath>
+    <clipPath id="faceClip"><ellipse cx="32" cy="28" rx="8.6" ry="11"/></clipPath>
+  </defs>
+
+  <rect width="64" height="64" rx="14" fill="#11294A"/>
+
+  <!-- Headdress -->
+  <use href="#nemes" fill="url(#gold)"/>
+  <g clip-path="url(#headClip)" fill="#1C4E8A">
+    <rect x="10" y="15" width="44" height="3"/>
+    <rect x="10" y="23" width="44" height="3"/>
+    <rect x="10" y="31" width="44" height="3"/>
+    <rect x="10" y="39" width="44" height="3"/>
+    <rect x="10" y="47" width="44" height="3"/>
+  </g>
+
+  <!-- Face -->
+  <ellipse cx="32" cy="28" rx="8.6" ry="11" fill="url(#gold)"/>
+  <g clip-path="url(#faceClip)">
+    <rect x="22" y="17" width="20" height="4" fill="#1C4E8A"/>
+  </g>
+  <!-- Eyes -->
+  <ellipse cx="28.4" cy="27.5" rx="2" ry="1.2" fill="#11294A"/>
+  <ellipse cx="35.6" cy="27.5" rx="2" ry="1.2" fill="#11294A"/>
+
+  <!-- Uraeus (cobra) on the brow -->
+  <ellipse cx="32" cy="14" rx="2.1" ry="3" fill="url(#gold)" stroke="#1C4E8A" stroke-width="0.8"/>
+
+  <!-- Plaited false beard -->
+  <rect x="29" y="39" width="6" height="12" rx="2" fill="url(#gold)"/>
+  <g clip-path="url(#beardClip)" fill="#1C4E8A">
+    <rect x="29" y="42" width="6" height="2"/>
+    <rect x="29" y="46" width="6" height="2"/>
+  </g>
+</svg>

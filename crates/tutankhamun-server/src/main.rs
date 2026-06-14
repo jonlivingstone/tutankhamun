@@ -368,7 +368,26 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         "memory budget initialised"
     );
 
-    let ops_state = OpsState::new(Arc::clone(&metrics));
+    // FlightSQL data-plane service. Built before the ops server so it can be
+    // handed to `OpsState` as the `/status` structural-state source (sessions,
+    // datasets); it's Clone-cheap (an `Arc` handle), so the gRPC task takes its
+    // own clone. Per-dataset shard caches are created lazily and reused across
+    // queries (see `flight_sql`).
+    let svc = TutankhamunFlightSqlService::new(
+        config.storage_url.clone(),
+        config.cache_dir.clone(),
+        cache_cap,
+        budget,
+        pct,
+        bitmap_cache,
+        Arc::clone(&metrics),
+    );
+
+    let ops_state = OpsState::new(
+        Arc::clone(&metrics),
+        Arc::new(svc.clone()),
+        std::time::Instant::now(),
+    );
     let ops_addr = config.ops_addr.parse()?;
     let ops_listener = ops_http::bind(ops_addr).await?;
     let ops_task = tokio::spawn({
@@ -381,22 +400,12 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         }
     });
 
-    // FlightSQL data-plane. Per-dataset shard caches are created lazily and
-    // reused across queries (see `flight_sql`); the gRPC listener is bound
-    // before marking ready so /readyz only flips once both ops and gRPC are live.
+    // The gRPC listener is bound before marking ready so /readyz only flips once
+    // both ops and gRPC are live.
     let grpc_addr = config.grpc_addr.parse()?;
     let grpc_listener = flight_sql::bind(grpc_addr).await?;
     let grpc_task = tokio::spawn({
         let shutdown = shutdown.clone();
-        let svc = TutankhamunFlightSqlService::new(
-            config.storage_url.clone(),
-            config.cache_dir.clone(),
-            cache_cap,
-            budget,
-            pct,
-            bitmap_cache,
-            metrics,
-        );
         async move {
             if let Err(e) = flight_sql::serve(grpc_listener, svc, shutdown).await {
                 error!(error = ?e, "gRPC FlightSQL server failed");

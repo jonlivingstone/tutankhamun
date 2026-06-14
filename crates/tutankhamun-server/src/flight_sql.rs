@@ -74,6 +74,7 @@ use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
+use crate::status::{DatasetsReport, SessionsSummary, StatusSource, StructuralReport};
 use crate::storage::StorageRegistry;
 
 /// Affinity header: the session id is published here on the handshake response
@@ -233,6 +234,41 @@ impl ServiceInner {
         }
         reaped
     }
+
+    /// Summarise live sessions for `/status`: count, the oldest session's age,
+    /// and total baseline bytes reserved (the admission floor, not live
+    /// working-set — every session reserves exactly [`SESSION_BASELINE_BYTES`]).
+    fn sessions_snapshot(&self) -> SessionsSummary {
+        let sessions = self.sessions.lock().expect("sessions lock");
+        let now = Instant::now();
+        let count = sessions.len() as u64;
+        let oldest_age_secs = sessions
+            .values()
+            .map(|s| now.saturating_duration_since(s.created_at).as_secs())
+            .max()
+            .unwrap_or(0);
+        SessionsSummary {
+            count,
+            oldest_age_secs,
+            reserved_bytes: count * SESSION_BASELINE_BYTES,
+        }
+    }
+}
+
+#[async_trait]
+impl StatusSource for TutankhamunFlightSqlService {
+    async fn structural_snapshot(&self) -> StructuralReport {
+        let sessions = self.inner.sessions_snapshot();
+        // A LIST failure must not fail the page — report datasets as unavailable.
+        let datasets = match self.inner.list_datasets().await {
+            Ok(names) => DatasetsReport { ok: true, names },
+            Err(_) => DatasetsReport {
+                ok: false,
+                names: Vec::new(),
+            },
+        };
+        StructuralReport { sessions, datasets }
+    }
 }
 
 impl TutankhamunFlightSqlService {
@@ -317,9 +353,10 @@ impl TutankhamunFlightSqlService {
         query: &str,
         prepared: bool,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+        let preview = sql_preview(query);
         let span = info_span!(
             "query",
-            sql = %sql_preview(query),
+            sql = %preview,
             prepared,
             rows = tracing::field::Empty,
             error = tracing::field::Empty,
@@ -328,13 +365,16 @@ impl TutankhamunFlightSqlService {
             let (df, schema) = plan(ctx, query).instrument(info_span!("plan")).await?;
             let started = Instant::now();
             let result = df.collect().instrument(info_span!("execute")).await;
+            let rows = match &result {
+                Ok(batches) => batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64,
+                Err(_) => 0,
+            };
             self.inner
                 .metrics
-                .record_query(started.elapsed(), result.is_ok());
+                .record_query(started.elapsed(), result.is_ok(), preview, rows);
             match result {
                 Ok(batches) => {
-                    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-                    tracing::Span::current().record("rows", rows as u64);
+                    tracing::Span::current().record("rows", rows);
                     Ok((schema, batches))
                 }
                 Err(e) => {

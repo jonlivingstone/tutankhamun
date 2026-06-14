@@ -386,15 +386,30 @@ directly.
 
 ## Web UI
 
-- [ ] `/status` page on the ops port — §3.5
-- [ ] Daemon health + build version display — §3.5
-- [ ] Loaded shards table (dataset, time range, size on disk,
-      size mmap'd) — §3.5
-- [ ] Active sessions table (count, oldest age, total memory) —
-      §3.5
-- [ ] Memory pool usage breakdown — §3.5
-- [ ] Recent queries ring buffer (last ~50) — §3.5
-- [ ] Pointers to `/metrics` and OTLP endpoints — §3.5
+- [x] `/status` page on the ops port — §3.5 (JSON-first: `/status.json`
+      serialises live state, `/status` serves an embedded static HTML page
+      [`include_str!`] that fetches it and renders client-side with vanilla JS —
+      zero new deps. Structural state [sessions, datasets] flows from the
+      `FlightSQL` service via a `status::StatusSource` trait so ops never sees its
+      internals; numeric state comes from the shared `Metrics`. `/favicon.svg`
+      serves the embedded `t9n.svg` mark)
+- [x] Daemon health + build version display — §3.5 (version, uptime, readiness)
+- [~] Loaded shards table (dataset, time range, size on disk,
+      size mmap'd) — §3.5 (v1 lists dataset *names* only, via the cheap
+      `list_datasets` LIST. Deferred: per-shard time range / size-on-disk /
+      mmap'd — needs `Cache` resident-bytes accessors and shard-size accounting;
+      "loaded shards" isn't tracked since datasets are discovered lazily)
+- [x] Active sessions table (count, oldest age, total memory) —
+      §3.5 (count, oldest-session age, and total *baseline* reserved bytes — the
+      admission floor; per-session live working-set is not metered)
+- [x] Memory pool usage breakdown — §3.5 (limit / used / available, off the §2.2
+      budget, plus the §2.8 bitmap-cache resident bytes)
+- [x] Recent queries ring buffer (last ~50) — §3.5 (bounded ring of the last 32
+      in `Metrics`, fed by `record_query` with the SQL preview + rows + latency;
+      status-only, not in the Prometheus exposition)
+- [x] Pointers to `/metrics` and OTLP endpoints — §3.5 (the page footer links
+      `/metrics` and `/status.json`; OTLP export is a push to a configured
+      collector, not a local URL to link)
 
 ## Auth — v1 disciplines (so v2 plugs in cleanly)
 
