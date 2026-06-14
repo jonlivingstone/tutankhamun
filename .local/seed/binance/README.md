@@ -28,6 +28,33 @@ BINANCE_INTERVAL="5m" bash .local/seed/binance/fetch.sh
 Downloaded to `.cache/downloads/binance/<SYMBOL>-<INTERVAL>-<YYYY-MM>.csv`
 (raw source; ingestion turns these into shards under `.cache/storage/`).
 
+## Ingest
+
+Headerless, with **float** price/volume strings and a **millisecond**
+`open_time` — `t9n ingest` wants a header, int64 metrics, and epoch
+**seconds**. The symbol comes from the filename (not a column), so inject it.
+A small `awk` pass does all of it (no extra tools):
+
+```sh
+SYMBOL=BTCUSDT
+awk -F, -v s="$SYMBOL" \
+  'BEGIN { print "open_time,symbol,close_e8,volume_e8,trades" }
+   { printf "%d,%s,%d,%d,%d\n", $1/1000, s, $5*1e8, $6*1e8, $9 }' \
+  .cache/downloads/binance/$SYMBOL-1m-2024-01.csv \
+  > .cache/downloads/binance/$SYMBOL-2024-01.csv
+
+cargo run --release --bin t9n -- ingest \
+    .cache/downloads/binance/$SYMBOL-2024-01.csv \
+    --output .cache/storage/binance \
+    --time open_time \
+    --string symbol \
+    --metric close_e8 --metric volume_e8 --metric trades \
+    --shard-by daily
+```
+
+`close_e8`/`volume_e8` are scaled ×1e8 (divide by 1e8 on read). If your
+download already includes a header row, drop it first with `tail -n +2`.
+
 ## Schema (CSV, header-less, 12 columns)
 
 | Col | Field | Type | Notes |
