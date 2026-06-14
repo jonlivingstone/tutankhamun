@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Download N months of NYC TLC yellow taxi trip records (Parquet) and stage
-# them under .local/storage/nyc_taxi/. Idempotent: skips files that already
-# exist.
+# Download N months of NYC TLC yellow taxi trip records (Parquet) into the
+# raw download cache .cache/downloads/nyc_taxi/ (a source cache, not the served
+# root — ingestion turns these into shards under .cache/storage/). Idempotent:
+# skips files that already exist.
 #
 # Months can be overridden via $TAXI_MONTHS, e.g.:
 #   TAXI_MONTHS="2024-01 2024-02 2024-03 2024-04" bash .local/seed/nyc-taxi/fetch.sh
@@ -10,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DEST_DIR="$PROJECT_ROOT/.local/storage/nyc_taxi"
+DEST_DIR="$PROJECT_ROOT/.cache/downloads/nyc_taxi"
 
 # Default to three months from early 2024 — a known-stable archived range.
 MONTHS="${TAXI_MONTHS:-2024-01 2024-02 2024-03}"
@@ -47,5 +48,5 @@ for month in $MONTHS; do
 done
 
 echo
-echo "Done. Storage contents:"
+echo "Done. Downloaded files:"
 ls -lh "$DEST_DIR"

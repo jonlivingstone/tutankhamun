@@ -9,13 +9,13 @@
 #   scripts/fetch_citibike.sh 202302        # other month
 #   CACHE_DIR=/tmp/cb scripts/fetch_citibike.sh
 #
-# Files are cached under .local/seed-cache so re-runs skip the
+# Files are cached under .cache/downloads/citibike so re-runs skip the
 # download + preprocessing steps.
 
 set -euo pipefail
 
 MONTH="${1:-202301}"
-CACHE_DIR="${CACHE_DIR:-.local/seed-cache}"
+CACHE_DIR="${CACHE_DIR:-.cache/downloads/citibike}"
 
 for tool in curl unzip python3; do
     command -v "$tool" >/dev/null || { echo "error: $tool not found in PATH"; exit 1; }
@@ -73,7 +73,7 @@ data ready: $CSV_DUR
 ingest it (one immutable shard per day) with:
 
   cargo run --release --bin t9n -- ingest $CSV_DUR \\
-      --output .local/storage/citibike/jc-$MONTH \\
+      --output .cache/storage/citibike/jc-$MONTH \\
       --time started_at \\
       --metric trip_seconds \\
       --string rideable_type --string member_casual \\

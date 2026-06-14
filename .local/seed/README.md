@@ -2,8 +2,9 @@
 
 One subdirectory per dataset. Each contains:
 
-- `fetch.sh` — downloads the data and stages it under
-  `.local/storage/<dataset>/…`. Idempotent (skips files that already exist).
+- `fetch.sh` — downloads the raw data into
+  `.cache/downloads/<dataset>/…` (a source cache, *not* the served root).
+  Idempotent (skips files that already exist).
 - `README.md` — schema, source URL, attribution / license note.
 
 Run them in any order; they don't depend on each other.
@@ -18,9 +19,9 @@ Run them in any order; they don't depend on each other.
 ## Adding a new dataset
 
 1. Create `.local/seed/<name>/` with `fetch.sh` and `README.md`.
-2. `fetch.sh` should stage files under `.local/storage/<name>/…` so the
-   prefix matches the directory name (this makes
-   `storage-check.sh <name>` work).
+2. `fetch.sh` should download raw files into `.cache/downloads/<name>/…`.
+   Ingestion later writes shards to `.cache/storage/<name>/…` (the served
+   root), which `storage-check.sh <name>` lists once that prefix exists.
 3. Use the conventions shared by the existing scripts:
    - `#!/usr/bin/env bash` + `set -euo pipefail`
    - `curl --fail --location --silent --show-error` (`-fLsS`)

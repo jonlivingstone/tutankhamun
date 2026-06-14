@@ -25,7 +25,8 @@ BINANCE_SYMBOLS="BTCUSDT ETHUSDT SOLUSDT" \
 BINANCE_INTERVAL="5m" bash .local/seed/binance/fetch.sh
 ```
 
-Staged under `.local/storage/binance/<SYMBOL>-<INTERVAL>-<YYYY-MM>.csv`.
+Downloaded to `.cache/downloads/binance/<SYMBOL>-<INTERVAL>-<YYYY-MM>.csv`
+(raw source; ingestion turns these into shards under `.cache/storage/`).
 
 ## Schema (CSV, header-less, 12 columns)
 

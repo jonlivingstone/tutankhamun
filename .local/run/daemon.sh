@@ -2,9 +2,9 @@
 # Start the t9n daemon with playground-friendly settings:
 #   - ops port bound to 127.0.0.1:18080 (off the default 0.0.0.0:8080 to
 #     avoid clashing with other dev services)
-#   - storage URL pointing at .local/storage (where the seed scripts staged
-#     data)
-#   - cache directory under .local/cache
+#   - storage URL pointing at .cache/storage (the object store — the daemon's
+#     read-only source of ingested shards)
+#   - cache directory under .cache/cache (the daemon's local mmap working copy)
 #
 # Overridable via env:
 #   OPS_ADDR  default: 127.0.0.1:18080
@@ -14,8 +14,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-STORAGE="$PROJECT_ROOT/.local/storage"
-CACHE="$PROJECT_ROOT/.local/cache"
+STORAGE="$PROJECT_ROOT/.cache/storage"
+CACHE="$PROJECT_ROOT/.cache/cache"
 BINARY="$PROJECT_ROOT/target/debug/t9n"
 
 if [[ ! -x "$BINARY" ]]; then

@@ -31,7 +31,7 @@ scripts/fetch_citibike.sh
 ```
 
 ```
-data ready: .local/seed-cache/JC-202301-citibike-tripdata-with-duration.csv
+data ready: .cache/downloads/citibike/JC-202301-citibike-tripdata-with-duration.csv
 ```
 
 ## 3. Ingest it
@@ -43,8 +43,8 @@ aggregate, and the `--string` columns you'll filter on.
 
 ```sh
 cargo run --release --bin t9n -- ingest \
-    .local/seed-cache/JC-202301-citibike-tripdata-with-duration.csv \
-    --output .local/storage/citibike/jc-202301 \
+    .cache/downloads/citibike/JC-202301-citibike-tripdata-with-duration.csv \
+    --output .cache/storage/citibike/jc-202301 \
     --time started_at \
     --metric trip_seconds \
     --string rideable_type --string member_casual \
@@ -53,7 +53,7 @@ cargo run --release --bin t9n -- ingest \
 ```
 
 ```
-wrote 56075 docs to .local/storage/citibike/jc-202301
+wrote 56075 docs to .cache/storage/citibike/jc-202301
 ```
 
 That column split *is* the storage model: metrics are summable but not
@@ -67,7 +67,7 @@ of 31 daily shards. Inspect one of them:
 
 ```sh
 cargo run --release --bin t9n -- shard inspect \
-    .local/storage/citibike/jc-202301/2023-01-01
+    .cache/storage/citibike/jc-202301/2023-01-01
 ```
 
 ```
@@ -91,7 +91,7 @@ sums the per-shard results. Total time spent riding in January:
 
 ```sh
 cargo run --release --bin t9n -- query \
-    .local/storage/citibike/jc-202301 --metric trip_seconds
+    .cache/storage/citibike/jc-202301 --metric trip_seconds
 ```
 
 ```
@@ -106,12 +106,12 @@ By rider type:
 
 ```sh
 cargo run --release --bin t9n -- query \
-    .local/storage/citibike/jc-202301 \
+    .cache/storage/citibike/jc-202301 \
     --filter member_casual=member --metric trip_seconds
 # shards 31; matched 43642 / 56075; sum 24,776,477  (~9.5 min avg)
 
 cargo run --release --bin t9n -- query \
-    .local/storage/citibike/jc-202301 \
+    .cache/storage/citibike/jc-202301 \
     --filter member_casual=casual --metric trip_seconds
 # shards 31; matched 12433 / 56075; sum 14,903,291  (~20 min avg)
 ```
@@ -123,7 +123,7 @@ Casuals are 22% of trips but 38% of ride time — they ride about
 
 ```sh
 cargo run --release --bin t9n -- query \
-    .local/storage/citibike/jc-202301 \
+    .cache/storage/citibike/jc-202301 \
     --metric trip_seconds --aggregate avg
 # trip_seconds:   avg = 707.61   (~12 min per trip)
 ```
@@ -132,7 +132,7 @@ By starting station — Hoboken Terminal:
 
 ```sh
 cargo run --release --bin t9n -- query \
-    .local/storage/citibike/jc-202301 \
+    .cache/storage/citibike/jc-202301 \
     --filter start_station_id=HB101 --metric trip_seconds
 # shards 31; matched 1734 / 56075; sum 1,467,974
 ```
@@ -142,7 +142,7 @@ starting at Hoboken Terminal:
 
 ```sh
 cargo run --release --bin t9n -- query \
-    .local/storage/citibike/jc-202301 \
+    .cache/storage/citibike/jc-202301 \
     --filter start_station_id=HB101 --filter member_casual=member \
     --metric trip_seconds
 ```
@@ -158,7 +158,7 @@ returned rows — either way you get the same answer.
 Trips and total ride time by rider type:
 
 ```sh
-cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
+cargo run --release --bin t9n -- sql .cache/storage/citibike/jc-202301 \
     "SELECT member_casual, count(*) AS trips, sum(trip_seconds) AS total
      FROM t GROUP BY member_casual ORDER BY member_casual"
 ```
@@ -176,7 +176,7 @@ cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
 start stations each rider type used, without keeping every value:
 
 ```sh
-cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
+cargo run --release --bin t9n -- sql .cache/storage/citibike/jc-202301 \
     "SELECT member_casual, approx_distinct(start_station_id) AS stations
      FROM t GROUP BY member_casual ORDER BY member_casual"
 ```
@@ -193,7 +193,7 @@ cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
 Most popular bike type:
 
 ```sh
-cargo run --release --bin t9n -- sql .local/storage/citibike/jc-202301 \
+cargo run --release --bin t9n -- sql .cache/storage/citibike/jc-202301 \
     "SELECT rideable_type, count(*) AS trips
      FROM t GROUP BY rideable_type ORDER BY trips DESC"
 ```

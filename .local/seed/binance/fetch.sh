@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Download Binance 1-minute klines for one or more symbols and stage them
-# under .local/storage/binance/. Each Binance archive is a zip containing a
-# single CSV; we unzip into the destination so consumers see plain CSVs.
+# Download Binance 1-minute klines for one or more symbols into the raw
+# download cache .cache/downloads/binance/. Each Binance archive is a zip
+# containing a single CSV; we unzip into the destination so consumers see
+# plain CSVs.
 # Idempotent: skips files that already exist.
 #
 # Overridable via env:
@@ -13,8 +14,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-DEST_DIR="$PROJECT_ROOT/.local/storage/binance"
-TMP_DIR="$PROJECT_ROOT/.local/data/binance"
+DEST_DIR="$PROJECT_ROOT/.cache/downloads/binance"
+TMP_DIR="$DEST_DIR/.tmp"
 
 SYMBOLS="${BINANCE_SYMBOLS:-BTCUSDT ETHUSDT}"
 MONTHS="${BINANCE_MONTHS:-2024-01 2024-02 2024-03 2024-04 2024-05 2024-06}"
@@ -58,5 +59,5 @@ done
 rmdir "$TMP_DIR" 2>/dev/null || true
 
 echo
-echo "Done. Storage contents:"
+echo "Done. Downloaded files:"
 ls -lh "$DEST_DIR"

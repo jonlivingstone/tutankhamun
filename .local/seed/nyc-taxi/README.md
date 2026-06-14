@@ -19,7 +19,8 @@ TAXI_MONTHS="2023-10 2023-11 2023-12 2024-01" \
   bash .local/seed/nyc-taxi/fetch.sh
 ```
 
-Staged under `.local/storage/nyc_taxi/yellow_tripdata_<YYYY-MM>.parquet`.
+Downloaded to `.cache/downloads/nyc_taxi/yellow_tripdata_<YYYY-MM>.parquet`
+(raw source; ingestion turns these into shards under `.cache/storage/`).
 
 ## Schema (~18 columns)
 

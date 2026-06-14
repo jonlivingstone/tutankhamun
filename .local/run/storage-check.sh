@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke-test the playground storage: list objects under .local/storage,
+# Smoke-test the playground storage: list objects under .cache/storage,
 # optionally filtered to a prefix.
 #
 # Usage:
@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-STORAGE="$PROJECT_ROOT/.local/storage"
+STORAGE="$PROJECT_ROOT/.cache/storage"
 BINARY="$PROJECT_ROOT/target/debug/t9n"
 
 if [[ ! -x "$BINARY" ]]; then
