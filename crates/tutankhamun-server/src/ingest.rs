@@ -25,14 +25,14 @@ use arrow::array::{
     TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{DateTime, NaiveDate, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, PutPayload, WriteMultipart};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringBitmap;
 use tokio::io::AsyncReadExt;
 
-use crate::shard::{DiskShardWriter, FieldKind, METADATA_FILE};
+use crate::shard::{DiskShardWriter, FieldKind, METADATA_FILE, Metadata};
 
 /// Default decimal scale applied to float columns at ingest (`round(v × 10^3)`),
 /// i.e. three fractional digits. Overridable per column via `--scale`.
@@ -77,18 +77,24 @@ pub struct IngestOptions {
     pub shard_by: ShardBy,
 }
 
-/// How rows are partitioned into shards. The internal model is
-/// duration-based (`Bucket { seconds }`); the CLI exposes named
-/// aliases (`daily` → 86400, `hourly` → 3600) but the engine accepts
-/// any positive bucket size — adding `--shard-by 6h` later is a
-/// CLI-parser change only.
+/// How rows are partitioned into shards. Most granularities are
+/// duration-based (`Bucket { seconds }`); the CLI exposes named aliases
+/// (`hourly` → 3600, `daily` → 86400, `weekly` → 604800) but the engine
+/// accepts any positive bucket size — adding `--shard-by 6h` later is a
+/// CLI-parser change only. `Month` is the one calendar-based granularity,
+/// since a month is not a fixed number of seconds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ShardBy {
     /// All rows into a single shard at the `--output` path.
     #[default]
     None,
-    /// One shard per `seconds`-wide UTC time bucket.
+    /// One shard per `seconds`-wide UTC time bucket. Buckets are aligned
+    /// to the Unix epoch (so `weekly` windows start on the epoch's
+    /// weekday, Thursday) — a storage-partitioning detail; query-time
+    /// pruning works regardless of alignment.
     Bucket { seconds: i64 },
+    /// One shard per calendar month (UTC).
+    Month,
 }
 
 impl ShardBy {
@@ -99,6 +105,10 @@ impl ShardBy {
         match self {
             Self::None => 0,
             Self::Bucket { seconds } => epoch.div_euclid(seconds),
+            Self::Month => {
+                let dt = DateTime::from_timestamp(epoch, 0).expect("epoch within chrono range");
+                i64::from(dt.year()) * 12 + i64::from(dt.month0())
+            }
         }
     }
 
@@ -116,7 +126,11 @@ impl ShardBy {
                 let dt = DateTime::from_timestamp(bucket_start, 0)
                     .expect("bucket_start within chrono range");
                 let fmt = match seconds {
-                    86_400 => "%Y-%m-%d",
+                    // Daily and weekly both name the dir by the bucket-start
+                    // date; each weekly bucket starts on a distinct date, so
+                    // they never collide within a single (fixed-granularity)
+                    // ingest.
+                    86_400 | 604_800 => "%Y-%m-%d",
                     3600 => "%Y-%m-%dT%H",
                     _ => panic!(
                         "ShardBy::output_dir has no dirname format defined for {seconds}s \
@@ -124,6 +138,12 @@ impl ShardBy {
                     ),
                 };
                 root.join(dt.format(fmt).to_string())
+            }
+            Self::Month => {
+                let year = i32::try_from(key.div_euclid(12)).expect("year within range");
+                let month = u32::try_from(key.rem_euclid(12)).expect("month in 0..12") + 1;
+                let dt = NaiveDate::from_ymd_opt(year, month, 1).expect("valid year-month");
+                root.join(dt.format("%Y-%m").to_string())
             }
         }
     }
@@ -205,6 +225,25 @@ fn find_shard_dirs(root: &Path) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     walk_shard_dirs(root, &mut out)?;
     Ok(out)
+}
+
+/// Every shard written under `root`, paired with its doc count, sorted by
+/// path (bucket dirs are named by date, so this reads chronologically).
+/// Reads each shard's `metadata.json`; used by the `ingest` CLI to report
+/// what it wrote. Mirrors discovery's "directory containing `metadata.json`"
+/// rule, so it covers both `--shard-by none` and bucketed layouts.
+pub fn shard_summaries(root: &Path) -> Result<Vec<(PathBuf, u64)>> {
+    let mut dirs = find_shard_dirs(root)?;
+    dirs.sort();
+    dirs.into_iter()
+        .map(|dir| {
+            let path = dir.join(METADATA_FILE);
+            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let metadata: Metadata = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            Ok((dir, metadata.num_docs))
+        })
+        .collect()
 }
 
 fn walk_shard_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -1051,6 +1090,30 @@ mod tests {
         }
     }
 
+    fn opts_weekly(time: &str, metrics: &[&str], strings: &[&str]) -> IngestOptions {
+        IngestOptions {
+            shard_by: ShardBy::Bucket { seconds: 604_800 },
+            ..opts(time, metrics, strings)
+        }
+    }
+
+    fn opts_monthly(time: &str, metrics: &[&str], strings: &[&str]) -> IngestOptions {
+        IngestOptions {
+            shard_by: ShardBy::Month,
+            ..opts(time, metrics, strings)
+        }
+    }
+
+    /// Epoch seconds for `YYYY-MM-DD` at UTC midnight (test helper).
+    fn day_epoch(date: &str) -> i64 {
+        NaiveDate::parse_from_str(date, "%Y-%m-%d")
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp()
+    }
+
     #[test]
     fn ingest_csv_round_trip_minimal() {
         let tmp = tempfile::tempdir().expect("tmpdir");
@@ -1359,6 +1422,70 @@ mod tests {
         assert!(root.join("2023-01-01T00").is_dir(), "{root:?}");
         assert!(root.join("2023-01-01T01").is_dir());
         assert!(root.join("2023-01-01T02").is_dir());
+    }
+
+    #[test]
+    fn ingest_csv_shard_by_weekly_produces_one_shard_per_week() {
+        // Epoch weeks align to Thursday; 2023-01-05 is a Thursday and an
+        // exact 604800s boundary, so it is a week start.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {w0_start},10\n\
+                 {w0_mid},20\n\
+                 {w1_start},30\n",
+                w0_start = day_epoch("2023-01-05"),
+                w0_mid = day_epoch("2023-01-10"), // same week (Thu..Wed)
+                w1_start = day_epoch("2023-01-12"), // next week
+            ),
+        );
+        let root = tmp.path().join("dataset");
+        let n = ingest_csv(&input, &root, &opts_weekly("pickup", &["x"], &[])).expect("ingest");
+        assert_eq!(n, 3);
+
+        assert!(root.join("2023-01-05").is_dir(), "{root:?}");
+        assert!(root.join("2023-01-12").is_dir());
+        let w0 = DiskShard::open(&root.join("2023-01-05")).expect("open week 0");
+        assert_eq!(w0.num_docs(), 2);
+        assert_eq!(w0.forward_column("x").unwrap(), &[10, 20]);
+        let w1 = DiskShard::open(&root.join("2023-01-12")).expect("open week 1");
+        assert_eq!(w1.num_docs(), 1);
+        assert_eq!(w1.forward_column("x").unwrap(), &[30]);
+    }
+
+    #[test]
+    fn ingest_csv_shard_by_monthly_produces_one_shard_per_calendar_month() {
+        // Calendar months (not fixed-width): Jan rows share a shard;
+        // Feb and Dec are distinct, including across the year.
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let input = write_csv(
+            tmp.path(),
+            &format!(
+                "pickup,x\n\
+                 {jan_a},10\n\
+                 {jan_b},20\n\
+                 {feb},30\n\
+                 {dec},40\n",
+                jan_a = day_epoch("2023-01-05"),
+                jan_b = day_epoch("2023-01-28"),
+                feb = day_epoch("2023-02-03"),
+                dec = day_epoch("2023-12-31"),
+            ),
+        );
+        let root = tmp.path().join("dataset");
+        let n = ingest_csv(&input, &root, &opts_monthly("pickup", &["x"], &[])).expect("ingest");
+        assert_eq!(n, 4);
+
+        assert!(root.join("2023-01").is_dir(), "{root:?}");
+        assert!(root.join("2023-02").is_dir());
+        assert!(root.join("2023-12").is_dir());
+        let jan = DiskShard::open(&root.join("2023-01")).expect("open jan");
+        assert_eq!(jan.num_docs(), 2);
+        assert_eq!(jan.forward_column("x").unwrap(), &[10, 20]);
+        let feb = DiskShard::open(&root.join("2023-02")).expect("open feb");
+        assert_eq!(feb.num_docs(), 1);
     }
 
     #[test]

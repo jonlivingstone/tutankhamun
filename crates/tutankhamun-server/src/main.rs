@@ -102,8 +102,8 @@ enum Command {
         input: PathBuf,
         /// Where to write the finalised shard(s). Accepts a local
         /// directory path or any `object_store` URL (`s3://`,
-        /// `gs://`, `az://`, `memory://`). With `--shard-by daily`
-        /// or `hourly`, one shard per time bucket is written under
+        /// `gs://`, `az://`, `memory://`). With a `--shard-by`
+        /// granularity, one shard per time bucket is written under
         /// this root (e.g. `<root>/YYYY-MM-DD/`). For remote URLs
         /// each shard is staged in a tempdir and uploaded with
         /// `metadata.json` last, so partial uploads stay invisible
@@ -135,8 +135,10 @@ enum Command {
         #[arg(long, default_value = ",")]
         delimiter: char,
         /// Partition rows into shards by UTC time bucket. `none`
-        /// produces one shard at `--output`; `daily` / `hourly`
-        /// produce one shard per day / hour under `--output`.
+        /// produces one shard at `--output`; `hourly` / `daily` /
+        /// `weekly` produce one shard per fixed-width bucket and
+        /// `monthly` one per calendar month, under `--output`.
+        /// (`weekly` windows are 7-day, epoch-aligned.)
         #[arg(long, value_enum, default_value_t = ShardByArg::None)]
         shard_by: ShardByArg,
         /// Per-column scale for Parquet float columns: `--scale
@@ -178,16 +180,20 @@ enum Command {
 pub(crate) enum ShardByArg {
     #[default]
     None,
-    Daily,
     Hourly,
+    Daily,
+    Weekly,
+    Monthly,
 }
 
 impl From<ShardByArg> for ShardBy {
     fn from(a: ShardByArg) -> Self {
         match a {
             ShardByArg::None => ShardBy::None,
-            ShardByArg::Daily => ShardBy::Bucket { seconds: 86_400 },
             ShardByArg::Hourly => ShardBy::Bucket { seconds: 3600 },
+            ShardByArg::Daily => ShardBy::Bucket { seconds: 86_400 },
+            ShardByArg::Weekly => ShardBy::Bucket { seconds: 604_800 },
+            ShardByArg::Monthly => ShardBy::Month,
         }
     }
 }

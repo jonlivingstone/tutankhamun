@@ -62,15 +62,37 @@ pub(crate) fn run(
     match ingest::IngestDestination::parse(output)? {
         ingest::IngestDestination::Local(local) => {
             let n = ingest_to(&local)?;
-            println!("wrote {n} docs to {}", local.display());
+            let shards = report_shards(&local)?;
+            println!(
+                "wrote {n} docs across {shards} shard(s) to {}",
+                local.display()
+            );
         }
         ingest::IngestDestination::Remote(url) => {
             let staging = tempfile::tempdir().context("create ingest staging tempdir")?;
             let n = ingest_to(staging.path())?;
+            let shards = report_shards(staging.path())?;
             let runtime = super::current_thread_runtime()?;
             runtime.block_on(ingest::upload_ingest_tree(staging.path(), &url))?;
-            println!("wrote {n} docs to {url}");
+            println!("wrote {n} docs across {shards} shard(s) to {url}");
         }
     }
     Ok(())
+}
+
+/// Print one line per shard written under `root` (skipped when there's a
+/// single shard, since the final summary already covers it); returns the
+/// shard count for that summary.
+fn report_shards(root: &Path) -> anyhow::Result<usize> {
+    let shards = ingest::shard_summaries(root)?;
+    if shards.len() > 1 {
+        for (dir, docs) in &shards {
+            let name = dir.file_name().map_or_else(
+                || dir.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            println!("  {name}: {docs} docs");
+        }
+    }
+    Ok(shards.len())
 }
