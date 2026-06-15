@@ -64,6 +64,20 @@ directly.
 - [x] Inverted index reader — FST range scan + Roaring bitmap
       iteration — §2.1
 - [ ] Optional Parquet export of forward columns — §2.1
+- [ ] Nullable columns — §2.1
+      (today `ingest` rejects any null in a declared column —
+      `extract_numeric`/`extract_time` `bail!` on `is_null` — because the
+      forward column is a dense `i64` buffer read zero-copy as `&[i64]`,
+      with no place for "absent". Add null support: carry the Arrow
+      validity bitmap alongside the values buffer (Arrow IPC already
+      produces it; we currently discard it), mmap it, and consult it in
+      the FTGS loop with SQL NULL semantics (sum/avg skip nulls,
+      `count(col)` skips, `count(*)` counts). The values buffer stays a
+      dense `&[i64]`, so the zero-copy read is preserved — the bitmap is
+      a side input, not a layout change. Unblocks ingesting nullable
+      source columns (e.g. nyc-taxi `passenger_count`) and per-shard
+      schema evolution: a dataset's newer shards can carry a column that
+      older shards project as null. Prereq for live add-column (§3.3).)
 
 ## Engine — abstractions
 
@@ -72,7 +86,15 @@ directly.
 - [x] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
 - [x] `ShardSource` trait — server-side abstraction over where
       shards come from — §3.3 v1 disciplines
-- [x] Object-storage `ShardSource` implementation — §3.3 v1
+- [~] Object-storage `ShardSource` implementation — §3.3 v1
+      (`ObjectStoreShardSource` works, but discovery is currently run
+      **per query** — a full `store.list()` + a GET of every shard's
+      `metadata.json` (shard_source.rs:81), called fresh from
+      `provider.rs`/`scan.rs` on every query. Not acceptable against
+      object storage (LIST + N round-trips per query); must move behind a
+      cached, version-checked catalog — see the per-dataset manifest item
+      under Ingest. Marked incomplete until discovery is no longer
+      per-query.)
 - [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
 - [ ] K8s DNS `ShardLocator` implementation — §1.3
 - [ ] Static-file `ShardLocator` implementation — §1.3
@@ -235,6 +257,17 @@ directly.
       + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
 - [x] Time-range shard pruning in the SQL scan (prune shards by a
       predicate on the time column before fetch) — §3.2
+- [ ] `__time` canonical alias for the time field — §3.2
+      (today the time field is exposed only under its ingested name, so
+      SQL must hard-code e.g. `tpep_pickup_datetime`. Expose it
+      *additionally* under a fixed `__time` name — the Druid convention —
+      so `WHERE __time >= TIMESTAMP '...'` works on any dataset regardless
+      of the original column name, for every FlightSQL client, not just
+      the Python one. Add the alias in `arrow_schema_from_metadata`, and
+      teach the filter pushdown + time-range pruning to treat `__time` as
+      the time field — otherwise a predicate on the alias would lose shard
+      pruning and fall back to a full scan. Makes a name-independent
+      client `time_range=` (§3.2 Python client) trivial to layer on top.)
 - [x] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
       FTGS scan (Tier 2/3) — §3.2
       (single- *and* multi-column `Int`/`String` GROUP BY *and* global
@@ -319,23 +352,69 @@ directly.
       `--state-dir`) — for cache in v1; for WAL in v2 — §3.3 v1
 - [ ] `flamdex-to-tutankhamun` migration tool — read old Imhotep
       Flamdex shards, write in new format — §2.1
+- [ ] Per-dataset manifest (catalog snapshot) — §3.3
+      (a small versioned object per dataset: the authoritative shard set
+      + schema + version, written atomically. Today `ShardSource::discover()`
+      runs a full `store.list()` **plus a GET of every shard's
+      `metadata.json` on every query** (shard_source.rs:81) — a LIST + N
+      round-trips per query, costly against S3/GCS. The manifest replaces
+      that with one manifest read + a cheap version/etag check, and a query
+      resolves a single consistent snapshot. Supersedes per-query
+      `discover()`; the manifest version is also the cache-invalidation
+      signal, so no manual `reload` op is needed.)
+- [ ] Atomic re-ingest / replace in place — §3.3
+      (rebuild a dataset's shards and swap the manifest atomically, so a
+      query never sees a mixed/partial state mid-rewrite. Without the
+      manifest this is unsafe live — readers observe old- and new-schema
+      shards at once. Append of a brand-new shard is already safe live
+      today via the `metadata.json` commit-marker; this covers the
+      *replace* case. Needs the nullable-columns item (storage format,
+      above) only when the new schema differs per shard; a uniform
+      whole-dataset rewrite does not.)
+- [ ] Live add / remove shards to a dataset — §3.3
+      (control-plane op to add or drop individual shards from a dataset's
+      manifest without a full re-ingest — append a fresh day/month, retire
+      an old one — committed atomically via the manifest version. Extends
+      the deferred "shard manager — registration / eviction" item above.)
 
 ## Query language — native Python client
 
-- [ ] `tutankhamun` PyPI package skeleton — §3.2
-- [ ] Connection / session classes (`tk.connect(...).session(...)`)
-      — §3.2
-- [ ] Fluent API (`.filter()`, `.group_by()`, `.select()`,
-      `.fetch()`) — §3.2
-- [ ] Lazy execution (composes SQL fragments until `.fetch()`) —
+- [x] `tutankhamun` PyPI package skeleton — §3.2 (`clients/python/`,
+      src-layout, hatchling; deps: pyarrow, optional pandas/polars)
+- [x] Connection / session classes (`tk.connect(...).session(...)`)
+      — §3.2 (`connect()` → `Connection`; `session(dataset=…)` /
+      `session_from_sql(…)` open over raw `pyarrow.flight`)
+- [x] Fluent API (`.filter()`, `.group_by()`, `.select()`,
+      `.fetch()`) — §3.2 (immutable `Query` composer → `pyarrow.Table`)
+- [x] Lazy execution (composes SQL fragments until `.fetch()`) —
       §3.2
-- [ ] Session token management — §3.2
-- [ ] Dynamic metric definition (`session.define(name, expr)`) —
-      §3.2
-- [ ] Result conversion: `to_arrow()`, `to_pandas()`,
-      `to_polars()`, `to_duckdb()` — §3.2
-- [ ] Context manager support (`with session: ...`) — §3.2
-- [ ] Decision: build on `ibis` or roll our own — §3.2
+- [x] Session token management — §3.2 (handshake mints a bearer the
+      client echoes on every RPC; transparent reopen+replay on
+      `SessionLost`; `close()`/`with` frees it server-side)
+- [x] Dynamic metric definition (`session.define(name, expr)`) —
+      §3.2 (folded into the base relation as a computed column, not a
+      textual macro — user aliases/identifiers untouched)
+- [x] Result conversion: `to_arrow()`, `to_pandas()`,
+      `to_polars()` — §3.2 (results are `pyarrow.Table`; `.to_pandas()`
+      native, `tk.to_polars()` zero-copy. `to_duckdb` deferred)
+- [x] Context manager support (`with session: ...`) — §3.2
+- [x] Decision: build on `ibis` or roll our own — §3.2 (rolled our own
+      thin SQL-fragment composer; the API passes SQL strings, so ibis's
+      typed-expression model would conflict. Optional ibis backend later)
+- [ ] `time_range=` on `session()` (absolute + relative windows) — §3.2
+      (resolves to a `WHERE __time >= … AND __time < …` predicate, so it
+      needs the `__time` alias above — or, until then, the discovered
+      timestamp column. Accept both **absolute** bounds (ISO strings /
+      `date` / `datetime`) and **relative** bounds resolved against `now()`
+      at call time — e.g. `time_range=("3w", "1w")` = "3 weeks ago to 1
+      week ago", giving IQL's `FROM <table> 3w 1w` ergonomics without
+      extending SQL. Relative grammar follows the established
+      observability convention (Splunk `earliest/latest`, Grafana
+      `now-3w`, ES date-math, Flux `range(start:-3w)`); a fluent
+      `.last("7d")` shorthand is optional sugar on top. The engine itself
+      already supports the semantics via standard `now() - INTERVAL`
+      arithmetic — verified — so this is purely client ergonomics.)
+- [ ] Python package CI (lint + unit tests; none exists yet) — §3.4
 
 ## Approximate aggregations
 
