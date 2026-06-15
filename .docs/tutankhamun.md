@@ -568,15 +568,30 @@ per-session caps, admission control at the front door, no spill-to-disk.
 
 **The three sub-decisions:**
 
-**Measurement.** Count engine allocations (group lookups, merge
-buffers, posting decode buffers, session-owned state) **plus** the
-mmap'd shard working set. When a shard is opened for a session, the
-forward-column file sizes (`metrics.arrow` byte size) are charged to
-that session's budget as a rough estimate of resident pressure. This
-is intentionally cheap to compute — no `/proc/self/smaps` polling, no
-per-page tracking — and closes Imhotep's known gap that operators
-report as "daemon configured for 8 GB uses 60 GB resident"
-([Imhotep `ARCHITECTURE.md` §6.3](../../imhotep/docs/modernization/ARCHITECTURE.md)).
+**Measurement.** Budget a query's **bounded concurrent working set**, not
+the volume of data it scans. The scan processes a query's shards in
+bounded-concurrency batches (`runtime::cpu_width()` shards at a time;
+`sql::scan::for_each_shard_batch`), dropping each batch — releasing its
+forward-column residency — before opening the next. A single
+span-*independent* envelope is reserved up front (`batch width × the
+largest selected shard's `num_docs` × a per-doc working-set estimate`)
+and held for the whole query, so an admitted query is guaranteed room to
+finish and querying all of history uses no more memory than one batch.
+This is intentionally cheap to compute — sizes come from shard metadata,
+no `/proc/self/smaps` polling, no per-page tracking.
+
+*Revised (was: charge each opened shard's `metrics.arrow` file size).*
+That summed the **whole span** of forward-column files and held them all
+at once — a full-history aggregate over a year of weekly shards reserved
+~3.6 GB and tripped the cap, even though only a bounded set is ever
+resident. It also conflated two concerns: `mmap`'d forward-column pages
+are demand-faulted and kernel-evictable, so they aren't the
+non-reclaimable heap that OOMs the daemon — their residency is bounded by
+the batch concurrency (a count), while the byte budget guards the heap
+working set (group lookups, accumulators, gathered output). This still
+closes Imhotep's "8 GB configured, 60 GB resident" gap
+([Imhotep `ARCHITECTURE.md` §6.3](../../imhotep/docs/modernization/ARCHITECTURE.md)),
+now without rejecting legitimate wide-span queries.
 
 **Limit-exceeded behaviour.** Hard enforcement, not advisory.
 

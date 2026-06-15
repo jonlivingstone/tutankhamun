@@ -1604,7 +1604,7 @@ async fn bitmap_cache_threads_into_both_exec_paths() {
     let ctx = super::session_context_with(SessionConfig::new().with_extension(Arc::clone(&cache)));
     ctx.register_table("trips", Arc::new(provider)).unwrap();
 
-    // Row scan with WHERE → TutankhamunExec → fetch_selected_shards → resolve.
+    // Row scan with WHERE → TutankhamunExec → for_each_shard_batch → resolve.
     // Two shards → two cold misses.
     ctx.sql("SELECT vendor_id FROM trips WHERE country = 'us'")
         .await
@@ -1632,4 +1632,126 @@ async fn bitmap_cache_threads_into_both_exec_paths() {
         "aggregate path reused the bitmaps the row scan cached"
     );
     assert_eq!(cache.misses(), 2, "no new misses");
+}
+
+/// Open a cache over a shard tree, returning the cache, its dataset URL, and
+/// the cache tempdir (kept alive by the caller).
+fn cache_for(root: &Path) -> (Cache, String, TempDir) {
+    let url = url::Url::from_directory_path(root)
+        .expect("absolute")
+        .to_string();
+    let registry = StorageRegistry::from_url(&url).expect("registry");
+    let cache_dir = tempfile::tempdir().expect("cache tmpdir");
+    let cache = Cache::open(
+        cache_dir.path().to_path_buf(),
+        registry.store(),
+        url.clone(),
+        u64::MAX,
+        crate::cache::Validation::Trust,
+    )
+    .expect("cache");
+    (cache, url, cache_dir)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_envelope_is_span_independent_and_released() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::memory::{MemoryBudget, SessionMemoryHandle};
+    use crate::sql::scan::{for_each_shard_batch, scan_batch_width};
+
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+    let (cache, url, _cache_dir) = cache_for(tmp.path());
+
+    // Shard A has 4 docs, shard B has 2; width is 1 in tests (no Rayon pool).
+    // The bounded envelope is width × max_docs(4) × per_doc, independent of the
+    // 6-doc span; the old reservation summed both shards (held at once).
+    let per_doc = 8u64;
+    let width = scan_batch_width();
+    let envelope = (width as u64) * 4 * per_doc;
+
+    // A cap that admits the envelope; assert it's held during the scan and
+    // released after, and that no batch exceeds the width.
+    let handle = Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(1 << 30)),
+        envelope + 1,
+    ));
+    let peak = AtomicU64::new(0);
+    for_each_shard_batch(&url, &cache, &[], Some(&handle), None, per_doc, |chunk| {
+        assert!(
+            chunk.len() <= width.max(1),
+            "residency bounded to the width"
+        );
+        peak.fetch_max(handle.used(), Ordering::AcqRel);
+        Ok(())
+    })
+    .await
+    .expect("admitted: envelope fits the cap");
+    assert_eq!(
+        peak.load(Ordering::Acquire),
+        envelope,
+        "exactly the bounded envelope held during the scan"
+    );
+    assert_eq!(handle.used(), 0, "reservation released after the scan");
+
+    // A cap below the envelope is refused up front — admission control intact.
+    let tight = Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(1 << 30)),
+        envelope - 1,
+    ));
+    let err = for_each_shard_batch(&url, &cache, &[], Some(&tight), None, per_doc, |_| Ok(()))
+        .await
+        .expect_err("envelope exceeds the cap");
+    assert!(err.to_string().contains("budget exceeded"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grouped_aggregate_completes_under_a_cap_below_the_shard_sum() {
+    use crate::memory::{MemoryBudget, SessionMemoryHandle};
+    use crate::shard::METRICS_FILE;
+
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_two_shard_dataset(tmp.path());
+
+    // Cap the session just under the sum of both shards' forward-column files.
+    // The old code reserved that whole sum at once (and would be refused here);
+    // the new bounded envelope (≈ one batch's working set) is far smaller, so
+    // the query runs through the real FtgsAggExec to completion.
+    let shard_sum: u64 = ["a", "b"]
+        .iter()
+        .map(|s| {
+            std::fs::metadata(tmp.path().join(s).join(METRICS_FILE))
+                .expect("metrics.arrow")
+                .len()
+        })
+        .sum();
+    let cap = shard_sum.saturating_sub(1).max(1);
+
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+    let handle = Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(1 << 30)),
+        cap,
+    ));
+    let config = SessionConfig::new().with_extension(handle);
+    let ctx = SessionContext::new_with_config(config);
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let batches = ctx
+        .sql(
+            "SELECT vendor_id, count(*) AS n, sum(fare) AS f \
+             FROM trips GROUP BY vendor_id ORDER BY vendor_id",
+        )
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .expect("aggregate completes under the tight cap");
+
+    // Three vendor groups: 1 → (2, 400), 2 → (2, 600), 3 → (2, 1100).
+    let total: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(total, 3, "three vendor groups");
 }

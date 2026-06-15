@@ -6,7 +6,7 @@ use tempfile::TempDir;
 
 use super::{
     FtgsRow, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats, ftgs_scan,
-    ftgs_scan_merge, merge_ftgs, render_term,
+    ftgs_scan_merge, merge_ftgs, merge_into, render_term,
 };
 use crate::group_lookup::GroupLookup;
 use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
@@ -465,6 +465,24 @@ fn single_shard_merge_equals_scan() {
         &[StatSpec::Sum("revenue")],
     );
     assert_eq!(rendered(&merged), rendered(&scanned));
+}
+
+#[test]
+fn merge_into_fold_equals_merge_all_at_once() {
+    // Streaming the merge batch-by-batch (`merge_into`) must equal merging
+    // every partial in one shot (`merge_ftgs`) — the associativity guard the
+    // bounded-memory aggregate fold relies on.
+    let (_tmp, shard) = setup();
+    let gb = ["country"];
+    let specs = [StatSpec::Sum("revenue")];
+    let scan = ftgs_scan(&shard, &groups_5(), &gb, &specs).unwrap();
+
+    let all_at_once = merge_ftgs(vec![scan.clone(), scan.clone(), scan.clone()], &gb, &specs);
+    let mut folded: Vec<FtgsRow> = Vec::new();
+    for _ in 0..3 {
+        folded = merge_into(folded, vec![scan.clone()], &gb, &specs);
+    }
+    assert_eq!(rendered(&folded), rendered(&all_at_once));
 }
 
 #[test]

@@ -26,7 +26,7 @@ use datafusion::physical_plan::{
 };
 
 use super::pushdown::PushedFilter;
-use super::scan::{block_on_scan, chunked_stream, fetch_selected_shards};
+use super::scan::{block_on_scan, chunked_stream, for_each_shard_batch};
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::memory::SessionMemoryHandle;
@@ -139,18 +139,27 @@ async fn collect_batches(
     mem: Option<&Arc<SessionMemoryHandle>>,
     bitmap_cache: Option<&Arc<BitmapCache>>,
 ) -> anyhow::Result<Vec<RecordBatch>> {
-    // `_reservations` holds the per-shard memory charge for the scan; it drops
-    // (releasing the budget) when this function returns, after the batches are
-    // built from the now-resident shards.
-    let (shards, _reservations) =
-        fetch_selected_shards(url, cache, pushed, mem, bitmap_cache).await?;
-    let mut batches = Vec::with_capacity(shards.len());
-    for (shard, selection) in &shards {
-        let batch = build_record_batch(shard, selection, projected_schema)?;
-        if batch.num_rows() > 0 {
-            batches.push(batch);
+    // Stream shards in bounded batches so forward-column *residency* stays
+    // bounded to `scan_batch_width` shards regardless of span. NOTE: the
+    // assembled output still accumulates into one `Vec<RecordBatch>` — an
+    // unbounded `SELECT *` holds the full result in memory before streaming.
+    // Bounding that (output backpressure) is a separate concern, not handled here.
+    let mut batches = Vec::new();
+    // Per-doc heap estimate for the bounded envelope (§2.2): each projected
+    // column gathers ~8 bytes per matched doc (i64/timestamp). Strings are
+    // term-deduplicated, so counting them at 8 B/doc over-estimates — keeping
+    // the bound conservative.
+    let per_doc = (projected_schema.fields().len().max(1) * std::mem::size_of::<i64>()) as u64;
+    for_each_shard_batch(url, cache, pushed, mem, bitmap_cache, per_doc, |chunk| {
+        for (shard, selection) in chunk {
+            let batch = build_record_batch(shard, selection, projected_schema)?;
+            if batch.num_rows() > 0 {
+                batches.push(batch);
+            }
         }
-    }
+        Ok(())
+    })
+    .await?;
     Ok(batches)
 }
 

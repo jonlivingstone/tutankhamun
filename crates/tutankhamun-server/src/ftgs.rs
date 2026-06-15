@@ -785,23 +785,57 @@ pub fn ftgs_scan_merge(
     group_by: &[&str],
     stats: &[StatSpec],
 ) -> Result<Vec<FtgsRow>> {
-    // par_iter preserves input order, so `per_shard` is positionally
-    // identical to the sequential form — and `merge_ftgs` is order-
-    // independent regardless — so the branch can't change the result.
-    let per_shard: Vec<Vec<FtgsRow>> = if runtime::rayon_ready() {
+    Ok(merge_ftgs(
+        ftgs_scan_batch(shards, group_by, stats)?,
+        group_by,
+        stats,
+    ))
+}
+
+/// Run [`ftgs_scan`] over each `(shard, groups)` pair and return the per-shard
+/// results **without merging** — so a streaming caller can fold one batch's
+/// partials into a running result (via [`merge_into`]) and drop the batch's
+/// shards before opening the next. Each shard's scan is single-threaded; the
+/// shards run in parallel on the bounded Rayon pool when initialised (the
+/// daemon), else sequentially (tests / non-`serve` CLI).
+pub fn ftgs_scan_batch(
+    shards: &[(&dyn Shard, &GroupLookup)],
+    group_by: &[&str],
+    stats: &[StatSpec],
+) -> Result<Vec<Vec<FtgsRow>>> {
+    // par_iter preserves input order, so the result is positionally identical
+    // to the sequential form — and `merge_ftgs` is order-independent anyway.
+    if runtime::rayon_ready() {
         runtime::run_cpu(|| {
             shards
                 .par_iter()
                 .map(|(shard, groups)| ftgs_scan(*shard, groups, group_by, stats))
                 .collect::<Result<Vec<_>>>()
-        })?
+        })
     } else {
         shards
             .iter()
             .map(|(shard, groups)| ftgs_scan(*shard, groups, group_by, stats))
-            .collect::<Result<Vec<_>>>()?
-    };
-    Ok(merge_ftgs(per_shard, group_by, stats))
+            .collect::<Result<Vec<_>>>()
+    }
+}
+
+/// Fold one batch's per-shard partials into an already-merged running result.
+/// `acc` is itself sorted by the canonical `(field, term, group)` key (it's a
+/// prior [`merge_ftgs`] output), so it's just one more sorted input to the same
+/// k-way merge — `combine_stats` is associative, so streaming the merge batch
+/// by batch yields the same result as merging every partial at once. Lets the
+/// aggregate keep only the running result + one batch resident, not Σ(partials).
+#[must_use]
+pub fn merge_into(
+    acc: Vec<FtgsRow>,
+    batch_partials: Vec<Vec<FtgsRow>>,
+    group_by: &[&str],
+    stats: &[StatSpec],
+) -> Vec<FtgsRow> {
+    let mut inputs = batch_partials;
+    inputs.push(acc);
+    merge_ftgs(inputs, group_by, stats)
 }
 
 /// N-way sorted merge of per-shard FTGS results into one sorted stream,

@@ -13,9 +13,15 @@
 //! the daemon. Admission control reserves a session's baseline through the
 //! handle at open time; if that fails the daemon is at capacity.
 //!
-//! v1 charges the resident forward-column working set (the `metrics.arrow`
-//! byte size) at shard open. Transient FTGS group/stat buffers route through
-//! the same API as they are wired up (§2.5).
+//! Reservations charge a query's **bounded working set**, not the volume of
+//! data it scans. The scan ([`crate::sql::scan::for_each_shard_batch`])
+//! processes shards in bounded-concurrency batches and reserves a
+//! span-independent envelope up front (`batch width × largest shard's num_docs
+//! × a per-doc working-set estimate`), held for the whole query — so an
+//! admitted query is guaranteed room to finish and querying all of history
+//! uses no more memory than querying one batch. (mmap'd forward-column pages are
+//! demand-faulted and kernel-evictable; their residency is bounded by the batch
+//! concurrency, not byte-charged here.)
 
 use std::fmt;
 use std::sync::Arc;

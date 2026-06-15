@@ -124,14 +124,27 @@ directly.
       (`--max-session-memory-pct` / `TUT_MAX_SESSION_MEMORY_PCT`; global
       cap is `--memory-limit` / `TUT_MEMORY_LIMIT`, an absolute size,
       default 4GB — percent-of-RAM deferred)
-- [x] mmap accounting via forward-column file sizes on shard open
-      — §2.2 (the per-session handle threads to the otherwise
-      session-agnostic execs as a `DataFusion` `SessionConfig` extension;
-      `fetch_selected_shards` charges each opened shard's `metrics.arrow`
-      byte size and holds the reservation alongside the shard, so an
-      over-budget scan fails — per-query, session survives — and the
-      charge releases when the shard drops. The `t9n sql` CLI sets no
-      extension and charges nothing)
+- [x] Bounded working-set reservation (span-independent) — §2.2 (the
+      per-session handle threads to the otherwise session-agnostic execs as
+      a `DataFusion` `SessionConfig` extension. The scan
+      (`sql::scan::for_each_shard_batch`) processes shards in
+      bounded-concurrency batches (`runtime::cpu_width()` at a time),
+      dropping each batch's forward-column residency before the next, and
+      reserves one span-independent envelope up front — `batch width ×
+      largest shard's num_docs × per-doc estimate` — held for the whole
+      query, so an admitted query has room to finish and a full-history
+      aggregate runs in bounded memory. The `t9n sql` CLI sets no extension
+      and charges nothing.
+      *Supersedes the original "charge each shard's `metrics.arrow` file
+      size" model, which summed the whole span and held it at once —
+      tripping the cap on wide-span queries and byte-charging evictable
+      `mmap` pages as if heap.*)
+- [ ] Project-aware / true-heap working-set accounting — §2.2 (the v1
+      envelope is a conservative `num_docs`-derived proxy; refine to charge
+      the realized heap — gathered output, group/stat buffers — and only the
+      projected columns, so the estimate tracks actual allocation more
+      tightly. Bounding the row-scan *output* `Vec<RecordBatch>` for an
+      unbounded `SELECT *` (output backpressure) is the related follow-up.)
 
 ## Engine — group lookup
 

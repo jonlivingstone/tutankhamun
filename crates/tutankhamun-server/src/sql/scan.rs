@@ -2,10 +2,10 @@
 //! ([`super::exec`]) and the pushed-down aggregate ([`super::ftgs_agg`]).
 //!
 //! Holds the synchronous-`execute` → async bridge ([`block_on_scan`]), the
-//! discover → time-prune → fetch → resolve-filters step
-//! ([`fetch_selected_shards`]), and the bounded record-batch streaming
-//! ([`chunked_stream`]). Neither exec depends on the other — both depend on
-//! this neutral module.
+//! bounded-concurrency shard driver ([`for_each_shard_batch`]) that discovers,
+//! time-prunes, and streams shards in batches, and the bounded record-batch
+//! streaming ([`chunked_stream`]). Neither exec depends on the other — both
+//! depend on this neutral module.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -20,9 +20,10 @@ use datafusion::physical_plan::memory::MemoryStream;
 use super::pushdown::{PushedFilter, PushedOp};
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
-use crate::memory::{SessionMemoryHandle, SessionReservation};
-use crate::shard::{DiskShard, FilterClause, FilterResult, METRICS_FILE, matched_doc_set};
-use crate::shard_source::{ObjectStoreShardSource, ShardSource};
+use crate::memory::SessionMemoryHandle;
+use crate::runtime;
+use crate::shard::{DiskShard, FilterClause, FilterResult, matched_doc_set};
+use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
 use crate::storage::StorageRegistry;
 
 /// Run a scan's async work to completion from `DataFusion`'s
@@ -53,66 +54,113 @@ where
     .map_err(|e| DataFusionError::External(e.into()))
 }
 
-/// Discover the dataset's shards, prune by time, fetch + open each, and
-/// resolve the pushed filters to a matched-doc set. The shared prelude
-/// for both the row scan ([`collect_batches`]) and the FTGS aggregate
-/// ([`aggregate_batch`]).
+/// Per-batch shard concurrency: how many shards are opened/resident at once.
+/// The Rayon pool width (so each batch's `par_iter` saturates the pool without
+/// over-opening) on the daemon, else 1 (sequential — tests / non-`serve` CLI,
+/// where a wider batch only grows residency).
+pub(crate) fn scan_batch_width() -> usize {
+    if runtime::rayon_ready() {
+        runtime::cpu_width().max(1)
+    } else {
+        1
+    }
+}
+
+/// Does the query's time window (if any) intersect this shard's time range?
+/// `true` when there's no time predicate or no time field — pruning only ever
+/// skips shards that provably hold no matching doc.
+fn intersects_query_window(summary: &ShardSummary, pushed: &[PushedFilter]) -> bool {
+    summary
+        .metadata
+        .time_field
+        .as_deref()
+        .and_then(|time_field| time_window(pushed, time_field))
+        .is_none_or(|(from, to)| summary.intersects_time_range(from, to))
+}
+
+/// Drive a query over its shards in **bounded-concurrency batches**, calling
+/// `work` with each batch's opened shards (and their resolved matched-doc sets)
+/// and dropping the batch — releasing its forward-column residency — before the
+/// next one. Peak resident shards = [`scan_batch_width`], independent of how
+/// many shards the query spans. The shared prelude for both the row scan
+/// ([`collect_batches`]) and the FTGS aggregate ([`aggregate_batch`]).
 ///
-/// When `mem` is set (the daemon data plane — §2.2), each opened shard's
-/// forward-column working set (`metrics.arrow` byte size) is reserved against
-/// the session budget; a query that would exceed it fails here rather than
-/// letting resident memory blow past the cap. The reservations are returned
-/// alongside the shards so the
-/// charge is held exactly as long as the shards are resident and released when
-/// the caller drops them. `None` (the `t9n sql` CLI) charges nothing.
+/// Memory (§2.2): when `mem` is set (the daemon data plane), a single bounded
+/// working-set **envelope** is reserved up front — `width × largest selected
+/// shard's num_docs × per_doc_bytes` — and held for the whole query. It is
+/// span-independent (it bounds the *concurrent* working set, not the total data
+/// scanned), so an admitted query is guaranteed room to finish; an over-cap
+/// query is refused here. `per_doc_bytes` is the caller's estimate of the heap
+/// working set a doc contributes (gathered columns / group + stat buffers).
+/// `None` (the `t9n sql` CLI) charges nothing.
 ///
 /// When `bitmap_cache` is set, the matched-doc set is served through the §2.8
-/// cache (exact hit or monotone-narrowing reuse) instead of always rescanning the
-/// inverted index; `None` resolves directly via [`matched_doc_set`].
-pub(crate) async fn fetch_selected_shards(
+/// cache (exact hit or monotone-narrowing reuse); `None` resolves directly via
+/// [`matched_doc_set`].
+pub(crate) async fn for_each_shard_batch<F>(
     url: &str,
     cache: &Cache,
     pushed: &[PushedFilter],
     mem: Option<&Arc<SessionMemoryHandle>>,
     bitmap_cache: Option<&Arc<BitmapCache>>,
-) -> anyhow::Result<(Vec<(DiskShard, FilterResult)>, Vec<SessionReservation>)> {
+    per_doc_bytes: u64,
+    mut work: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(&[(DiskShard, FilterResult)]) -> anyhow::Result<()>,
+{
     let registry = StorageRegistry::from_url(url)?;
     let source = ObjectStoreShardSource::new(registry.store());
     let summaries = source.discover().await?;
+    // Time-prune up front (cheap — metadata only), so the envelope and batching
+    // see only the shards the query can actually touch.
+    let selected: Vec<&ShardSummary> = summaries
+        .iter()
+        .filter(|s| intersects_query_window(s, pushed))
+        .collect();
 
-    let mut out = Vec::with_capacity(summaries.len());
-    let mut reservations = Vec::new();
-    for summary in &summaries {
-        // Prune whole shards before fetching them: if the query
-        // constrains the time field to a window that the shard's
-        // `[time_range_start, time_range_end]` can't intersect, the
-        // shard has no matching docs and we skip the cache fetch
-        // entirely.
-        if let Some(time_field) = summary.metadata.time_field.as_deref()
-            && let Some((from, to)) = time_window(pushed, time_field)
-            && !summary.intersects_time_range(from, to)
-        {
-            continue;
+    let width = scan_batch_width();
+
+    // Reserve the bounded working-set envelope once, up front, and hold it for
+    // the whole query: at most `width` shards resident at a time, each no larger
+    // than the biggest selected shard. Span-independent — querying all history
+    // costs the same as querying one batch — so admission gates on a bounded
+    // number and an admitted query is guaranteed room.
+    let _envelope = match mem {
+        Some(handle) => {
+            let max_docs = selected
+                .iter()
+                .map(|s| s.metadata.num_docs)
+                .max()
+                .unwrap_or(0);
+            let bytes = (width as u64)
+                .saturating_mul(max_docs)
+                .saturating_mul(per_doc_bytes);
+            Some(handle.reserve(bytes).map_err(|e| anyhow::anyhow!(e))?)
         }
-        let local_dir = cache.fetch_shard(summary).await?;
-        let shard = DiskShard::open(&local_dir)?;
-        if let Some(handle) = mem {
-            // Rough resident estimate: the forward-column file size (§2.2). A
-            // missing file (statless edge) charges nothing rather than failing.
-            let bytes = std::fs::metadata(local_dir.join(METRICS_FILE)).map_or(0, |m| m.len());
-            reservations.push(handle.reserve(bytes).map_err(|e| anyhow::anyhow!(e))?);
+        None => None,
+    };
+
+    for chunk in selected.chunks(width) {
+        let mut shards: Vec<(DiskShard, FilterResult)> = Vec::with_capacity(chunk.len());
+        for summary in chunk {
+            let local_dir = cache.fetch_shard(summary).await?;
+            let shard = DiskShard::open(&local_dir)?;
+            let selection = if let Some(bc) = bitmap_cache {
+                let id = BitmapCache::shard_id(url, summary.location.as_ref());
+                bc.resolve(&shard, id, pushed)?
+            } else {
+                let clauses: Vec<FilterClause<'_>> =
+                    pushed.iter().map(PushedFilter::as_clause).collect();
+                matched_doc_set(&shard, &clauses)?
+            };
+            shards.push((shard, selection));
         }
-        let selection = if let Some(bc) = bitmap_cache {
-            let id = BitmapCache::shard_id(url, summary.location.as_ref());
-            bc.resolve(&shard, id, pushed)?
-        } else {
-            let clauses: Vec<FilterClause<'_>> =
-                pushed.iter().map(PushedFilter::as_clause).collect();
-            matched_doc_set(&shard, &clauses)?
-        };
-        out.push((shard, selection));
+        work(&shards)?;
+        // `shards` drops here, releasing this batch's forward-column residency
+        // before the next batch opens.
     }
-    Ok((out, reservations))
+    Ok(())
 }
 
 /// Split a batch into `<= batch_size`-row slices for streaming. Zero-copy —

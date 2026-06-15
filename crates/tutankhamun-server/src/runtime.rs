@@ -39,6 +39,14 @@ pub fn rayon_ready() -> bool {
     RAYON_POOL.get().is_some()
 }
 
+/// Width of the bounded Rayon pool — the natural per-batch concurrency for
+/// data-parallel work. Call only when [`rayon_ready`]; panics otherwise
+/// (same contract as the pool's other users).
+#[must_use]
+pub fn cpu_width() -> usize {
+    pool().current_num_threads()
+}
+
 /// Run a CPU-bound closure on the bounded Rayon pool, blocking until it
 /// returns. Unlike [`spawn_cpu`], the closure may borrow from the
 /// caller's stack (it runs synchronously), so this is the entry point
