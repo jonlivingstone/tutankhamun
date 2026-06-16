@@ -107,7 +107,7 @@ pub(crate) async fn for_each_shard_batch<F>(
     mut work: F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(&[(DiskShard, FilterResult)]) -> anyhow::Result<()>,
+    F: FnMut(&[(u64, DiskShard, FilterResult)]) -> anyhow::Result<()>,
 {
     let registry = StorageRegistry::from_url(url)?;
     let source = ObjectStoreShardSource::new(registry.store());
@@ -142,19 +142,19 @@ where
     };
 
     for chunk in selected.chunks(width) {
-        let mut shards: Vec<(DiskShard, FilterResult)> = Vec::with_capacity(chunk.len());
+        let mut shards: Vec<(u64, DiskShard, FilterResult)> = Vec::with_capacity(chunk.len());
         for summary in chunk {
+            let id = BitmapCache::shard_id(url, summary.location.as_ref());
             let local_dir = cache.fetch_shard(summary).await?;
             let shard = DiskShard::open(&local_dir)?;
             let selection = if let Some(bc) = bitmap_cache {
-                let id = BitmapCache::shard_id(url, summary.location.as_ref());
                 bc.resolve(&shard, id, pushed)?
             } else {
                 let clauses: Vec<FilterClause<'_>> =
                     pushed.iter().map(PushedFilter::as_clause).collect();
                 matched_doc_set(&shard, &clauses)?
             };
-            shards.push((shard, selection));
+            shards.push((id, shard, selection));
         }
         work(&shards)?;
         // `shards` drops here, releasing this batch's forward-column residency

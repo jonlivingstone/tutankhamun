@@ -2,6 +2,7 @@
 //!
 //! See `.docs/tutankhamun.md` for the design.
 
+pub mod aggregate_cache;
 pub mod bit_tree;
 pub mod bitmap_cache;
 pub mod cache;

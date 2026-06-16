@@ -44,6 +44,7 @@ pub struct StatusReport {
 pub struct MetricsSnapshot {
     pub memory: MemoryReport,
     pub bitmap_cache: CacheReport,
+    pub aggregate_cache: AggCacheReport,
     pub queries: QueriesReport,
 }
 
@@ -59,6 +60,15 @@ pub struct CacheReport {
     pub used_bytes: u64,
     pub hits: u64,
     pub narrows: u64,
+    pub misses: u64,
+}
+
+/// Per-shard aggregate cache state (no monotone-narrowing, unlike the bitmap
+/// cache — exact-shape match only).
+#[derive(Serialize)]
+pub struct AggCacheReport {
+    pub used_bytes: u64,
+    pub hits: u64,
     pub misses: u64,
 }
 

@@ -16,6 +16,7 @@ use futures::TryStreamExt;
 use roaring::RoaringBitmap;
 use tonic::transport::Channel;
 
+use tutankhamun_server::aggregate_cache::AggregateCache;
 use tutankhamun_server::bitmap_cache::BitmapCache;
 use tutankhamun_server::cache::Validation;
 use tutankhamun_server::flight_sql::{self, TutankhamunFlightSqlService};
@@ -110,7 +111,15 @@ async fn start_with_budget(
         Arc::clone(&mem),
         budget,
     ))));
-    let metrics = Metrics::new(Arc::clone(&mem), Arc::clone(&bitmap_cache));
+    let aggregate_cache = Arc::new(AggregateCache::new(Arc::new(SessionMemoryHandle::new(
+        Arc::clone(&mem),
+        budget,
+    ))));
+    let metrics = Metrics::new(
+        Arc::clone(&mem),
+        Arc::clone(&bitmap_cache),
+        Arc::clone(&aggregate_cache),
+    );
     let svc = TutankhamunFlightSqlService::new(
         storage_url,
         cache.path().to_path_buf(),
@@ -119,6 +128,7 @@ async fn start_with_budget(
         mem,
         100,
         bitmap_cache,
+        aggregate_cache,
         Arc::clone(&metrics),
     );
     let server = tokio::spawn({

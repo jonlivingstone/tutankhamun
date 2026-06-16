@@ -1449,6 +1449,7 @@ async fn theta_intersect_counts_cohort_overlap() {
 
 // ---- §2.8 doc-set bitmap cache ----
 
+use crate::aggregate_cache::AggregateCache;
 use crate::bitmap_cache::BitmapCache;
 use crate::memory::{MemoryBudget, SessionMemoryHandle};
 use crate::shard::{DiskShard, FilterResult, matched_doc_set};
@@ -1754,4 +1755,255 @@ async fn grouped_aggregate_completes_under_a_cap_below_the_shard_sum() {
         .map(arrow::array::RecordBatch::num_rows)
         .sum();
     assert_eq!(total, 3, "three vendor groups");
+}
+
+// ---- time-bucket GROUP BY pushdown (date_trunc on the time field) ----
+
+/// UTC-noon epoch seconds for `YYYY-MM-DD` (test helper).
+fn day_secs(date: &str) -> i64 {
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp()
+}
+
+/// Write one shard with a `ts` time field, a `payment` int, and a `fare` metric.
+/// The shard's `time_range` is the true (min, max) of `dates` — the
+/// shard-granular bucketing trusts it (as ingest guarantees in production).
+fn write_ts_shard(dir: &Path, dates: &[&str], payment: Vec<i64>, fare: Vec<i64>) {
+    let ts: Vec<i64> = dates.iter().map(|d| day_secs(d)).collect();
+    let range = (*ts.iter().min().unwrap(), *ts.iter().max().unwrap());
+    let mut w = DiskShardWriter::new(dir, range).expect("new");
+    w.add_int_field("ts", ts).expect("ts");
+    w.set_time_field("ts");
+    w.add_int_field("payment", payment).expect("payment");
+    w.add_metric("fare", fare).expect("fare");
+    w.finalize().expect("finalize");
+}
+
+/// Dataset spanning Jan–Mar 2024 across shards that exercise both bucketing
+/// paths: single-month shards (the shard-granular fast path) and one that
+/// straddles a month boundary (the per-doc path).
+fn write_months_dataset(root: &Path) {
+    write_ts_shard(
+        &root.join("a"),
+        &["2024-01-05", "2024-01-20"],
+        vec![1, 2],
+        vec![10, 20],
+    ); // all January
+    write_ts_shard(
+        &root.join("b"),
+        &["2024-02-10", "2024-02-25"],
+        vec![1, 1],
+        vec![30, 40],
+    ); // all February
+    write_ts_shard(
+        &root.join("c"),
+        &["2024-02-28", "2024-03-02"],
+        vec![2, 1],
+        vec![50, 60],
+    ); // straddles Feb/Mar
+}
+
+/// Correctness oracle: the pushed-down query (via `session_context`, which has
+/// the FTGS rule) must produce the same rows as `DataFusion`'s own aggregation
+/// over the row scan (a plain context, no rule). Confirms the query pushes down
+/// and that the FTGS time-bucket result matches `date_trunc` exactly.
+async fn pushdown_matches_fallback(root: &Path, sql: &str) {
+    use arrow::compute::concat_batches;
+
+    let (provider, _cache_dir) = provider_for(root).await;
+    let provider: Arc<dyn TableProvider> = Arc::new(provider);
+
+    let pushed = super::session_context();
+    pushed
+        .register_table("events", Arc::clone(&provider))
+        .unwrap();
+    let plain = SessionContext::new();
+    plain.register_table("events", provider).unwrap();
+
+    assert!(
+        physical_plan(&pushed, sql).await.contains("FtgsAggExec"),
+        "expected pushdown for: {sql}"
+    );
+    assert!(
+        !physical_plan(&plain, sql).await.contains("FtgsAggExec"),
+        "plain context should not push down"
+    );
+
+    let pb = pushed.sql(sql).await.unwrap().collect().await.unwrap();
+    let fb = plain.sql(sql).await.unwrap().collect().await.unwrap();
+    let p = concat_batches(&pb[0].schema(), &pb).unwrap();
+    let f = concat_batches(&fb[0].schema(), &fb).unwrap();
+    assert_eq!(p, f, "pushdown result must match DataFusion for: {sql}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_bucket_group_by_matches_datafusion() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_months_dataset(tmp.path());
+    // Each unit's FTGS truncation must match DataFusion's date_trunc exactly.
+    for unit in ["hour", "day", "week", "month", "quarter", "year"] {
+        let sql = format!(
+            "SELECT date_trunc('{unit}', ts) AS m, count(*) AS n, sum(fare) AS f \
+             FROM events GROUP BY date_trunc('{unit}', ts) ORDER BY m"
+        );
+        pushdown_matches_fallback(tmp.path(), &sql).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn time_bucket_with_categorical_matches_datafusion() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_months_dataset(tmp.path());
+    // Bucket combined with a categorical, in both column orders.
+    pushdown_matches_fallback(
+        tmp.path(),
+        "SELECT date_trunc('month', ts) AS m, payment, count(*) AS n, sum(fare) AS f \
+         FROM events GROUP BY date_trunc('month', ts), payment ORDER BY m, payment",
+    )
+    .await;
+    pushdown_matches_fallback(
+        tmp.path(),
+        "SELECT payment, date_trunc('month', ts) AS m, sum(fare) AS f \
+         FROM events GROUP BY payment, date_trunc('month', ts) ORDER BY payment, m",
+    )
+    .await;
+}
+
+/// Over the three-shard months dataset: a pushdown context wired with a fresh
+/// unbounded [`AggregateCache`], the cache handle, and a plain `DataFusion`
+/// context (same data, no pushdown) for parity. The returned `TempDir` (the
+/// shard cache) must be kept alive for the test.
+async fn months_cache_fixture(
+    root: &Path,
+) -> (SessionContext, SessionContext, Arc<AggregateCache>, TempDir) {
+    let (provider, cache_dir) = provider_for(root).await;
+    let provider: Arc<dyn TableProvider> = Arc::new(provider);
+    let agg = Arc::new(AggregateCache::new(Arc::new(SessionMemoryHandle::new(
+        Arc::new(MemoryBudget::new(u64::MAX)),
+        u64::MAX,
+    ))));
+    let pushed = super::session_context_with(SessionConfig::new().with_extension(Arc::clone(&agg)));
+    pushed
+        .register_table("events", Arc::clone(&provider))
+        .unwrap();
+    let plain = SessionContext::new();
+    plain.register_table("events", provider).unwrap();
+    (pushed, plain, agg, cache_dir)
+}
+
+/// Run `sql` twice and assert the per-shard [`AggregateCache`] does its job: the
+/// query pushes down, the first run computes one partial per shard (miss), the
+/// rerun serves every shard from cache (hit, no new misses), and the result is
+/// stable and matches a plain `DataFusion` aggregation.
+async fn assert_cached_rerun(
+    pushed: &SessionContext,
+    plain: &SessionContext,
+    agg: &AggregateCache,
+    sql: &str,
+    shards: u64,
+) {
+    use arrow::compute::concat_batches;
+
+    assert!(
+        physical_plan(pushed, sql).await.contains("FtgsAggExec"),
+        "must push down: {sql}"
+    );
+    let first = pushed.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(agg.hits(), 0, "nothing cached on the first run: {sql}");
+    assert_eq!(
+        agg.misses(),
+        shards,
+        "one compute per shard first run: {sql}"
+    );
+
+    let second = pushed.sql(sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(agg.hits(), shards, "every shard from cache on rerun: {sql}");
+    assert_eq!(agg.misses(), shards, "no fresh computes on rerun: {sql}");
+
+    let want = plain.sql(sql).await.unwrap().collect().await.unwrap();
+    let got = concat_batches(&first[0].schema(), &first).unwrap();
+    assert_eq!(
+        got,
+        concat_batches(&want[0].schema(), &want).unwrap(),
+        "matches DataFusion: {sql}"
+    );
+    assert_eq!(
+        got,
+        concat_batches(&second[0].schema(), &second).unwrap(),
+        "rerun result stable: {sql}"
+    );
+}
+
+/// Goal 1: a rerun of a time-bucket aggregate serves every shard's partial from
+/// the per-shard cache.
+#[tokio::test(flavor = "multi_thread")]
+async fn time_bucket_aggregate_cache_hits_on_rerun() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_months_dataset(tmp.path()); // three shards
+    let (pushed, plain, agg, _cache_dir) = months_cache_fixture(tmp.path()).await;
+    assert_cached_rerun(
+        &pushed,
+        &plain,
+        &agg,
+        "SELECT date_trunc('month', ts) AS m, sum(fare) AS f \
+         FROM events GROUP BY date_trunc('month', ts) ORDER BY m",
+        3,
+    )
+    .await;
+}
+
+/// Goal 2: a filtered time-bucket aggregate caches each shard's partial under the
+/// normalized filter, so the rerun hits per shard.
+#[tokio::test(flavor = "multi_thread")]
+async fn filtered_time_bucket_aggregate_cache_hits_on_rerun() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_months_dataset(tmp.path()); // three shards
+    let (pushed, plain, agg, _cache_dir) = months_cache_fixture(tmp.path()).await;
+    assert_cached_rerun(
+        &pushed,
+        &plain,
+        &agg,
+        "SELECT date_trunc('month', ts) AS m, sum(fare) AS f \
+         FROM events WHERE payment = 1 GROUP BY date_trunc('month', ts) ORDER BY m",
+        3,
+    )
+    .await;
+}
+
+/// The cache is not time-specific: a global aggregate (no `GROUP BY`) caches each
+/// shard's single-group partial and is served from cache on rerun.
+#[tokio::test(flavor = "multi_thread")]
+async fn global_aggregate_cache_hits_on_rerun() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_months_dataset(tmp.path()); // three shards
+    let (pushed, plain, agg, _cache_dir) = months_cache_fixture(tmp.path()).await;
+    assert_cached_rerun(
+        &pushed,
+        &plain,
+        &agg,
+        "SELECT sum(fare) AS f FROM events",
+        3,
+    )
+    .await;
+}
+
+/// The cache is not time-specific: a plain categorical `GROUP BY` (the FTGS
+/// cursor-walk path) caches each shard's partial and is served on rerun.
+#[tokio::test(flavor = "multi_thread")]
+async fn categorical_aggregate_cache_hits_on_rerun() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_months_dataset(tmp.path()); // three shards
+    let (pushed, plain, agg, _cache_dir) = months_cache_fixture(tmp.path()).await;
+    assert_cached_rerun(
+        &pushed,
+        &plain,
+        &agg,
+        "SELECT payment, sum(fare) AS f FROM events GROUP BY payment ORDER BY payment",
+        3,
+    )
+    .await;
 }

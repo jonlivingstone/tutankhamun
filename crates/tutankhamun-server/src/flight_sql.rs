@@ -68,6 +68,7 @@ use arrow_flight::{
 
 use object_store::ObjectStore;
 
+use crate::aggregate_cache::AggregateCache;
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::{Cache, Validation};
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
@@ -135,6 +136,9 @@ struct ServiceInner {
     /// Daemon-shared doc-set bitmap cache (§2.8); threaded into each context as a
     /// `SessionConfig` extension so the scan can probe it.
     bitmap_cache: Arc<BitmapCache>,
+    /// Daemon-shared per-shard aggregate cache; threaded into each context as a
+    /// `SessionConfig` extension so the time-bucket aggregate path can probe it.
+    aggregate_cache: Arc<AggregateCache>,
     /// Daemon metrics (§3.4): session gauge + query latency/counters.
     metrics: Arc<Metrics>,
 }
@@ -317,6 +321,7 @@ impl TutankhamunFlightSqlService {
         budget: Arc<MemoryBudget>,
         session_pct: u8,
         bitmap_cache: Arc<BitmapCache>,
+        aggregate_cache: Arc<AggregateCache>,
         metrics: Arc<Metrics>,
     ) -> Self {
         Self {
@@ -331,6 +336,7 @@ impl TutankhamunFlightSqlService {
                 budget,
                 session_pct,
                 bitmap_cache,
+                aggregate_cache,
                 metrics,
             }),
         }
@@ -364,7 +370,8 @@ impl TutankhamunFlightSqlService {
     fn build_context(&self, mem: Arc<SessionMemoryHandle>) -> SessionContext {
         let config = SessionConfig::new()
             .with_extension(mem)
-            .with_extension(Arc::clone(&self.inner.bitmap_cache));
+            .with_extension(Arc::clone(&self.inner.bitmap_cache))
+            .with_extension(Arc::clone(&self.inner.aggregate_cache));
         let ctx = sql::session_context_with(config);
         let provider = Arc::new(DatasetSchemaProvider {
             inner: Arc::clone(&self.inner),
@@ -1216,7 +1223,15 @@ mod tests {
             Arc::clone(&budget),
             limit,
         ))));
-        let metrics = Metrics::new(Arc::clone(&budget), Arc::clone(&bitmap_cache));
+        let aggregate_cache = Arc::new(AggregateCache::new(Arc::new(SessionMemoryHandle::new(
+            Arc::clone(&budget),
+            limit,
+        ))));
+        let metrics = Metrics::new(
+            Arc::clone(&budget),
+            Arc::clone(&bitmap_cache),
+            Arc::clone(&aggregate_cache),
+        );
         TutankhamunFlightSqlService::new(
             "memory:///".to_string(),
             std::env::temp_dir().join("t9n-session-test"),
@@ -1225,6 +1240,7 @@ mod tests {
             budget,
             100, // per-session cap = 100% of global, so tests bind on the global
             bitmap_cache,
+            aggregate_cache,
             metrics,
         )
     }

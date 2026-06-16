@@ -10,6 +10,7 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use tracing::{error, info, warn};
 
+use tutankhamun_server::aggregate_cache;
 use tutankhamun_server::bitmap_cache;
 use tutankhamun_server::cache;
 use tutankhamun_server::config::{Config, ServeArgs, env_vars};
@@ -374,6 +375,41 @@ fn run_serve(args: &ServeArgs) -> anyhow::Result<()> {
     runtime.block_on(serve(config))
 }
 
+/// A capped sub-budget handle off the global budget, for a daemon-shared cache.
+fn sub_budget(budget: &Arc<memory::MemoryBudget>, cap: u64) -> Arc<memory::SessionMemoryHandle> {
+    Arc::new(memory::SessionMemoryHandle::new(Arc::clone(budget), cap))
+}
+
+/// The global memory budget plus the daemon-shared caches and metrics that hang
+/// off it. The §2.8 doc-set bitmap cache and the per-shard aggregate cache EACH
+/// get their own `cache_pct`%-of-`mem_limit` sub-budget (so caching can total up
+/// to `2 × cache_pct`%, still hard-capped by the global budget they both draw
+/// from). Separate slices, not a shared pool: each cache only knows its own
+/// entries, so it can only LRU-evict its own — a shared cap would let one cache
+/// fill the pool and the other be unable to free it. See Tech debt in the roadmap.
+fn build_budget_and_caches(
+    mem_limit: u64,
+    cache_pct: u8,
+) -> (
+    Arc<memory::MemoryBudget>,
+    Arc<bitmap_cache::BitmapCache>,
+    Arc<aggregate_cache::AggregateCache>,
+    Arc<metrics::Metrics>,
+) {
+    let budget = Arc::new(memory::MemoryBudget::new(mem_limit));
+    let cap = mem_limit.saturating_mul(u64::from(cache_pct)) / 100;
+    let bitmap_cache = Arc::new(bitmap_cache::BitmapCache::new(sub_budget(&budget, cap)));
+    let aggregate_cache = Arc::new(aggregate_cache::AggregateCache::new(sub_budget(
+        &budget, cap,
+    )));
+    let metrics = metrics::Metrics::new(
+        Arc::clone(&budget),
+        Arc::clone(&bitmap_cache),
+        Arc::clone(&aggregate_cache),
+    );
+    (budget, bitmap_cache, aggregate_cache, metrics)
+}
+
 async fn serve(config: Config) -> anyhow::Result<()> {
     let storage = Arc::new(StorageRegistry::from_url(&config.storage_url)?);
     info!(storage_url = %config.storage_url, "storage backend ready");
@@ -396,14 +432,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     if cache_pct > 100 {
         anyhow::bail!("--bitmap-cache-pct must be between 0 and 100 (got {cache_pct})");
     }
-    let budget = Arc::new(memory::MemoryBudget::new(mem_limit));
-    // Daemon-shared doc-set bitmap cache (§2.8), bounded by a sub-budget of the
-    // global limit so it competes with session working sets and LRU-evicts.
-    let bitmap_cache_cap = mem_limit.saturating_mul(u64::from(cache_pct)) / 100;
-    let bitmap_cache = Arc::new(bitmap_cache::BitmapCache::new(Arc::new(
-        memory::SessionMemoryHandle::new(Arc::clone(&budget), bitmap_cache_cap),
-    )));
-    let metrics = metrics::Metrics::new(Arc::clone(&budget), Arc::clone(&bitmap_cache));
+    let (budget, bitmap_cache, aggregate_cache, metrics) =
+        build_budget_and_caches(mem_limit, cache_pct);
     info!(
         bytes = mem_limit,
         per_session_pct = pct,
@@ -428,6 +458,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
         budget,
         pct,
         bitmap_cache,
+        aggregate_cache,
         Arc::clone(&metrics),
     );
 

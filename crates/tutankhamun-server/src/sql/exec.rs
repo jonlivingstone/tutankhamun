@@ -151,7 +151,7 @@ async fn collect_batches(
     // the bound conservative.
     let per_doc = (projected_schema.fields().len().max(1) * std::mem::size_of::<i64>()) as u64;
     for_each_shard_batch(url, cache, pushed, mem, bitmap_cache, per_doc, |chunk| {
-        for (shard, selection) in chunk {
+        for (_id, shard, selection) in chunk {
             let batch = build_record_batch(shard, selection, projected_schema)?;
             if batch.num_rows() > 0 {
                 batches.push(batch);

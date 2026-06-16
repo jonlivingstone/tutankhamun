@@ -16,9 +16,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::aggregate_cache::AggregateCache;
 use crate::bitmap_cache::BitmapCache;
 use crate::memory::MemoryBudget;
-use crate::status::{CacheReport, MemoryReport, MetricsSnapshot, QueriesReport, RecentQueryView};
+use crate::status::{
+    AggCacheReport, CacheReport, MemoryReport, MetricsSnapshot, QueriesReport, RecentQueryView,
+};
 
 /// Most-recent queries retained for the `/status` page (§3.5). Bounded and small —
 /// status-only, never part of the Prometheus exposition.
@@ -88,6 +91,7 @@ impl Histogram {
 pub struct Metrics {
     budget: Arc<MemoryBudget>,
     bitmap_cache: Arc<BitmapCache>,
+    aggregate_cache: Arc<AggregateCache>,
     live_sessions: AtomicU64,
     query_latency: Histogram,
     queries_total: AtomicU64,
@@ -108,10 +112,15 @@ struct RecentQuery {
 
 impl Metrics {
     #[must_use]
-    pub fn new(budget: Arc<MemoryBudget>, bitmap_cache: Arc<BitmapCache>) -> Arc<Self> {
+    pub fn new(
+        budget: Arc<MemoryBudget>,
+        bitmap_cache: Arc<BitmapCache>,
+        aggregate_cache: Arc<AggregateCache>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             budget,
             bitmap_cache,
+            aggregate_cache,
             live_sessions: AtomicU64::new(0),
             query_latency: Histogram::default(),
             queries_total: AtomicU64::new(0),
@@ -196,6 +205,11 @@ impl Metrics {
                 narrows: self.bitmap_cache.narrows(),
                 misses: self.bitmap_cache.misses(),
             },
+            aggregate_cache: AggCacheReport {
+                used_bytes: self.aggregate_cache.used_bytes(),
+                hits: self.aggregate_cache.hits(),
+                misses: self.aggregate_cache.misses(),
+            },
             queries: QueriesReport {
                 total: self.queries_total.load(Ordering::Relaxed),
                 errors: self.query_errors_total.load(Ordering::Relaxed),
@@ -261,6 +275,25 @@ impl Metrics {
             self.bitmap_cache.misses(),
         );
 
+        gauge(
+            &mut out,
+            "tut_aggregate_cache_used_bytes",
+            "Bytes held by the per-shard aggregate cache.",
+            self.aggregate_cache.used_bytes(),
+        );
+        counter(
+            &mut out,
+            "tut_aggregate_cache_hits_total",
+            "Per-shard aggregate cache hits.",
+            self.aggregate_cache.hits(),
+        );
+        counter(
+            &mut out,
+            "tut_aggregate_cache_misses_total",
+            "Per-shard aggregate cache misses (fresh per-shard aggregation).",
+            self.aggregate_cache.misses(),
+        );
+
         self.query_latency.render(
             &mut out,
             "tut_query_duration_seconds",
@@ -308,7 +341,11 @@ mod tests {
             Arc::clone(&budget),
             1000,
         ))));
-        Metrics::new(budget, cache)
+        let agg = Arc::new(AggregateCache::new(Arc::new(SessionMemoryHandle::new(
+            Arc::clone(&budget),
+            1000,
+        ))));
+        Metrics::new(budget, cache, agg)
     }
 
     #[test]

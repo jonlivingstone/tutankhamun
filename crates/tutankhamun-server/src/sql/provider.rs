@@ -51,6 +51,15 @@ impl TutankhamunTableProvider {
     pub(crate) fn field_kind(&self, field: &str) -> Option<FieldKind> {
         self.field_kinds.get(field).copied()
     }
+
+    /// Whether `field` is the dataset's time field — the one column the
+    /// schema presents as `Timestamp` (stored as epoch-seconds `Int`). Used
+    /// by the aggregate pushdown to validate `date_trunc(unit, <time>)`.
+    pub(crate) fn is_time_field(&self, field: &str) -> bool {
+        self.schema
+            .field_with_name(field)
+            .is_ok_and(|f| matches!(f.data_type(), DataType::Timestamp(_, _)))
+    }
 }
 
 impl TutankhamunTableProvider {

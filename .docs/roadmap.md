@@ -57,8 +57,13 @@ directly.
       format version, content hashes) — §2.1
 - [x] Forward column writer — uncompressed single-batch Arrow IPC
       via `arrow-rs` — §2.1
-- [x] Forward column reader — mmap via `memmap2` + zero-copy
-      `&[i64]` cast via `bytemuck` — §2.1
+- [~] Forward column reader — §2.1. **mmap zero-copy NOT implemented.**
+      `DiskShard::open` reads `metrics.arrow` into a heap `RecordBatch` via
+      Arrow `FileReader` (`shard/mod.rs`), not the `memmap2` + `bytemuck`
+      `&[i64]` path §2.1 specifies (`bytemuck` isn't even a dependency). The
+      indexes *are* mmap'd; the forward columns are not. This makes shard
+      `open` both slow and heap-heavy (measured: ~700ms warm / 11.5s cold to
+      open 62 nyc_taxi shards, ~3.7 GB heap). See Tech debt §1.
 - [x] Inverted index writer — `roaring` bitmaps per term + `fst`
       term dictionary — §2.1
 - [x] Inverted index reader — FST range scan + Roaring bitmap
@@ -293,6 +298,58 @@ directly.
       works on `String` args too, hashing the inverted-index terms (no forward
       column) so the sketch still merges across shards; unsupported shapes fall
       back to DataFusion)
+- [x] Time-bucket GROUP BY pushdown (`date_trunc`) — §3.2
+      (today `try_build` (group_by.rs) only pushes down `GROUP BY` of bare
+      `Expr::Column`s, so `GROUP BY date_trunc('month', <time>)` — a
+      `ScalarFunction` — falls back to a row scan: materialise every matching
+      row's time column + scale to ns, then DataFusion runs `date_trunc`
+      per row and hash-aggregates. For a year over weekly shards that's ~37M
+      rows for a 12-row answer. Recognise `date_trunc(unit, <time field>)` /
+      `date_bin(...)` on the dataset's time column as a **derived integer group
+      key** = the bucket-start epoch, computed per doc straight off the `i64`
+      time column in the FTGS scan (fixed units — second…week, and `date_bin`
+      — are integer truncation; month/year need chrono calendar math). Then
+      time-window aggregation runs natively, with low-cardinality output
+      (12 months / 52 weeks). This is the primary time-series query shape
+      (cf. Druid `__time` + granularity, ClickHouse `toStartOfMonth`).
+      Composes with the `__time` alias (above) and feeds the per-shard
+      partial-aggregate cube (Engine — FTGS) — a repeated time-window
+      aggregate then becomes near-free; without this pushdown the cube never
+      applies, since the query never reaches FTGS.
+      **Implemented:** `GroupKey`/`BucketUnit` + recognition of
+      `date_trunc('<unit>', <time field>)` for second…year (integer truncation
+      for second…day, chrono calendar math for week/month/quarter/year),
+      including mixed with categoricals; a shard-granular single-bucket fast
+      path (whole shard in one bucket → one group, no per-doc truncation); and
+      it feeds the per-shard aggregate cache. `date_bin` NOT recognised yet.
+      Synonyms (`__month` etc.) tracked separately below.)
+- [ ] Canonical time-bucket synonyms (`__year`/`__quarter`/`__month`/`__week`/
+      `__day`/`__hour`/`__minute`/`__second`) — §3.2
+      (today the time-bucket fast path fires only for the exact shape
+      `date_trunc('<unit>', <time field>)`; any near-miss a user writes
+      — `to_char(t,'YYYY-MM')`, `extract(year ...), extract(month ...)`,
+      `cast(date_trunc(...) as date)`, a timezone shift, an aliased wrap —
+      silently falls back to a full row scan with no cache and no signal. A
+      zero-arg synonym over the dataset's designated time field gives one
+      blessed, foot-gun-proof handle that *is* the fast path by construction.
+      Two surfaces:
+      - **GROUP BY**: `GROUP BY __month` → the `date_trunc('month', <time
+        field>)` bucket key (the existing pushdown).
+      - **WHERE**: `__month = '2024-01'` → the half-open range
+        `__time >= '2024-01-01' AND __time < '2024-02-01'` (and `>=`/`<=`/`IN`
+        forms), i.e. the pushdown-able predicate shape — so a drill-down can't
+        accidentally be written in a way that loses pushdown. Needs the
+        half-open exact-range filter (Tech debt / Layer 1a) to push down.
+      Implement as an AST rewrite keyed on the dataset's `metadata.time_field`,
+      done after parse / before planning (NOT virtual columns — they'd leak
+      into `SELECT *` and not help WHERE; NOT a pre-parse string regex — the
+      time field isn't known until the FROM is parsed). Shares the time-field
+      resolution with the `__time` alias above; `date_trunc` recognition stays
+      as best-effort compatibility, `__month` becomes the recommended form.
+      Out of scope for v1: cyclic/EXTRACT-style buckets (`__dow` day-of-week,
+      `__moy` month-of-year, `__hod` hour-of-day) — a different family that
+      partitions rather than truncates, so it doesn't roll up or range-select
+      like the nested truncation grains; revisit separately if needed.)
 - [~] FlightSQL service implementation — §3.2
       (ad-hoc statement path: `get_flight_info_statement` plans for the output
       schema and `do_get_statement` executes through the in-process DataFusion
@@ -550,3 +607,49 @@ v1 must respect so v2 is a localized change.
 - [ ] `Identity` type as a placeholder used by session lifecycle
       / admission control (v1's Identity = claimed username; v2
       makes it verified) — §1.6
+
+## Tech debt
+
+Known gaps and consolidations deferred from shipped work. Not features —
+cleanups/fixes we don't want to lose track of.
+
+1. **Forward columns read into heap, not mmap'd — §2.1.** `DiskShard::open`
+   parses `metrics.arrow` into a heap `RecordBatch` via Arrow `FileReader`
+   instead of the mmap + `bytemuck` zero-copy `&[i64]` path the design
+   specifies. Consequences, measured on 62 weekly nyc_taxi shards: shard
+   `open` is ~700ms warm / 11.5s cold and holds ~3.7 GB resident; and because
+   `open` happens fresh per query (the `Cache` caches files, not parsed
+   shards), it dominates query latency — e.g. a repeated `avg(fare_amount)`
+   spends ~85% of its time in `open`, swamping the aggregate cache's win. Fix:
+   mmap the single uncompressed batch and cast the values buffer to `&[i64]`
+   (the writer already enforces the one-batch invariant that makes this safe).
+   This makes `open` cheap *and* makes keeping shards resident ~free (page
+   cache, reclaimable), and speeds every query (row scans included), not just
+   repeated aggregates.
+2. **Aggregate-cache probe happens after shard open.** `cached_partial` is
+   called inside the scan's `work` callback, i.e. after `fetch_shard` +
+   `DiskShard::open`. The cache key's `shard_id` is derivable from the
+   discovery `ShardSummary` *without* opening the shard, so a full cache hit
+   could skip fetch+open entirely. Probe-before-open would make a cached
+   aggregate rerun near-instant. Lower priority once tech-debt §1 lands (mmap
+   makes open cheap regardless); revisit after.
+3. **`BitmapCache` and `AggregateCache` duplicate LRU machinery.** Two
+   daemon-shared caches with near-identical `Mutex<state>` + clock-LRU +
+   `reserve_with_eviction`/`evict_oldest` + byte accounting + counters,
+   differing only in key/value type and the bitmap cache's monotone-narrowing.
+   A shared `LruCache<K, V>` (budget + eviction + counters) with the two as
+   thin shims would remove the duplication. A bug in eviction must be fixed in
+   both today.
+4. **Filter normalization duplicated.** `aggregate_cache.rs` sorts+dedups its
+   filter clauses inline; `bitmap_cache.rs::normalize` does the same. Move the
+   canonicalization next to `PushedFilter` (`sql/pushdown.rs`) and have both
+   caches call it, so the set-semantics policy lives in one place. (Folds into
+   §3 if that consolidation happens.)
+5. **Cache budget is per-cache, not a shared pool.** The bitmap and aggregate
+   caches each get their own `cache_pct`%-of-`mem_limit` sub-budget, so total
+   cache memory can reach `2 × cache_pct`% (default 25% → up to 50%), bounded by
+   the global budget. Separate slices are intentional (a shared cap would let
+   one cache starve the other's eviction — see `build_budget_and_caches`), but
+   if cache pressure on sessions becomes a problem, revisit: a single shared
+   `cache_pct` pool with combined eviction (needs §3's shared `LruCache`) or a
+   distinct `--aggregate-cache-pct` flag.

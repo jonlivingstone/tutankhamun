@@ -173,6 +173,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
+    use crate::aggregate_cache::AggregateCache;
     use crate::bitmap_cache::BitmapCache;
     use crate::memory::{MemoryBudget, SessionMemoryHandle};
     use crate::status::{DatasetLoad, DatasetsReport, SessionsSummary, StructuralReport};
@@ -208,8 +209,12 @@ mod tests {
             Arc::clone(&budget),
             u64::MAX,
         ))));
+        let agg = Arc::new(AggregateCache::new(Arc::new(SessionMemoryHandle::new(
+            Arc::clone(&budget),
+            u64::MAX,
+        ))));
         OpsState::new(
-            Metrics::new(budget, cache),
+            Metrics::new(budget, cache, agg),
             Arc::new(StubStatusSource),
             Instant::now(),
         )

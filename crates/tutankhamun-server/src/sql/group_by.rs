@@ -125,6 +125,81 @@ impl OwnedStat {
     }
 }
 
+/// A `GROUP BY` key the rule pushes down: a bare column, or a time bucket
+/// (`date_trunc(unit, <time field>)`) whose value is the bucket-start epoch
+/// computed per doc from the time column.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum GroupKey {
+    Column(String),
+    TimeBucket { col: String, unit: BucketUnit },
+}
+
+impl GroupKey {
+    /// The underlying stored column name (the time field, for a bucket).
+    pub(crate) fn col(&self) -> &str {
+        match self {
+            GroupKey::Column(c) | GroupKey::TimeBucket { col: c, .. } => c,
+        }
+    }
+}
+
+impl fmt::Display for GroupKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GroupKey::Column(c) => f.write_str(c),
+            GroupKey::TimeBucket { col, unit } => write!(f, "date_trunc({unit},{col})"),
+        }
+    }
+}
+
+/// Time-bucket granularity for [`GroupKey::TimeBucket`]. Fixed-width units
+/// (`Second`…`Day`) truncate by integer arithmetic on epoch seconds; the rest
+/// (`Week`/`Month`/`Quarter`/`Year`) need calendar math (see `truncate_epoch`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum BucketUnit {
+    Second,
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Quarter,
+    Year,
+}
+
+impl BucketUnit {
+    /// Parse a `date_trunc` unit literal (case-insensitive); `None` for units
+    /// we don't support (the query then falls back to `DataFusion`).
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "second" => Self::Second,
+            "minute" => Self::Minute,
+            "hour" => Self::Hour,
+            "day" => Self::Day,
+            "week" => Self::Week,
+            "month" => Self::Month,
+            "quarter" => Self::Quarter,
+            "year" => Self::Year,
+            _ => return None,
+        })
+    }
+}
+
+impl fmt::Display for BucketUnit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Second => "second",
+            Self::Minute => "minute",
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+            Self::Quarter => "quarter",
+            Self::Year => "year",
+        })
+    }
+}
+
 /// Logical node standing in for `Aggregate(TableScan)`. Carries
 /// everything the physical exec needs. `cache` rides along but is
 /// excluded from logical identity (`Eq`/`Ord`/`Hash`): a node is
@@ -133,16 +208,16 @@ impl OwnedStat {
 pub(crate) struct FtgsAggregate {
     url: String,
     cache: Arc<Cache>,
-    /// The grouping columns in `GROUP BY` order, or empty for a global
+    /// The grouping keys in `GROUP BY` order, or empty for a global
     /// aggregate (no `GROUP BY`) — one row over the whole filtered set.
-    group_cols: Vec<String>,
+    group_cols: Vec<GroupKey>,
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
     schema: DFSchemaRef,
 }
 
 impl FtgsAggregate {
-    fn identity(&self) -> (&str, &[String], &[OwnedStat], &[PushedFilter]) {
+    fn identity(&self) -> (&str, &[GroupKey], &[OwnedStat], &[PushedFilter]) {
         (&self.url, &self.group_cols, &self.stats, &self.filters)
     }
 }
@@ -195,10 +270,15 @@ impl UserDefinedLogicalNodeCore for FtgsAggregate {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let group_by = self
+            .group_cols
+            .iter()
+            .map(GroupKey::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
         write!(
             f,
-            "FtgsAggregate: group_by=[{}], stats={}, filters={}",
-            self.group_cols.join(","),
+            "FtgsAggregate: group_by=[{group_by}], stats={}, filters={}",
             self.stats.len(),
             self.filters.len()
         )
@@ -261,23 +341,17 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
         return Ok(None);
     };
 
-    // No grouping column → a global aggregate (one row over the whole
-    // filtered set). Otherwise every column must be a bare, filterable
-    // (`String`/`Int`) column — these carry the inverted index the cursor
-    // walks and the regroup reads. The exec regroups all but the last
-    // column into the group lookup and scans the last.
+    // No grouping key → a global aggregate (one row over the whole filtered
+    // set). Otherwise each key is a bare filterable (`String`/`Int`) column or
+    // a `date_trunc(unit, <time field>)` time bucket. A bare column is
+    // index-walked/regrouped; a time bucket is always regrouped (the time
+    // field's index is per-second, not per-bucket) — see `aggregate_batch`.
     let mut group_cols = Vec::with_capacity(agg.group_expr.len());
     for expr in &agg.group_expr {
-        let Expr::Column(col) = expr else {
-            return Ok(None);
-        };
-        if !matches!(
-            prov.field_kind(&col.name),
-            Some(FieldKind::String | FieldKind::Int)
-        ) {
-            return Ok(None);
+        match group_key(expr, prov) {
+            Some(key) => group_cols.push(key),
+            None => return Ok(None),
         }
-        group_cols.push(col.name.clone());
     }
 
     // Every aggregate must map to a supported scalar stat.
@@ -310,6 +384,38 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
         filters,
         schema: Arc::clone(&agg.schema),
     }))
+}
+
+/// Map one `GROUP BY` expression to a pushable [`GroupKey`], or `None`.
+fn group_key(expr: &Expr, prov: &TutankhamunTableProvider) -> Option<GroupKey> {
+    match expr {
+        Expr::Column(col) => matches!(
+            prov.field_kind(&col.name),
+            Some(FieldKind::String | FieldKind::Int)
+        )
+        .then(|| GroupKey::Column(col.name.clone())),
+        // `date_trunc(unit, <time field>)` → a time bucket. The source column
+        // must be the dataset's time field (the one presented as Timestamp).
+        Expr::ScalarFunction(f) if f.func.name().eq_ignore_ascii_case("date_trunc") => {
+            let [unit_expr, Expr::Column(col)] = f.args.as_slice() else {
+                return None;
+            };
+            let unit = match unit_expr {
+                Expr::Literal(
+                    ScalarValue::Utf8(Some(u))
+                    | ScalarValue::LargeUtf8(Some(u))
+                    | ScalarValue::Utf8View(Some(u)),
+                    _,
+                ) => BucketUnit::parse(u)?,
+                _ => return None,
+            };
+            prov.is_time_field(&col.name).then(|| GroupKey::TimeBucket {
+                col: col.name.clone(),
+                unit,
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Map one aggregate expression to a pushable [`OwnedStat`], or `None`.

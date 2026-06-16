@@ -15,10 +15,11 @@ use std::sync::Arc;
 
 use arrow::array::{
     ArrayRef, BinaryBuilder, Float64Array, Int64Array, ListArray, RecordBatch, RecordBatchOptions,
-    StringArray, StructArray, UInt64Array,
+    StringArray, StructArray, TimestampNanosecondArray, UInt64Array,
 };
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, FieldRef, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, SchemaRef, TimeUnit};
+use chrono::{DateTime, Datelike, Duration};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -29,14 +30,15 @@ use datafusion::physical_plan::{
 
 use roaring::RoaringBitmap;
 
-use super::group_by::OwnedStat;
+use super::group_by::{BucketUnit, GroupKey, OwnedStat};
 use super::pushdown::PushedFilter;
 use super::scan::{block_on_scan, chunked_stream, for_each_shard_batch};
+use crate::aggregate_cache::{AggregateCache, GroupTuple, ShardPartial};
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::ftgs::{
-    FtgsRow, OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped,
-    combine_stats, ftgs_scan_batch, merge_into, render_term, term_map,
+    OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats,
+    ftgs_scan, render_term, term_map,
 };
 use crate::group_lookup::GroupLookup;
 use crate::memory::SessionMemoryHandle;
@@ -46,13 +48,14 @@ use crate::sketches::ThetaSketch;
 /// `ExecutionPlan` for a pushed-down aggregate (§3.2). Runs the
 /// aggregation through FTGS per shard and merges, emitting one
 /// pre-aggregated record batch instead of materializing every row.
-/// `group_col` is the single grouping column, or `None` for a global
-/// aggregate (no `GROUP BY` — one row over the whole filtered set).
+/// `group_cols` are the `GROUP BY` keys (bare columns and/or `date_trunc`
+/// time buckets, in `GROUP BY` order); empty means a global aggregate
+/// (no `GROUP BY` — one row over the whole filtered set).
 #[derive(Debug)]
 pub(crate) struct FtgsAggExec {
     url: String,
     cache: Arc<Cache>,
-    group_cols: Vec<String>,
+    group_cols: Vec<GroupKey>,
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
     /// Output schema, matching the `Aggregate` this replaces: the group
@@ -65,7 +68,7 @@ impl FtgsAggExec {
     pub(crate) fn new(
         url: String,
         cache: Arc<Cache>,
-        group_cols: Vec<String>,
+        group_cols: Vec<GroupKey>,
         stats: Vec<OwnedStat>,
         filters: Vec<PushedFilter>,
         schema: SchemaRef,
@@ -93,7 +96,11 @@ impl DisplayAs for FtgsAggExec {
         let group_by = if self.group_cols.is_empty() {
             "(global)".to_string()
         } else {
-            self.group_cols.join(",")
+            self.group_cols
+                .iter()
+                .map(GroupKey::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
         };
         write!(
             f,
@@ -137,6 +144,7 @@ impl ExecutionPlan for FtgsAggExec {
             .session_config()
             .get_extension::<SessionMemoryHandle>();
         let bitmap_cache = context.session_config().get_extension::<BitmapCache>();
+        let agg_cache = context.session_config().get_extension::<AggregateCache>();
         let batch = block_on_scan(|| {
             aggregate_batch(
                 &self.url,
@@ -147,6 +155,7 @@ impl ExecutionPlan for FtgsAggExec {
                 &self.schema,
                 mem.as_ref(),
                 bitmap_cache.as_ref(),
+                agg_cache.as_ref(),
             )
         })?;
         // One row per group; cap every emitted batch to the session's
@@ -159,30 +168,51 @@ impl ExecutionPlan for FtgsAggExec {
 async fn aggregate_batch(
     url: &str,
     cache: &Cache,
-    group_cols: &[String],
+    group_cols: &[GroupKey],
     stats: &[OwnedStat],
     filters: &[PushedFilter],
     schema: &SchemaRef,
     mem: Option<&Arc<SessionMemoryHandle>>,
     bitmap_cache: Option<&Arc<BitmapCache>>,
+    agg_cache: Option<&Arc<AggregateCache>>,
 ) -> anyhow::Result<RecordBatch> {
-    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
     if group_cols.is_empty() {
-        let acc = global_stats(url, cache, filters, mem, bitmap_cache, &stat_specs).await?;
-        reshape_global(acc.as_deref(), stats, schema)
-    } else {
-        aggregate_grouped(
+        let acc = global_stats(url, cache, stats, filters, mem, bitmap_cache, agg_cache).await?;
+        return reshape_global(acc.as_deref(), stats, schema);
+    }
+    // A time bucket can't be the index-walked cursor (the time field's index is
+    // per-second, not per-bucket), so any bucket forces the regrouped path: fold
+    // the whole group tuple into a combo id and aggregate per group — no cursor.
+    if group_cols
+        .iter()
+        .any(|k| matches!(k, GroupKey::TimeBucket { .. }))
+    {
+        return aggregate_regrouped(
             url,
             cache,
             group_cols,
-            &stat_specs,
+            stats,
             filters,
             mem,
             bitmap_cache,
+            agg_cache,
             schema,
         )
-        .await
+        .await;
     }
+    // All bare columns → the cursor-walk path (regroup the prefix, scan the last).
+    aggregate_grouped(
+        url,
+        cache,
+        group_cols,
+        stats,
+        filters,
+        mem,
+        bitmap_cache,
+        agg_cache,
+        schema,
+    )
+    .await
 }
 
 /// Conservative per-doc heap working-set estimate for the bounded scan envelope
@@ -194,101 +224,104 @@ fn per_doc_estimate(group_cols: usize, stats: usize) -> u64 {
     ((group_cols + stats + 1) * std::mem::size_of::<i64>()) as u64
 }
 
-/// `GROUP BY g1..gk`: regroup the prefix `g1..g(k-1)` into each shard's
-/// group lookup as a combo id, scan the last column `gk` with FTGS, and
-/// reshape to one row per `(prefix tuple, cursor term)`. A `String` cursor
-/// can leave docs term-less — those form a per-group NULL-keyed row.
-///
-/// Streams shards in bounded batches ([`for_each_shard_batch`]): the running
-/// merged `rows`, the cross-shard `combo` map, and `null_stats` accumulate
-/// across batches, while each batch's `GroupLookup`s and shards are dropped
-/// before the next batch opens. `combo` spanning batches is the same
-/// shard-global group-id invariant `merge_into` needs, at larger scope.
+/// `GROUP BY g1..gk` over bare columns: regroup the prefix `g1..g(k-1)` into each
+/// shard's group lookup, FTGS-scan the last column `gk` (the index-walked
+/// cursor), and emit one self-contained partial per shard — `(prefix values +
+/// cursor term) -> stats`. A `String` cursor can leave docs term-less; those form
+/// a NULL-cursor group. Partials cache per shard ([`AggregateCache`]) and combine
+/// across shards by tuple ([`combine_partial`]); shards stream in bounded batches.
 #[allow(clippy::too_many_arguments)]
 async fn aggregate_grouped(
     url: &str,
     cache: &Cache,
-    group_cols: &[String],
-    stat_specs: &[StatSpec<'_>],
+    group_cols: &[GroupKey],
+    stats: &[OwnedStat],
     filters: &[PushedFilter],
     mem: Option<&Arc<SessionMemoryHandle>>,
     bitmap_cache: Option<&Arc<BitmapCache>>,
+    agg_cache: Option<&Arc<AggregateCache>>,
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
-    let (cursor, prefix) = group_cols
+    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
+    let cols: Vec<String> = group_cols.iter().map(|k| k.col().to_string()).collect();
+    let (cursor, prefix) = cols
         .split_last()
         .expect("grouped path has at least one column");
-    // The cursor column is output column `prefix.len()`. A `String` cursor
-    // can be sparse (the SQL NULL group); `Int`/`Metric` are dense.
+    let cursor = cursor.as_str();
+    // The cursor is output column `prefix.len()`. A `String` cursor can be sparse
+    // (the SQL NULL group); `Int` is dense.
     let cursor_is_string = matches!(schema.field(prefix.len()).data_type(), DataType::Utf8);
 
-    // These persist across batches: combo ids are assigned from one map so a
-    // given prefix tuple maps to the same group id everywhere (the invariant
-    // `merge_into` needs); `rows` is the running merged result; `null_stats`
-    // accumulates the NULL-cursor docs per combo group.
-    let mut combo = ComboMap::default();
-    let mut null_stats: BTreeMap<u32, Vec<StatValue>> = BTreeMap::new();
-    let mut rows: Vec<FtgsRow> = Vec::new();
-    let per_doc = per_doc_estimate(group_cols.len(), stat_specs.len());
+    let mut combined: BTreeMap<GroupTuple, Vec<StatValue>> = BTreeMap::new();
+    let per_doc = per_doc_estimate(cols.len(), stat_specs.len());
 
     for_each_shard_batch(url, cache, filters, mem, bitmap_cache, per_doc, |chunk| {
-        process_grouped_batch(
-            chunk,
-            cursor,
-            prefix,
-            cursor_is_string,
-            stat_specs,
-            &mut combo,
-            &mut null_stats,
-            &mut rows,
-        )
+        for (id, shard, selection) in chunk {
+            let partial = cached_partial(agg_cache, *id, filters, group_cols, stats, || {
+                cursor_walk_shard(
+                    shard,
+                    selection,
+                    prefix,
+                    cursor,
+                    cursor_is_string,
+                    &stat_specs,
+                )
+            })?;
+            combine_partial(&mut combined, &partial, &stat_specs);
+        }
+        Ok(())
     })
     .await?;
 
-    reshape_aggregate(
-        &rows,
-        prefix.len(),
-        stat_specs,
-        schema,
-        &combo.inverse,
-        &null_stats,
-    )
+    reshape_regrouped(&combined, cols.len(), &stat_specs, schema)
 }
 
-/// Scan one batch's shards into per-`(cursor term, combo group)` partials and
-/// fold them into the running `rows`, updating the cross-batch `combo` and
-/// `null_stats`. Each shard's `GroupLookup` and the batch's shards drop when
-/// this returns, before the next batch opens.
-#[allow(clippy::too_many_arguments)]
-fn process_grouped_batch(
-    chunk: &[(DiskShard, FilterResult)],
-    cursor: &str,
+/// One shard's grouped aggregate via the FTGS index-walk: regroup the prefix into
+/// a *local* combo, scan the cursor column's index, and return `(prefix values +
+/// cursor term) -> stats` per `(group, term)`. Self-contained (group values, not
+/// the cross-shard combo ids the old batch-merge used), so it caches per shard.
+fn cursor_walk_shard(
+    shard: &DiskShard,
+    selection: &FilterResult,
     prefix: &[String],
+    cursor: &str,
     cursor_is_string: bool,
     stat_specs: &[StatSpec<'_>],
-    combo: &mut ComboMap,
-    null_stats: &mut BTreeMap<u32, Vec<StatValue>>,
-    rows: &mut Vec<FtgsRow>,
-) -> anyhow::Result<()> {
-    let mut pairs: Vec<(&DiskShard, GroupLookup)> = Vec::with_capacity(chunk.len());
-    for (shard, selection) in chunk {
-        let matched: Option<&RoaringBitmap> = match selection {
-            FilterResult::Empty => continue,
-            FilterResult::All => None,
-            FilterResult::Bitmap(bm) => Some(bm),
-        };
-        let groups = build_groups(shard, matched, prefix, combo)?;
-        if cursor_is_string {
-            accumulate_null_cursor(shard, matched, cursor, &groups, stat_specs, null_stats)?;
+) -> anyhow::Result<ShardPartial> {
+    let matched: Option<&RoaringBitmap> = match selection {
+        FilterResult::Empty => return Ok(Vec::new()),
+        FilterResult::All => None,
+        FilterResult::Bitmap(bm) => Some(bm),
+    };
+    let mut combo = ComboMap::default();
+    let groups = build_groups(shard, matched, prefix, &mut combo)?;
+    // Recover the prefix values for a group id. The single-column case (empty
+    // prefix) carries no prefix — just the membership marker group 1.
+    let prefix_tuple = |gid: u32| -> GroupTuple {
+        if prefix.is_empty() {
+            Vec::new()
+        } else {
+            combo.inverse[(gid - 1) as usize].clone()
         }
-        pairs.push((shard, groups));
-    }
+    };
 
-    let refs: Vec<(&dyn Shard, &GroupLookup)> =
-        pairs.iter().map(|(s, g)| (*s as &dyn Shard, g)).collect();
-    let partials = ftgs_scan_batch(&refs, &[cursor], stat_specs)?;
-    *rows = merge_into(std::mem::take(rows), partials, &[cursor], stat_specs);
-    Ok(())
+    let mut out: ShardPartial = Vec::new();
+    for row in ftgs_scan(shard, &groups, &[cursor], stat_specs)? {
+        let mut tuple = prefix_tuple(row.group);
+        tuple.push(Some(row.term));
+        out.push((tuple, row.stats));
+    }
+    // String cursors can leave matched docs term-less — the SQL NULL group.
+    if cursor_is_string {
+        let mut null_stats: BTreeMap<u32, Vec<StatValue>> = BTreeMap::new();
+        accumulate_null_cursor(shard, matched, cursor, &groups, stat_specs, &mut null_stats)?;
+        for (gid, st) in null_stats {
+            let mut tuple = prefix_tuple(gid);
+            tuple.push(None);
+            out.push((tuple, st));
+        }
+    }
+    Ok(out)
 }
 
 /// Map each matched doc to its prefix-tuple combo id (single-column: group 1
@@ -369,6 +402,180 @@ fn accumulate_null_cursor(
     Ok(())
 }
 
+/// `GROUP BY` including a time bucket: regroup the **whole** group tuple
+/// (buckets truncated, categoricals by value) into one combo id per distinct
+/// tuple and aggregate per group — no index-walked cursor, because the time
+/// field's inverted index is per-*second*, not per-bucket. Handles any
+/// mix/order of buckets + low-cardinality categoricals uniformly. Streams
+/// shards in bounded batches ([`for_each_shard_batch`]); the cross-shard `combo`
+/// and the running per-group stats accumulate across batches while each batch's
+/// shards drop.
+#[allow(clippy::too_many_arguments)]
+async fn aggregate_regrouped(
+    url: &str,
+    cache: &Cache,
+    group_cols: &[GroupKey],
+    stats: &[OwnedStat],
+    filters: &[PushedFilter],
+    mem: Option<&Arc<SessionMemoryHandle>>,
+    bitmap_cache: Option<&Arc<BitmapCache>>,
+    agg_cache: Option<&Arc<AggregateCache>>,
+    schema: &SchemaRef,
+) -> anyhow::Result<RecordBatch> {
+    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
+    // Combine per-shard partials by group-value tuple. Group values are
+    // self-contained (not per-shard ids), so this folds across shards/batches
+    // and lets each shard's partial be cached and reused independently.
+    let mut combined: BTreeMap<GroupTuple, Vec<StatValue>> = BTreeMap::new();
+    let per_doc = per_doc_estimate(group_cols.len(), stat_specs.len());
+
+    for_each_shard_batch(url, cache, filters, mem, bitmap_cache, per_doc, |chunk| {
+        for (id, shard, selection) in chunk {
+            let partial = cached_partial(agg_cache, *id, filters, group_cols, stats, || {
+                process_regrouped_shard(shard, selection, group_cols, &stat_specs)
+            })?;
+            combine_partial(&mut combined, &partial, &stat_specs);
+        }
+        Ok(())
+    })
+    .await?;
+
+    reshape_regrouped(&combined, group_cols.len(), &stat_specs, schema)
+}
+
+/// Fetch a shard's partial from `agg_cache` (computing + storing on a miss), or
+/// compute it directly when no cache is wired (the CLI). The cache makes a
+/// shard's `(filter, group-keys, stats)` partial reusable across reruns and
+/// across queries that touch the same immutable shard.
+fn cached_partial<F>(
+    agg_cache: Option<&Arc<AggregateCache>>,
+    shard_id: u64,
+    filters: &[PushedFilter],
+    group_cols: &[GroupKey],
+    stats: &[OwnedStat],
+    compute: F,
+) -> anyhow::Result<Arc<ShardPartial>>
+where
+    F: FnOnce() -> anyhow::Result<ShardPartial>,
+{
+    match agg_cache {
+        Some(c) => c.get_or_compute(shard_id, filters, group_cols, stats, compute),
+        None => Ok(Arc::new(compute()?)),
+    }
+}
+
+/// Fold one shard's partial into the running cross-shard accumulator, combining
+/// stats for group tuples already seen and inserting new ones.
+fn combine_partial(
+    combined: &mut BTreeMap<GroupTuple, Vec<StatValue>>,
+    partial: &ShardPartial,
+    stat_specs: &[StatSpec<'_>],
+) {
+    for (tuple, st) in partial {
+        match combined.get_mut(tuple) {
+            Some(acc) => combine_stats(acc, st, stat_specs),
+            None => {
+                combined.insert(tuple.clone(), st.clone());
+            }
+        }
+    }
+}
+
+/// One shard's aggregate for a regrouped (time-bucket) query: each distinct
+/// group-value tuple with its stats. Self-contained (group *values*, not global
+/// ids), so it caches per shard ([`AggregateCache`]) and combines across shards.
+fn process_regrouped_shard(
+    shard: &DiskShard,
+    selection: &FilterResult,
+    group_cols: &[GroupKey],
+    stat_specs: &[StatSpec<'_>],
+) -> anyhow::Result<ShardPartial> {
+    let num_docs = usize::try_from(shard.num_docs())?;
+    let matched: Option<&RoaringBitmap> = match selection {
+        FilterResult::Empty => return Ok(Vec::new()),
+        FilterResult::All => None,
+        FilterResult::Bitmap(bm) => Some(bm),
+    };
+    let sources: Vec<KeySource> = group_cols
+        .iter()
+        .map(|k| KeySource::build(shard, k))
+        .collect::<anyhow::Result<_>>()?;
+
+    // Shard-granular fast path: when every key is constant for this shard — pure
+    // time-bucket grouping where the shard's time range falls in one bucket — the
+    // whole matched set is a single group, so one `aggregate_docs` does it with no
+    // per-doc truncation or combo. (Weekly shards under month/quarter/year.)
+    if sources.iter().all(|s| matches!(s, KeySource::Const(_))) {
+        let tuple: Vec<Option<Box<[u8]>>> = sources.iter().map(|s| s.key(0)).collect();
+        let st = match matched {
+            None => aggregate_docs(shard, 0..u32::try_from(num_docs)?, stat_specs)?,
+            Some(bm) => aggregate_docs(shard, bm.iter(), stat_specs)?,
+        };
+        return Ok(vec![(tuple, st)]);
+    }
+
+    // Mixed: at least one per-doc key (a categorical column, or a time bucket on a
+    // shard that straddles a boundary). Regroup matched docs into a local combo,
+    // aggregate per group, then emit (group tuple, stats) by decoding that combo.
+    let mut combo = ComboMap::default();
+    let mut g = GroupLookup::constant(num_docs, 0);
+    match matched {
+        None => {
+            for doc in 0..num_docs {
+                let tuple = sources.iter().map(|s| s.key(doc)).collect();
+                g.set(doc, combo.id(tuple));
+            }
+        }
+        Some(bm) => {
+            for doc in bm {
+                let doc = doc as usize;
+                let tuple = sources.iter().map(|s| s.key(doc)).collect();
+                g.set(doc, combo.id(tuple));
+            }
+        }
+    }
+    // Aggregate only matched docs (the unmatched keep group 0 and are skipped).
+    let per_group = match matched {
+        None => aggregate_docs_grouped(shard, 0..u32::try_from(num_docs)?, &g, stat_specs)?,
+        Some(bm) => aggregate_docs_grouped(shard, bm.iter(), &g, stat_specs)?,
+    };
+    Ok(per_group
+        .into_iter()
+        .map(|(gid, st)| (combo.inverse[(gid - 1) as usize].clone(), st))
+        .collect())
+}
+
+/// Per-shard source for a group key's value: a constant (a single-bucket time
+/// key, computed once from the shard's time range) or a per-doc lookup (a
+/// categorical column, or a time bucket on a shard that straddles a boundary).
+enum KeySource<'a> {
+    Const(Option<Box<[u8]>>),
+    PerDoc(DocKeys<'a>),
+}
+
+impl<'a> KeySource<'a> {
+    fn build(shard: &'a DiskShard, key: &GroupKey) -> anyhow::Result<KeySource<'a>> {
+        if let GroupKey::TimeBucket { unit, .. } = key {
+            let (lo, hi) = shard.time_range();
+            let (blo, bhi) = (truncate_epoch(lo, *unit), truncate_epoch(hi, *unit));
+            if blo == bhi {
+                // The whole shard is in one bucket — constant key, computed once.
+                return Ok(KeySource::Const(Some(Box::from(
+                    encode_int_key(blo).as_slice(),
+                ))));
+            }
+        }
+        Ok(KeySource::PerDoc(DocKeys::for_key(shard, key)?))
+    }
+
+    fn key(&self, doc: usize) -> Option<Box<[u8]>> {
+        match self {
+            KeySource::Const(v) => v.clone(),
+            KeySource::PerDoc(dk) => dk.key(doc),
+        }
+    }
+}
+
 /// Assigns a stable group id (from 1) to each distinct prefix-column
 /// tuple, shared across all shards so a tuple maps to the same id
 /// everywhere — what lets [`ftgs_scan_merge`] fold matching `(cursor
@@ -404,6 +611,9 @@ enum DocKeys<'a> {
         doc_term: Vec<Option<u32>>,
         terms: Vec<Box<[u8]>>,
     },
+    /// Time bucket: dense epoch-seconds forward column; key = the
+    /// bucket-start epoch (`encode_int_key`-encoded like any `Int`).
+    TimeBucket { col: &'a [i64], unit: BucketUnit },
 }
 
 impl<'a> DocKeys<'a> {
@@ -416,12 +626,71 @@ impl<'a> DocKeys<'a> {
         }
     }
 
+    /// Build the per-doc key source for a [`GroupKey`] — a plain column (via
+    /// [`build`](Self::build)) or a time bucket over the time field's dense
+    /// forward column.
+    fn for_key(shard: &'a dyn Shard, key: &GroupKey) -> anyhow::Result<DocKeys<'a>> {
+        match key {
+            GroupKey::Column(name) => DocKeys::build(shard, name),
+            GroupKey::TimeBucket { col, unit } => {
+                let fc = shard
+                    .forward_column(col)
+                    .ok_or_else(|| anyhow::anyhow!("no forward column for time field {col:?}"))?;
+                Ok(DocKeys::TimeBucket {
+                    col: fc,
+                    unit: *unit,
+                })
+            }
+        }
+    }
+
     fn key(&self, doc: usize) -> Option<Box<[u8]>> {
         match self {
             DocKeys::Int(col) => Some(Box::from(encode_int_key(col[doc]).as_slice())),
             DocKeys::Str { doc_term, terms } => doc_term[doc].map(|i| terms[i as usize].clone()),
+            DocKeys::TimeBucket { col, unit } => Some(Box::from(
+                encode_int_key(truncate_epoch(col[doc], *unit)).as_slice(),
+            )),
         }
     }
+}
+
+/// The bucket-start epoch (UTC seconds) for `secs` under `unit`. Fixed-width
+/// units divide on the epoch (day/hour/… align to UTC midnight/top-of-hour,
+/// matching `date_trunc`); `week` (Monday) and `month`/`quarter`/`year` use
+/// calendar math (the chrono pattern the ingester uses for `ShardBy::Month`).
+fn truncate_epoch(secs: i64, unit: BucketUnit) -> i64 {
+    let width = match unit {
+        BucketUnit::Second => 1,
+        BucketUnit::Minute => 60,
+        BucketUnit::Hour => 3_600,
+        BucketUnit::Day => 86_400,
+        BucketUnit::Week | BucketUnit::Month | BucketUnit::Quarter | BucketUnit::Year => {
+            let dt = DateTime::from_timestamp(secs, 0).expect("epoch within chrono range");
+            let date = dt.date_naive();
+            let start = match unit {
+                BucketUnit::Week => {
+                    date - Duration::days(i64::from(date.weekday().num_days_from_monday()))
+                }
+                BucketUnit::Month => date.with_day(1).expect("day 1 valid"),
+                BucketUnit::Quarter => date
+                    .with_day(1)
+                    .and_then(|d| d.with_month((date.month0() / 3) * 3 + 1))
+                    .expect("quarter-start valid"),
+                BucketUnit::Year => date
+                    .with_day(1)
+                    .and_then(|d| d.with_month(1))
+                    .expect("Jan 1 valid"),
+                _ => unreachable!("fixed-width units handled above"),
+            };
+            return start
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight valid")
+                .and_utc()
+                .timestamp();
+        }
+    };
+    secs.div_euclid(width) * width
 }
 
 /// Global aggregate (no `GROUP BY`): aggregate each shard's whole filtered doc
@@ -432,30 +701,49 @@ impl<'a> DocKeys<'a> {
 async fn global_stats(
     url: &str,
     cache: &Cache,
+    stats: &[OwnedStat],
     filters: &[PushedFilter],
     mem: Option<&Arc<SessionMemoryHandle>>,
     bitmap_cache: Option<&Arc<BitmapCache>>,
-    stat_specs: &[StatSpec<'_>],
+    agg_cache: Option<&Arc<AggregateCache>>,
 ) -> anyhow::Result<Option<Vec<StatValue>>> {
+    let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
     let mut acc: Option<Vec<StatValue>> = None;
     let per_doc = per_doc_estimate(0, stat_specs.len());
     for_each_shard_batch(url, cache, filters, mem, bitmap_cache, per_doc, |chunk| {
-        for (shard, selection) in chunk {
-            let num_docs = u32::try_from(shard.num_docs())?;
-            let shard_stats = match selection {
-                FilterResult::Empty => continue,
-                FilterResult::All => aggregate_docs(shard, 0..num_docs, stat_specs)?,
-                FilterResult::Bitmap(bm) => aggregate_docs(shard, bm.iter(), stat_specs)?,
-            };
-            match acc.as_mut() {
-                Some(a) => combine_stats(a, &shard_stats, stat_specs),
-                None => acc = Some(shard_stats),
+        for (id, shard, selection) in chunk {
+            // No group keys: the shard's partial is a single group (empty tuple)
+            // over the matched docs, cached per shard like the grouped paths.
+            let partial = cached_partial(agg_cache, *id, filters, &[], stats, || {
+                global_shard_partial(shard, selection, &stat_specs)
+            })?;
+            for (_tuple, st) in partial.iter() {
+                match acc.as_mut() {
+                    Some(a) => combine_stats(a, st, &stat_specs),
+                    None => acc = Some(st.clone()),
+                }
             }
         }
         Ok(())
     })
     .await?;
     Ok(acc)
+}
+
+/// One shard's global aggregate (no `GROUP BY`): a single empty-tuple group over
+/// the matched docs, or empty when nothing matched.
+fn global_shard_partial(
+    shard: &DiskShard,
+    selection: &FilterResult,
+    stat_specs: &[StatSpec<'_>],
+) -> anyhow::Result<ShardPartial> {
+    let num_docs = u32::try_from(shard.num_docs())?;
+    let st = match selection {
+        FilterResult::Empty => return Ok(Vec::new()),
+        FilterResult::All => aggregate_docs(shard, 0..num_docs, stat_specs)?,
+        FilterResult::Bitmap(bm) => aggregate_docs(shard, bm.iter(), stat_specs)?,
+    };
+    Ok(vec![(Vec::new(), st)])
 }
 
 /// Union of all of `col`'s postings in `shard` — the docs that carry
@@ -471,94 +759,71 @@ fn covered_docs(shard: &dyn Shard, col: &str) -> RoaringBitmap {
     covered
 }
 
-/// Turn merged FTGS rows into one record batch. The first `num_prefix`
-/// columns are the regrouped prefix values, decoded from each row's combo
-/// group via `inverse`; column `num_prefix` is the cursor term (`None` for
-/// a `String` cursor's NULL group); the rest are the stats. `null_stats`
-/// holds the NULL-cursor docs, one entry per combo group.
-fn reshape_aggregate(
-    rows: &[FtgsRow],
-    num_prefix: usize,
-    specs: &[StatSpec],
+/// Build the stat columns (after the `group_cols` group columns) from each
+/// output row's finalized stats — dispatched by the stat's [`OutputKind`] and
+/// filled in the schema's declared type. Shared by [`reshape_aggregate`] and
+/// [`reshape_regrouped`].
+fn stat_columns(
+    rows: &[&[StatValue]],
+    specs: &[StatSpec<'_>],
     schema: &SchemaRef,
-    inverse: &[Vec<Option<Box<[u8]>>>],
-    null_stats: &BTreeMap<u32, Vec<StatValue>>,
-) -> anyhow::Result<RecordBatch> {
-    // One output row per scanned `(cursor term, group)`, plus one per
-    // NULL-cursor combo group. `group` decodes to the prefix tuple.
-    struct OutRow<'a> {
-        group: u32,
-        cursor: Option<&'a [u8]>,
-        stats: &'a [StatValue],
-    }
-    let out: Vec<OutRow> = rows
-        .iter()
-        .map(|r| OutRow {
-            group: r.group,
-            cursor: Some(&r.term),
-            stats: &r.stats,
-        })
-        .chain(null_stats.iter().map(|(&gid, st)| OutRow {
-            group: gid,
-            cursor: None,
-            stats: st,
-        }))
-        .collect();
-
-    let num_group_cols = num_prefix + 1;
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + specs.len());
-
-    // Group columns: prefix j from `inverse[group - 1][j]`, the cursor
-    // (last group column) from the row's own term. `j` indexes the schema,
-    // the prefix/cursor split, and the inverse tuple — not a single slice.
-    #[allow(clippy::needless_range_loop)]
-    for j in 0..num_group_cols {
-        let values: Vec<Option<&[u8]>> = out
-            .iter()
-            .map(|o| {
-                if j == num_prefix {
-                    o.cursor
-                } else {
-                    inverse[(o.group - 1) as usize][j].as_deref()
-                }
-            })
-            .collect();
-        arrays.push(group_column(schema.field(j).data_type(), &values));
-    }
-
-    // Stat columns follow the group columns. The output column is keyed by
-    // the stat's own [`OutputKind`], not the Arrow dtype — `dtype` only
-    // supplies the concrete array type the builder fills (Int64 vs UInt64,
-    // or the `List` item field for top-k).
+    group_cols: usize,
+) -> anyhow::Result<Vec<ArrayRef>> {
+    let mut arrays = Vec::with_capacity(specs.len());
     for (s, spec) in specs.iter().enumerate() {
-        let dtype = schema.field(num_group_cols + s).data_type();
+        let dtype = schema.field(group_cols + s).data_type();
         let array = match spec.output_kind() {
             // `stat_array` validates `dtype` (Int64/UInt64) itself.
             OutputKind::Int => stat_array(
                 dtype,
-                out.iter()
-                    .map(|o| Some(o.stats[s].finalize().int()))
-                    .collect(),
+                rows.iter().map(|st| Some(st[s].finalize().int())).collect(),
             )?,
             OutputKind::Float => float_array(
-                out.iter()
-                    .map(|o| Some(o.stats[s].finalize().float()))
+                rows.iter()
+                    .map(|st| Some(st[s].finalize().float()))
                     .collect(),
             ),
             OutputKind::TopK => {
                 let DataType::List(item) = dtype else {
                     anyhow::bail!("approx_top_k output column is not a List, got {dtype:?}");
                 };
-                topk_list_array(item, out.iter().map(|o| o.stats[s].finalize().topk()))?
+                topk_list_array(item, rows.iter().map(|st| st[s].finalize().topk()))?
             }
             OutputKind::Theta => {
-                theta_binary_array(out.iter().map(|o| Some(o.stats[s].finalize().theta())))
+                theta_binary_array(rows.iter().map(|st| Some(st[s].finalize().theta())))
             }
         };
         arrays.push(array);
     }
+    Ok(arrays)
+}
 
-    let options = RecordBatchOptions::new().with_row_count(Some(out.len()));
+/// Turn the regrouped path's combined per-tuple stats into one record batch: one
+/// row per group-value tuple, the group columns decoded from the tuple in their
+/// schema types, then the stats. Group order is the tuple order (`BTreeMap`
+/// ascending); any `ORDER BY` is applied by `DataFusion` downstream.
+fn reshape_regrouped(
+    combined: &BTreeMap<GroupTuple, Vec<StatValue>>,
+    num_group_cols: usize,
+    specs: &[StatSpec<'_>],
+    schema: &SchemaRef,
+) -> anyhow::Result<RecordBatch> {
+    let entries: Vec<(&GroupTuple, &Vec<StatValue>)> = combined.iter().collect();
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(num_group_cols + specs.len());
+
+    #[allow(clippy::needless_range_loop)]
+    for j in 0..num_group_cols {
+        let values: Vec<Option<&[u8]>> = entries
+            .iter()
+            .map(|(tuple, _)| tuple[j].as_deref())
+            .collect();
+        arrays.push(group_column(schema.field(j).data_type(), &values));
+    }
+
+    let stat_rows: Vec<&[StatValue]> = entries.iter().map(|(_, st)| st.as_slice()).collect();
+    arrays.extend(stat_columns(&stat_rows, specs, schema, num_group_cols)?);
+
+    let options = RecordBatchOptions::new().with_row_count(Some(entries.len()));
     Ok(RecordBatch::try_new_with_options(
         Arc::clone(schema),
         arrays,
@@ -567,8 +832,9 @@ fn reshape_aggregate(
 }
 
 /// Build a group-key column from FTGS term-key bytes in the column's
-/// declared type: `Utf8` renders the term string, `Int64` decodes the
-/// order-preserving key. `None` (a `String` NULL group) is a SQL NULL.
+/// declared type: `Utf8` renders the term string, `Timestamp` decodes a
+/// time-bucket start (epoch seconds → ns), `Int64` decodes the order-preserving
+/// key. `None` (a `String` NULL group) is a SQL NULL.
 fn group_column(dtype: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {
     match dtype {
         DataType::Utf8 => Arc::new(StringArray::from(
@@ -576,6 +842,15 @@ fn group_column(dtype: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {
                 .iter()
                 .map(|v| v.map(|b| render_term(FieldKind::String, b)))
                 .collect::<Vec<Option<String>>>(),
+        )),
+        // Time-bucket group: the key decodes to the bucket-start epoch in
+        // seconds; scale to nanoseconds to match the time field's presented
+        // `Timestamp(Nanosecond)` type. Dense (the time field is non-null).
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => Arc::new(TimestampNanosecondArray::from(
+            values
+                .iter()
+                .map(|v| v.map(|b| decode_int_key(b).saturating_mul(1_000_000_000)))
+                .collect::<Vec<Option<i64>>>(),
         )),
         // `Int` group: dense, so a `None` here never occurs.
         _ => Arc::new(Int64Array::from(
