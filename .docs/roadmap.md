@@ -101,7 +101,16 @@ directly.
       object storage (LIST + N round-trips per query); must move behind a
       cached, version-checked catalog — see the per-dataset manifest item
       under Ingest. Marked incomplete until discovery is no longer
-      per-query.)
+      per-query. **Amplifier:** the FlightSQL two-phase flow plans the query
+      *twice* — `get_flight_info_statement` plans to return the output schema,
+      then `do_get_statement` plans again to execute (flight_sql.rs:616, :644)
+      — and each plan re-resolves the dataset through
+      `DatasetSchemaProvider::table` → `TutankhamunTableProvider::try_new`,
+      which touches storage on every reference (flight_sql.rs:1102). So a
+      single client query triggers discovery 2–3×. The manifest fix makes each
+      resolution a cheap cached read, so this collapses without needing a
+      separate change; caching the resolved provider/schema per dataset URL
+      would also help in the interim.)
 - [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
 - [ ] K8s DNS `ShardLocator` implementation — §1.3
 - [ ] Static-file `ShardLocator` implementation — §1.3
