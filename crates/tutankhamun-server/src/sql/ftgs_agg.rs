@@ -32,7 +32,7 @@ use roaring::RoaringBitmap;
 
 use super::group_by::{BucketUnit, GroupKey, OwnedStat};
 use super::pushdown::PushedFilter;
-use super::scan::{block_on_scan, chunked_stream, for_each_shard_batch};
+use super::scan::{ScanCtx, block_on_scan, chunked_stream, for_each_shard_batch};
 use crate::aggregate_cache::{AggregateCache, GroupTuple, ShardPartial};
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
@@ -43,6 +43,7 @@ use crate::ftgs::{
 use crate::group_lookup::GroupLookup;
 use crate::memory::SessionMemoryHandle;
 use crate::shard::{DiskShard, FieldKind, FilterResult, Shard, decode_int_key, encode_int_key};
+use crate::shard_source::ShardSummary;
 use crate::sketches::ThetaSketch;
 
 /// `ExecutionPlan` for a pushed-down aggregate (§3.2). Runs the
@@ -61,6 +62,9 @@ pub(crate) struct FtgsAggExec {
     /// Output schema, matching the `Aggregate` this replaces: the group
     /// columns (in `GROUP BY` order) followed by one column per stat.
     schema: SchemaRef,
+    /// The dataset's shard set, resolved once by the provider — the scan reuses
+    /// it instead of re-discovering.
+    summaries: Arc<Vec<ShardSummary>>,
     plan_properties: PlanProperties,
 }
 
@@ -72,6 +76,7 @@ impl FtgsAggExec {
         stats: Vec<OwnedStat>,
         filters: Vec<PushedFilter>,
         schema: SchemaRef,
+        summaries: Arc<Vec<ShardSummary>>,
     ) -> Self {
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&schema)),
@@ -86,6 +91,7 @@ impl FtgsAggExec {
             stats,
             filters,
             schema,
+            summaries,
             plan_properties,
         }
     }
@@ -145,17 +151,21 @@ impl ExecutionPlan for FtgsAggExec {
             .get_extension::<SessionMemoryHandle>();
         let bitmap_cache = context.session_config().get_extension::<BitmapCache>();
         let agg_cache = context.session_config().get_extension::<AggregateCache>();
+        let ctx = ScanCtx {
+            url: &self.url,
+            summaries: &self.summaries,
+            cache: &self.cache,
+            mem: mem.as_ref(),
+            bitmap_cache: bitmap_cache.as_ref(),
+        };
         let batch = block_on_scan(|| {
             aggregate_batch(
-                &self.url,
-                &self.cache,
+                &ctx,
+                agg_cache.as_ref(),
                 &self.group_cols,
                 &self.stats,
                 &self.filters,
                 &self.schema,
-                mem.as_ref(),
-                bitmap_cache.as_ref(),
-                agg_cache.as_ref(),
             )
         })?;
         // One row per group; cap every emitted batch to the session's
@@ -164,20 +174,16 @@ impl ExecutionPlan for FtgsAggExec {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn aggregate_batch(
-    url: &str,
-    cache: &Cache,
+    ctx: &ScanCtx<'_>,
+    agg_cache: Option<&Arc<AggregateCache>>,
     group_cols: &[GroupKey],
     stats: &[OwnedStat],
     filters: &[PushedFilter],
     schema: &SchemaRef,
-    mem: Option<&Arc<SessionMemoryHandle>>,
-    bitmap_cache: Option<&Arc<BitmapCache>>,
-    agg_cache: Option<&Arc<AggregateCache>>,
 ) -> anyhow::Result<RecordBatch> {
     if group_cols.is_empty() {
-        let acc = global_stats(url, cache, stats, filters, mem, bitmap_cache, agg_cache).await?;
+        let acc = global_stats(ctx, agg_cache, stats, filters).await?;
         return reshape_global(acc.as_deref(), stats, schema);
     }
     // A time bucket can't be the index-walked cursor (the time field's index is
@@ -187,32 +193,10 @@ async fn aggregate_batch(
         .iter()
         .any(|k| matches!(k, GroupKey::TimeBucket { .. }))
     {
-        return aggregate_regrouped(
-            url,
-            cache,
-            group_cols,
-            stats,
-            filters,
-            mem,
-            bitmap_cache,
-            agg_cache,
-            schema,
-        )
-        .await;
+        return aggregate_regrouped(ctx, agg_cache, group_cols, stats, filters, schema).await;
     }
     // All bare columns → the cursor-walk path (regroup the prefix, scan the last).
-    aggregate_grouped(
-        url,
-        cache,
-        group_cols,
-        stats,
-        filters,
-        mem,
-        bitmap_cache,
-        agg_cache,
-        schema,
-    )
-    .await
+    aggregate_grouped(ctx, agg_cache, group_cols, stats, filters, schema).await
 }
 
 /// Conservative per-doc heap working-set estimate for the bounded scan envelope
@@ -230,16 +214,12 @@ fn per_doc_estimate(group_cols: usize, stats: usize) -> u64 {
 /// cursor term) -> stats`. A `String` cursor can leave docs term-less; those form
 /// a NULL-cursor group. Partials cache per shard ([`AggregateCache`]) and combine
 /// across shards by tuple ([`combine_partial`]); shards stream in bounded batches.
-#[allow(clippy::too_many_arguments)]
 async fn aggregate_grouped(
-    url: &str,
-    cache: &Cache,
+    ctx: &ScanCtx<'_>,
+    agg_cache: Option<&Arc<AggregateCache>>,
     group_cols: &[GroupKey],
     stats: &[OwnedStat],
     filters: &[PushedFilter],
-    mem: Option<&Arc<SessionMemoryHandle>>,
-    bitmap_cache: Option<&Arc<BitmapCache>>,
-    agg_cache: Option<&Arc<AggregateCache>>,
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
@@ -255,7 +235,7 @@ async fn aggregate_grouped(
     let mut combined: BTreeMap<GroupTuple, Vec<StatValue>> = BTreeMap::new();
     let per_doc = per_doc_estimate(cols.len(), stat_specs.len());
 
-    for_each_shard_batch(url, cache, filters, mem, bitmap_cache, per_doc, |chunk| {
+    for_each_shard_batch(ctx, filters, per_doc, |chunk| {
         for (id, shard, selection) in chunk {
             let partial = cached_partial(agg_cache, *id, filters, group_cols, stats, || {
                 cursor_walk_shard(
@@ -410,16 +390,12 @@ fn accumulate_null_cursor(
 /// shards in bounded batches ([`for_each_shard_batch`]); the cross-shard `combo`
 /// and the running per-group stats accumulate across batches while each batch's
 /// shards drop.
-#[allow(clippy::too_many_arguments)]
 async fn aggregate_regrouped(
-    url: &str,
-    cache: &Cache,
+    ctx: &ScanCtx<'_>,
+    agg_cache: Option<&Arc<AggregateCache>>,
     group_cols: &[GroupKey],
     stats: &[OwnedStat],
     filters: &[PushedFilter],
-    mem: Option<&Arc<SessionMemoryHandle>>,
-    bitmap_cache: Option<&Arc<BitmapCache>>,
-    agg_cache: Option<&Arc<AggregateCache>>,
     schema: &SchemaRef,
 ) -> anyhow::Result<RecordBatch> {
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
@@ -429,7 +405,7 @@ async fn aggregate_regrouped(
     let mut combined: BTreeMap<GroupTuple, Vec<StatValue>> = BTreeMap::new();
     let per_doc = per_doc_estimate(group_cols.len(), stat_specs.len());
 
-    for_each_shard_batch(url, cache, filters, mem, bitmap_cache, per_doc, |chunk| {
+    for_each_shard_batch(ctx, filters, per_doc, |chunk| {
         for (id, shard, selection) in chunk {
             let partial = cached_partial(agg_cache, *id, filters, group_cols, stats, || {
                 process_regrouped_shard(shard, selection, group_cols, &stat_specs)
@@ -699,18 +675,15 @@ fn truncate_epoch(secs: i64, unit: BucketUnit) -> i64 {
 /// ([`for_each_shard_batch`]) — the running `acc` is all that survives between
 /// batches. `None` means no shard had a matching doc (empty input).
 async fn global_stats(
-    url: &str,
-    cache: &Cache,
+    ctx: &ScanCtx<'_>,
+    agg_cache: Option<&Arc<AggregateCache>>,
     stats: &[OwnedStat],
     filters: &[PushedFilter],
-    mem: Option<&Arc<SessionMemoryHandle>>,
-    bitmap_cache: Option<&Arc<BitmapCache>>,
-    agg_cache: Option<&Arc<AggregateCache>>,
 ) -> anyhow::Result<Option<Vec<StatValue>>> {
     let stat_specs: Vec<StatSpec> = stats.iter().map(OwnedStat::as_spec).collect();
     let mut acc: Option<Vec<StatValue>> = None;
     let per_doc = per_doc_estimate(0, stat_specs.len());
-    for_each_shard_batch(url, cache, filters, mem, bitmap_cache, per_doc, |chunk| {
+    for_each_shard_batch(ctx, filters, per_doc, |chunk| {
         for (id, shard, selection) in chunk {
             // No group keys: the shard's partial is a single group (empty tuple)
             // over the matched docs, cached per shard like the grouped paths.

@@ -73,6 +73,7 @@ use crate::bitmap_cache::BitmapCache;
 use crate::cache::{Cache, Validation};
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
+use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
 use crate::status::{DatasetLoad, DatasetsReport, SessionsSummary, StatusSource, StructuralReport};
@@ -119,6 +120,14 @@ struct ServiceInner {
     /// its own store — so a single root cache can't serve sub-prefix datasets.
     /// Keying by URL keeps each dataset's cache consistent across queries.
     caches: Mutex<HashMap<String, Arc<Cache>>>,
+    /// Resolved shard set per dataset URL, cached for the daemon's lifetime so
+    /// queries don't re-run `discover()` (a `list()` + GET of every shard's
+    /// metadata) on every plan. No invalidation in this slice: a dataset that
+    /// gains/loses shards after it's first queried needs a restart to refresh
+    /// (the per-dataset manifest follow-on adds cheap etag-based invalidation
+    /// behind this same seam). Only non-empty resolutions are cached, so a
+    /// not-yet-populated dataset still appears once it has shards.
+    summaries: Mutex<HashMap<String, Arc<Vec<ShardSummary>>>>,
     /// Live sessions keyed by their opaque token. Holds the persistent context
     /// (and its session-scoped temp views); reaped on idle / max age.
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -208,6 +217,54 @@ impl ServiceInner {
         )?);
         caches.insert(url.to_string(), Arc::clone(&cache));
         Ok(cache)
+    }
+
+    /// Resolve the dataset's shard set, cached for the daemon's lifetime. Warm
+    /// hits skip `discover()` (the per-query `list()` + N metadata GETs); the
+    /// same `Arc` then feeds schema resolution and the scan. Only non-empty
+    /// resolutions are cached (an empty result = dataset not yet populated, so
+    /// it re-resolves next time). See the `summaries` field for the no-
+    /// invalidation trade.
+    async fn resolve_summaries(&self, url: &str) -> anyhow::Result<Arc<Vec<ShardSummary>>> {
+        if let Some(s) = self
+            .summaries
+            .lock()
+            .expect("summaries cache lock")
+            .get(url)
+        {
+            return Ok(Arc::clone(s));
+        }
+        let registry = StorageRegistry::from_url(url)?;
+        let summaries = Arc::new(
+            ObjectStoreShardSource::new(registry.store())
+                .discover()
+                .await?,
+        );
+        if !summaries.is_empty() {
+            self.summaries
+                .lock()
+                .expect("summaries cache lock")
+                .insert(url.to_string(), Arc::clone(&summaries));
+        }
+        Ok(summaries)
+    }
+
+    /// Resolve the dataset at `url` to a registered table provider via the
+    /// cached shard set (`cache_for` + `resolve_summaries` + `from_summaries`),
+    /// or `None` if the dataset is empty / not yet populated. The single daemon
+    /// seam for "dataset URL → provider"; callers map the `Option`/error to their
+    /// own response (a query's "table not found", a listing's "skip").
+    async fn table_provider(&self, url: &str) -> anyhow::Result<Option<TutankhamunTableProvider>> {
+        let cache = self.cache_for(url)?;
+        let summaries = self.resolve_summaries(url).await?;
+        if summaries.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(TutankhamunTableProvider::from_summaries(
+            url.to_string(),
+            cache,
+            summaries,
+        )?))
     }
 
     /// Dataset names under the storage root — the top-level directories. A
@@ -331,6 +388,7 @@ impl TutankhamunFlightSqlService {
                 size_cap,
                 validation,
                 caches: Mutex::new(HashMap::new()),
+                summaries: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 prepared: Mutex::new(HashMap::new()),
                 budget,
@@ -886,24 +944,24 @@ impl FlightSqlService for TutankhamunFlightSqlService {
             if include {
                 let base = self.inner.storage_url.trim_end_matches('/');
                 let url = format!("{base}/{name}");
-                let cache = self
+                // Raced with eviction / an empty dir → `None`, just skip it.
+                let Some(p) = self
                     .inner
-                    .cache_for(&url)
-                    .map_err(|e| Status::internal(format!("cache: {e}")))?;
-                match TutankhamunTableProvider::try_new(url, cache).await {
-                    Ok(p) => builder
-                        .append(
-                            CATALOG_NAME,
-                            SCHEMA_NAME,
-                            &name,
-                            "TABLE",
-                            p.schema().as_ref(),
-                        )
-                        .map_err(|e| metadata_error(&e))?,
-                    // Raced with eviction / an empty dir — just skip it.
-                    Err(e) if e.to_string().contains("no shards") => {}
-                    Err(e) => return Err(Status::internal(format!("dataset schema: {e}"))),
-                }
+                    .table_provider(&url)
+                    .await
+                    .map_err(|e| Status::internal(format!("dataset schema: {e}")))?
+                else {
+                    continue;
+                };
+                builder
+                    .append(
+                        CATALOG_NAME,
+                        SCHEMA_NAME,
+                        &name,
+                        "TABLE",
+                        p.schema().as_ref(),
+                    )
+                    .map_err(|e| metadata_error(&e))?;
             } else {
                 builder
                     .append(CATALOG_NAME, SCHEMA_NAME, &name, "TABLE", &empty)
@@ -1092,16 +1150,12 @@ impl SchemaProvider for DatasetSchemaProvider {
 
         let base = self.inner.storage_url.trim_end_matches('/');
         let url = format!("{base}/{name}");
-        let cache = self
-            .inner
-            .cache_for(&url)
-            .map_err(|e| DataFusionError::External(e.into()))?;
-        // `try_new` derives the dataset's schema from its first shard, so this
-        // touches storage on every reference. An absent/empty dataset is a clean
-        // "table not found" (None), not an internal error.
-        match TutankhamunTableProvider::try_new(url, cache).await {
-            Ok(p) => Ok(Some(Arc::new(p) as Arc<dyn TableProvider>)),
-            Err(e) if e.to_string().contains("no shards") => Ok(None),
+        // Resolve through the daemon's cache (warm hits skip `discover()`); the
+        // provider holds the same `Arc` the scan reuses. An empty dataset is a
+        // clean "table not found" (None), not an internal error.
+        match self.inner.table_provider(&url).await {
+            Ok(Some(p)) => Ok(Some(Arc::new(p) as Arc<dyn TableProvider>)),
+            Ok(None) => Ok(None),
             Err(e) => Err(DataFusionError::External(e.into())),
         }
     }
@@ -1253,6 +1307,66 @@ mod tests {
         ));
         let baseline = mem.reserve(0).expect("baseline");
         Session::new(SessionContext::new(), now, baseline)
+    }
+
+    /// The per-dataset summary cache: a second resolve reuses the cached `Arc`
+    /// (no re-`discover()`), and an empty/not-yet-populated dataset isn't cached
+    /// (so it appears once it has shards).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_summaries_caches_and_skips_empty() {
+        use crate::shard::DiskShardWriter;
+
+        let root = tempfile::tempdir().expect("tmpdir");
+        let storage_url = url::Url::from_directory_path(root.path())
+            .expect("absolute")
+            .to_string();
+        let budget = Arc::new(MemoryBudget::new(u64::MAX));
+        let mk_cache = || Arc::new(SessionMemoryHandle::new(Arc::clone(&budget), u64::MAX));
+        let bitmap_cache = Arc::new(BitmapCache::new(mk_cache()));
+        let aggregate_cache = Arc::new(AggregateCache::new(mk_cache()));
+        let metrics = Metrics::new(
+            Arc::clone(&budget),
+            Arc::clone(&bitmap_cache),
+            Arc::clone(&aggregate_cache),
+        );
+        let svc = TutankhamunFlightSqlService::new(
+            storage_url.clone(),
+            root.path().join(".cache"),
+            u64::MAX,
+            Validation::Trust,
+            budget,
+            100,
+            bitmap_cache,
+            aggregate_cache,
+            metrics,
+        );
+        let ds_url = format!("{}/ds", storage_url.trim_end_matches('/'));
+
+        // No shards yet: resolves empty and is NOT cached.
+        let empty = svc
+            .inner
+            .resolve_summaries(&ds_url)
+            .await
+            .expect("resolve empty");
+        assert!(empty.is_empty());
+        assert!(
+            !svc.inner.summaries.lock().unwrap().contains_key(&ds_url),
+            "an empty dataset must not be cached, so it resolves again once populated",
+        );
+
+        // Populate one shard, then resolve twice — the second reuses the Arc.
+        let mut w =
+            DiskShardWriter::new(&root.path().join("ds").join("shard-0"), (0, 0)).expect("writer");
+        w.add_metric("x", vec![1, 2, 3]).expect("add_metric");
+        w.finalize().expect("finalize");
+
+        let first = svc.inner.resolve_summaries(&ds_url).await.expect("resolve");
+        assert_eq!(first.len(), 1, "the one written shard is discovered");
+        let second = svc.inner.resolve_summaries(&ds_url).await.expect("resolve");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the rerun reuses the cached shard set (no re-discover)",
+        );
     }
 
     #[test]

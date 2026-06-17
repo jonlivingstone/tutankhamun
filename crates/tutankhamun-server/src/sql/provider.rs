@@ -17,7 +17,7 @@ use super::exec::TutankhamunExec;
 use super::pushdown;
 use crate::cache::Cache;
 use crate::shard::{FieldKind, Metadata};
-use crate::shard_source::{ObjectStoreShardSource, ShardSource};
+use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
 use crate::storage::StorageRegistry;
 
 /// `DataFusion` `TableProvider` over a single Tutankhamun dataset.
@@ -35,6 +35,10 @@ pub struct TutankhamunTableProvider {
     /// pushdown rule consults this to tell a filterable `Int` group
     /// column from a non-filterable `Metric`.
     field_kinds: std::collections::BTreeMap<String, FieldKind>,
+    /// The dataset's shard set, resolved once at construction (cached by the
+    /// daemon, freshly discovered for one-shot CLI use). Handed to the execs so
+    /// the scan reuses it instead of re-discovering.
+    summaries: Arc<Vec<ShardSummary>>,
 }
 
 impl TutankhamunTableProvider {
@@ -63,10 +67,9 @@ impl TutankhamunTableProvider {
 }
 
 impl TutankhamunTableProvider {
-    /// Discover the dataset under `url`, derive an Arrow schema from
-    /// its first shard, and return a provider `DataFusion` can register.
-    /// Errors if the dataset is empty (no shards) — `DataFusion` has no
-    /// way to ask us for a schema if we can't read one.
+    /// Discover the dataset under `url` (one-shot, no cache) and build a
+    /// provider. Used by the CLI and as the daemon's fallback; the daemon's
+    /// hot path uses [`Self::from_summaries`] with cached summaries.
     pub async fn try_new(url: String, cache: Arc<Cache>) -> anyhow::Result<Self> {
         let registry = StorageRegistry::from_url(&url)?;
         let source = ObjectStoreShardSource::new(registry.store());
@@ -74,15 +77,22 @@ impl TutankhamunTableProvider {
             .discover()
             .await
             .with_context(|| format!("discover shards at {url}"))?;
+        Self::from_summaries(url, cache, Arc::new(summaries))
+    }
+
+    /// Build a provider from an already-resolved shard set — no I/O. Derives the
+    /// Arrow schema from the first shard and checks every shard shares a field
+    /// set (a dataset is one logical table; a diverging shard would mis-project
+    /// or fail deep in the scan rather than here at registration). Errors if the
+    /// dataset is empty — `DataFusion` has no schema to register without a shard.
+    pub(crate) fn from_summaries(
+        url: String,
+        cache: Arc<Cache>,
+        summaries: Arc<Vec<ShardSummary>>,
+    ) -> anyhow::Result<Self> {
         let first = summaries
             .first()
             .ok_or_else(|| anyhow::anyhow!("no shards at {url}"))?;
-        // A dataset is one logical table, so every shard must share a
-        // field set. The query path projects against this single
-        // schema; a diverging shard would otherwise mis-project or
-        // fail deep in the scan rather than here at registration.
-        // `discover()` already loaded every shard's metadata, so this
-        // check is a fold over in-memory data, no extra I/O.
         for s in &summaries[1..] {
             if s.metadata.fields != first.metadata.fields {
                 anyhow::bail!(
@@ -104,7 +114,14 @@ impl TutankhamunTableProvider {
             cache,
             schema,
             field_kinds,
+            summaries,
         })
+    }
+
+    /// The dataset's resolved shard set, shared with the execs this provider
+    /// builds so the scan reuses it instead of re-discovering.
+    pub(crate) fn summaries(&self) -> Arc<Vec<ShardSummary>> {
+        Arc::clone(&self.summaries)
     }
 }
 
@@ -146,6 +163,7 @@ impl TableProvider for TutankhamunTableProvider {
             Arc::clone(&self.cache),
             projected_schema,
             pushed,
+            self.summaries(),
         );
         Ok(Arc::new(exec))
     }

@@ -48,6 +48,7 @@ use super::pushdown::{PushedFilter, expr_to_pushed_filter};
 use crate::cache::Cache;
 use crate::ftgs::{OutputKind, StatSpec};
 use crate::shard::FieldKind;
+use crate::shard_source::ShardSummary;
 use crate::sketches::TDigest;
 
 /// A `SessionContext` with the `GROUP BY` pushdown rule + planner wired
@@ -214,6 +215,9 @@ pub(crate) struct FtgsAggregate {
     stats: Vec<OwnedStat>,
     filters: Vec<PushedFilter>,
     schema: DFSchemaRef,
+    /// The dataset's shard set, resolved once by the provider and carried through
+    /// to the exec so the scan reuses it. Not part of logical identity.
+    summaries: Arc<Vec<ShardSummary>>,
 }
 
 impl FtgsAggregate {
@@ -383,6 +387,7 @@ fn try_build(agg: &Aggregate) -> DfResult<Option<FtgsAggregate>> {
         stats,
         filters,
         schema: Arc::clone(&agg.schema),
+        summaries: prov.summaries(),
     }))
 }
 
@@ -587,6 +592,7 @@ impl ExtensionPlanner for FtgsAggregatePlanner {
             node.stats.clone(),
             node.filters.clone(),
             Arc::clone(node.schema.inner()),
+            Arc::clone(&node.summaries),
         );
         Ok(Some(Arc::new(exec)))
     }

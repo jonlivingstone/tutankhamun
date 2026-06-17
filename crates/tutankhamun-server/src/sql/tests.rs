@@ -1659,11 +1659,17 @@ async fn scan_envelope_is_span_independent_and_released() {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::memory::{MemoryBudget, SessionMemoryHandle};
-    use crate::sql::scan::{for_each_shard_batch, scan_batch_width};
+    use crate::shard_source::{ObjectStoreShardSource, ShardSource};
+    use crate::sql::scan::{ScanCtx, for_each_shard_batch, scan_batch_width};
 
     let tmp = tempfile::tempdir().expect("tmpdir");
     write_two_shard_dataset(tmp.path());
     let (cache, url, _cache_dir) = cache_for(tmp.path());
+    let summaries =
+        ObjectStoreShardSource::new(StorageRegistry::from_url(&url).expect("registry").store())
+            .discover()
+            .await
+            .expect("discover");
 
     // Shard A has 4 docs, shard B has 2; width is 1 in tests (no Rayon pool).
     // The bounded envelope is width × max_docs(4) × per_doc, independent of the
@@ -1679,7 +1685,14 @@ async fn scan_envelope_is_span_independent_and_released() {
         envelope + 1,
     ));
     let peak = AtomicU64::new(0);
-    for_each_shard_batch(&url, &cache, &[], Some(&handle), None, per_doc, |chunk| {
+    let ctx = ScanCtx {
+        url: &url,
+        summaries: &summaries,
+        cache: &cache,
+        mem: Some(&handle),
+        bitmap_cache: None,
+    };
+    for_each_shard_batch(&ctx, &[], per_doc, |chunk| {
         assert!(
             chunk.len() <= width.max(1),
             "residency bounded to the width"
@@ -1701,7 +1714,14 @@ async fn scan_envelope_is_span_independent_and_released() {
         Arc::new(MemoryBudget::new(1 << 30)),
         envelope - 1,
     ));
-    let err = for_each_shard_batch(&url, &cache, &[], Some(&tight), None, per_doc, |_| Ok(()))
+    let tight_ctx = ScanCtx {
+        url: &url,
+        summaries: &summaries,
+        cache: &cache,
+        mem: Some(&tight),
+        bitmap_cache: None,
+    };
+    let err = for_each_shard_batch(&tight_ctx, &[], per_doc, |_| Ok(()))
         .await
         .expect_err("envelope exceeds the cap");
     assert!(err.to_string().contains("budget exceeded"), "{err}");

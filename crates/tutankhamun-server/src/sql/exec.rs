@@ -26,11 +26,12 @@ use datafusion::physical_plan::{
 };
 
 use super::pushdown::PushedFilter;
-use super::scan::{block_on_scan, chunked_stream, for_each_shard_batch};
+use super::scan::{ScanCtx, block_on_scan, chunked_stream, for_each_shard_batch};
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::memory::SessionMemoryHandle;
 use crate::shard::{DiskShard, FilterResult, Shard};
+use crate::shard_source::ShardSummary;
 
 #[derive(Debug)]
 pub(crate) struct TutankhamunExec {
@@ -42,6 +43,9 @@ pub(crate) struct TutankhamunExec {
     /// Owned form of pushed-down predicates so the plan can hold
     /// them past the lifetime of the originating `scan` call.
     pushed: Vec<PushedFilter>,
+    /// The dataset's shard set, resolved once by the provider — the scan reuses
+    /// it instead of re-discovering.
+    summaries: Arc<Vec<ShardSummary>>,
     plan_properties: PlanProperties,
 }
 
@@ -51,6 +55,7 @@ impl TutankhamunExec {
         cache: Arc<Cache>,
         projected_schema: SchemaRef,
         pushed: Vec<PushedFilter>,
+        summaries: Arc<Vec<ShardSummary>>,
     ) -> Self {
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(Arc::clone(&projected_schema)),
@@ -63,6 +68,7 @@ impl TutankhamunExec {
             cache,
             projected_schema,
             pushed,
+            summaries,
             plan_properties,
         }
     }
@@ -115,16 +121,15 @@ impl ExecutionPlan for TutankhamunExec {
             .session_config()
             .get_extension::<SessionMemoryHandle>();
         let bitmap_cache = context.session_config().get_extension::<BitmapCache>();
-        let batches = block_on_scan(|| {
-            collect_batches(
-                &self.url,
-                &self.cache,
-                &self.pushed,
-                &self.projected_schema,
-                mem.as_ref(),
-                bitmap_cache.as_ref(),
-            )
-        })?;
+        let ctx = ScanCtx {
+            url: &self.url,
+            summaries: &self.summaries,
+            cache: &self.cache,
+            mem: mem.as_ref(),
+            bitmap_cache: bitmap_cache.as_ref(),
+        };
+        let batches =
+            block_on_scan(|| collect_batches(&ctx, &self.pushed, &self.projected_schema))?;
         // Each shard contributes one (possibly large) batch; cap every emitted
         // batch to the session's configured row count for streaming.
         chunked_stream(batches, Arc::clone(&self.projected_schema), &context)
@@ -132,12 +137,9 @@ impl ExecutionPlan for TutankhamunExec {
 }
 
 async fn collect_batches(
-    url: &str,
-    cache: &Cache,
+    ctx: &ScanCtx<'_>,
     pushed: &[PushedFilter],
     projected_schema: &SchemaRef,
-    mem: Option<&Arc<SessionMemoryHandle>>,
-    bitmap_cache: Option<&Arc<BitmapCache>>,
 ) -> anyhow::Result<Vec<RecordBatch>> {
     // Stream shards in bounded batches so forward-column *residency* stays
     // bounded to `scan_batch_width` shards regardless of span. NOTE: the
@@ -150,7 +152,7 @@ async fn collect_batches(
     // term-deduplicated, so counting them at 8 B/doc over-estimates — keeping
     // the bound conservative.
     let per_doc = (projected_schema.fields().len().max(1) * std::mem::size_of::<i64>()) as u64;
-    for_each_shard_batch(url, cache, pushed, mem, bitmap_cache, per_doc, |chunk| {
+    for_each_shard_batch(ctx, pushed, per_doc, |chunk| {
         for (_id, shard, selection) in chunk {
             let batch = build_record_batch(shard, selection, projected_schema)?;
             if batch.num_rows() > 0 {

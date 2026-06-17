@@ -23,8 +23,7 @@ use crate::cache::Cache;
 use crate::memory::SessionMemoryHandle;
 use crate::runtime;
 use crate::shard::{DiskShard, FilterClause, FilterResult, matched_doc_set};
-use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
-use crate::storage::StorageRegistry;
+use crate::shard_source::ShardSummary;
 
 /// Run a scan's async work to completion from `DataFusion`'s
 /// synchronous `execute`, on a dedicated scoped thread with its own
@@ -78,6 +77,20 @@ fn intersects_query_window(summary: &ShardSummary, pushed: &[PushedFilter]) -> b
         .is_none_or(|(from, to)| summary.intersects_time_range(from, to))
 }
 
+/// Per-query scan substrate threaded through the shard driver and both scan
+/// paths: where the dataset lives (`url`), its shard set resolved once by the
+/// caller (`summaries`), the file cache, and the optional per-session memory
+/// handle + §2.8 bitmap cache. Borrowed for the duration of one query — a
+/// parameter object so the scan/aggregate functions forward one reference
+/// instead of five repeated arguments.
+pub(crate) struct ScanCtx<'a> {
+    pub url: &'a str,
+    pub summaries: &'a [ShardSummary],
+    pub cache: &'a Cache,
+    pub mem: Option<&'a Arc<SessionMemoryHandle>>,
+    pub bitmap_cache: Option<&'a Arc<BitmapCache>>,
+}
+
 /// Drive a query over its shards in **bounded-concurrency batches**, calling
 /// `work` with each batch's opened shards (and their resolved matched-doc sets)
 /// and dropping the batch — releasing its forward-column residency — before the
@@ -94,27 +107,23 @@ fn intersects_query_window(summary: &ShardSummary, pushed: &[PushedFilter]) -> b
 /// working set a doc contributes (gathered columns / group + stat buffers).
 /// `None` (the `t9n sql` CLI) charges nothing.
 ///
-/// When `bitmap_cache` is set, the matched-doc set is served through the §2.8
+/// When `ctx.bitmap_cache` is set, the matched-doc set is served through the §2.8
 /// cache (exact hit or monotone-narrowing reuse); `None` resolves directly via
 /// [`matched_doc_set`].
 pub(crate) async fn for_each_shard_batch<F>(
-    url: &str,
-    cache: &Cache,
+    ctx: &ScanCtx<'_>,
     pushed: &[PushedFilter],
-    mem: Option<&Arc<SessionMemoryHandle>>,
-    bitmap_cache: Option<&Arc<BitmapCache>>,
     per_doc_bytes: u64,
     mut work: F,
 ) -> anyhow::Result<()>
 where
     F: FnMut(&[(u64, DiskShard, FilterResult)]) -> anyhow::Result<()>,
 {
-    let registry = StorageRegistry::from_url(url)?;
-    let source = ObjectStoreShardSource::new(registry.store());
-    let summaries = source.discover().await?;
-    // Time-prune up front (cheap — metadata only), so the envelope and batching
-    // see only the shards the query can actually touch.
-    let selected: Vec<&ShardSummary> = summaries
+    // The dataset's shard set is resolved once per query by the caller (cached in
+    // the daemon); here we only time-prune it (cheap — metadata only), so the
+    // envelope and batching see only the shards the query can actually touch.
+    let selected: Vec<&ShardSummary> = ctx
+        .summaries
         .iter()
         .filter(|s| intersects_query_window(s, pushed))
         .collect();
@@ -126,7 +135,7 @@ where
     // than the biggest selected shard. Span-independent — querying all history
     // costs the same as querying one batch — so admission gates on a bounded
     // number and an admitted query is guaranteed room.
-    let _envelope = match mem {
+    let _envelope = match ctx.mem {
         Some(handle) => {
             let max_docs = selected
                 .iter()
@@ -144,10 +153,10 @@ where
     for chunk in selected.chunks(width) {
         let mut shards: Vec<(u64, DiskShard, FilterResult)> = Vec::with_capacity(chunk.len());
         for summary in chunk {
-            let id = BitmapCache::shard_id(url, summary.location.as_ref());
-            let local_dir = cache.fetch_shard(summary).await?;
+            let id = BitmapCache::shard_id(ctx.url, summary.location.as_ref());
+            let local_dir = ctx.cache.fetch_shard(summary).await?;
             let shard = DiskShard::open(&local_dir)?;
-            let selection = if let Some(bc) = bitmap_cache {
+            let selection = if let Some(bc) = ctx.bitmap_cache {
                 bc.resolve(&shard, id, pushed)?
             } else {
                 let clauses: Vec<FilterClause<'_>> =
