@@ -57,13 +57,15 @@ directly.
       format version, content hashes) — §2.1
 - [x] Forward column writer — uncompressed single-batch Arrow IPC
       via `arrow-rs` — §2.1
-- [~] Forward column reader — §2.1. **mmap zero-copy NOT implemented.**
-      `DiskShard::open` reads `metrics.arrow` into a heap `RecordBatch` via
-      Arrow `FileReader` (`shard/mod.rs`), not the `memmap2` + `bytemuck`
-      `&[i64]` path §2.1 specifies (`bytemuck` isn't even a dependency). The
-      indexes *are* mmap'd; the forward columns are not. This makes shard
-      `open` both slow and heap-heavy (measured: ~700ms warm / 11.5s cold to
-      open 62 nyc_taxi shards, ~3.7 GB heap). See Tech debt §1.
+- [x] Forward column reader — mmap zero-copy `&[i64]` — §2.1
+      (`DiskShard::open` mmaps `metrics.arrow` and decodes its single batch via
+      Arrow's `FileDecoder` over a `Buffer::from_custom_allocation` wrapping the
+      mapping — `forward_column` returns a view straight into the file, no heap
+      copy, no `bytemuck` needed (arrow's `ScalarBuffer<i64>` derefs to `&[i64]`).
+      An in-crate test asserts the slice's address lies inside the mmap. Measured
+      on 62 nyc_taxi shards: `open` dropped from ~700ms warm / 11.5s cold to
+      ~21ms warm / ~95ms cold, and the ~3.7 GB heap moved to reclaimable page
+      cache. The indexes were already mmap'd; now the forward columns are too.)
 - [x] Inverted index writer — `roaring` bitmaps per term + `fst`
       term dictionary — §2.1
 - [x] Inverted index reader — FST range scan + Roaring bitmap
@@ -613,43 +615,34 @@ v1 must respect so v2 is a localized change.
 Known gaps and consolidations deferred from shipped work. Not features —
 cleanups/fixes we don't want to lose track of.
 
-1. **Forward columns read into heap, not mmap'd — §2.1.** `DiskShard::open`
-   parses `metrics.arrow` into a heap `RecordBatch` via Arrow `FileReader`
-   instead of the mmap + `bytemuck` zero-copy `&[i64]` path the design
-   specifies. Consequences, measured on 62 weekly nyc_taxi shards: shard
-   `open` is ~700ms warm / 11.5s cold and holds ~3.7 GB resident; and because
-   `open` happens fresh per query (the `Cache` caches files, not parsed
-   shards), it dominates query latency — e.g. a repeated `avg(fare_amount)`
-   spends ~85% of its time in `open`, swamping the aggregate cache's win. Fix:
-   mmap the single uncompressed batch and cast the values buffer to `&[i64]`
-   (the writer already enforces the one-batch invariant that makes this safe).
-   This makes `open` cheap *and* makes keeping shards resident ~free (page
-   cache, reclaimable), and speeds every query (row scans included), not just
-   repeated aggregates.
-2. **Aggregate-cache probe happens after shard open.** `cached_partial` is
-   called inside the scan's `work` callback, i.e. after `fetch_shard` +
-   `DiskShard::open`. The cache key's `shard_id` is derivable from the
-   discovery `ShardSummary` *without* opening the shard, so a full cache hit
-   could skip fetch+open entirely. Probe-before-open would make a cached
-   aggregate rerun near-instant. Lower priority once tech-debt §1 lands (mmap
-   makes open cheap regardless); revisit after.
-3. **`BitmapCache` and `AggregateCache` duplicate LRU machinery.** Two
+1. **Repeated queries re-open shards (parse footer + build array views +
+   mmap indexes) every time.** The `Cache` caches shard *files* on disk, not
+   the parsed `DiskShard`, so `DiskShard::open` runs fresh per query. Since
+   forward columns are now mmap'd zero-copy (§2.1), open is cheap (~21ms warm
+   for 62 nyc_taxi shards), so this is low priority — but two refinements
+   remain if shard counts grow large: (a) a **resident-shard LRU** keyed by
+   `shard_id` (now ~free in memory since residency is page-cache-backed), and
+   (b) **probe the aggregate cache before open** — `shard_id` is derivable from
+   the discovery `ShardSummary` without opening, so a full cache hit could skip
+   open entirely (~21ms → ~8ms discover-only). Both largely obviated by the
+   mmap win; revisit only at scale.
+2. **`BitmapCache` and `AggregateCache` duplicate LRU machinery.** Two
    daemon-shared caches with near-identical `Mutex<state>` + clock-LRU +
    `reserve_with_eviction`/`evict_oldest` + byte accounting + counters,
    differing only in key/value type and the bitmap cache's monotone-narrowing.
    A shared `LruCache<K, V>` (budget + eviction + counters) with the two as
    thin shims would remove the duplication. A bug in eviction must be fixed in
    both today.
-4. **Filter normalization duplicated.** `aggregate_cache.rs` sorts+dedups its
+3. **Filter normalization duplicated.** `aggregate_cache.rs` sorts+dedups its
    filter clauses inline; `bitmap_cache.rs::normalize` does the same. Move the
    canonicalization next to `PushedFilter` (`sql/pushdown.rs`) and have both
    caches call it, so the set-semantics policy lives in one place. (Folds into
-   §3 if that consolidation happens.)
-5. **Cache budget is per-cache, not a shared pool.** The bitmap and aggregate
+   §2 if that consolidation happens.)
+4. **Cache budget is per-cache, not a shared pool.** The bitmap and aggregate
    caches each get their own `cache_pct`%-of-`mem_limit` sub-budget, so total
    cache memory can reach `2 × cache_pct`% (default 25% → up to 50%), bounded by
    the global budget. Separate slices are intentional (a shared cap would let
    one cache starve the other's eviction — see `build_budget_and_caches`), but
    if cache pressure on sessions becomes a problem, revisit: a single shared
-   `cache_pct` pool with combined eviction (needs §3's shared `LruCache`) or a
+   `cache_pct` pool with combined eviction (needs §2's shared `LruCache`) or a
    distinct `--aggregate-cache-pct` flag.

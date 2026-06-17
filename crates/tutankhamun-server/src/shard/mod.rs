@@ -30,11 +30,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{Array, Int64Array, RecordBatch};
+use arrow::buffer::Buffer;
 use arrow::datatypes::DataType;
-use arrow::ipc::reader::FileReader;
 use chrono::DateTime;
 use fst::{IntoStreamer, Streamer};
 use memmap2::Mmap;
@@ -310,20 +312,118 @@ fn mmap_readonly(path: &Path) -> Result<Mmap> {
     Ok(mmap)
 }
 
+/// mmap `metrics.arrow` and decode its single record batch **zero-copy**: the
+/// returned batch's `Int64` buffers are views into the mapping (arrow only
+/// re-copies a column if it were misaligned, which the writer's 64-byte
+/// alignment prevents). `Mmap` satisfies Arrow's `Allocation` marker trait via
+/// its blanket impl, so the returned `Arc<Mmap>` owns the mapping both directly
+/// and behind the batch's buffers — it must outlive the batch.
+///
+/// Preserves the one-uncompressed-batch invariant: errors unless the IPC footer
+/// lists exactly one record batch.
+fn mmap_forward_batch(path: &Path) -> Result<(RecordBatch, Arc<Mmap>)> {
+    use arrow::ipc::convert::fb_to_schema;
+    use arrow::ipc::reader::{FileDecoder, read_footer_length};
+    use arrow::ipc::root_as_footer;
+
+    let mmap = Arc::new(mmap_readonly(path)?);
+    let bytes: &[u8] = &mmap;
+    if bytes.len() < 10 {
+        bail!(
+            "{}: truncated Arrow IPC file ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    }
+    let ptr = NonNull::new(bytes.as_ptr().cast_mut()).expect("mmap of non-empty file is non-null");
+    let len = bytes.len();
+    #[allow(unsafe_code)]
+    // SAFETY: `ptr`/`len` describe the live, immutable mmap; the cloned `Arc`
+    // owner (an `Allocation`) keeps it mapped for as long as any `Buffer`
+    // derived from it lives. Shard files are immutable post-rename.
+    let buffer = unsafe { Buffer::from_custom_allocation(ptr, len, mmap.clone()) };
+
+    let trailer_start = buffer.len() - 10;
+    let footer_len = read_footer_length(buffer[trailer_start..].try_into().unwrap())
+        .with_context(|| format!("{}: bad IPC footer length", path.display()))?;
+    // A corrupt footer length could exceed the file; reject it rather than
+    // underflow-panicking on the slice (the writer's files are always valid,
+    // but object storage can hand back a truncated/corrupt read in Trust mode).
+    let footer_start = trailer_start.checked_sub(footer_len).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: IPC footer length {footer_len} exceeds file",
+            path.display()
+        )
+    })?;
+    let footer = root_as_footer(&buffer[footer_start..trailer_start])
+        .map_err(|e| anyhow::anyhow!("{}: parse IPC footer: {e}", path.display()))?;
+
+    let ipc_schema = footer
+        .schema()
+        .ok_or_else(|| anyhow::anyhow!("{}: IPC footer has no schema", path.display()))?;
+    let schema = Arc::new(fb_to_schema(ipc_schema));
+    let decoder = FileDecoder::new(schema, footer.version());
+
+    let batches = footer
+        .recordBatches()
+        .ok_or_else(|| anyhow::anyhow!("{}: IPC footer has no record batches", path.display()))?;
+    if batches.len() != 1 {
+        bail!(
+            "{}: forward-column invariant violated: expected exactly one record batch, found {}",
+            path.display(),
+            batches.len(),
+        );
+    }
+
+    let block = batches.get(0);
+    // Footer block offsets/lengths are non-negative file positions. Reject a
+    // corrupt footer (negative, or out of the file's bounds) rather than
+    // wrapping on the cast or panicking inside `slice_with_length`.
+    let offset = usize::try_from(block.offset()).context("negative IPC block offset")?;
+    let body = usize::try_from(block.bodyLength()).context("negative IPC body length")?;
+    let meta = usize::try_from(block.metaDataLength()).context("negative IPC metadata length")?;
+    let block_len = body
+        .checked_add(meta)
+        .ok_or_else(|| anyhow::anyhow!("{}: IPC block length overflow", path.display()))?;
+    let in_bounds = offset
+        .checked_add(block_len)
+        .is_some_and(|end| end <= buffer.len());
+    if !in_bounds {
+        bail!(
+            "{}: IPC block [{offset}..+{block_len}) exceeds file size {}",
+            path.display(),
+            buffer.len(),
+        );
+    }
+    let data = buffer.slice_with_length(offset, block_len);
+    let batch = decoder
+        .read_record_batch(block, &data)
+        .with_context(|| format!("{}: decode record batch", path.display()))?
+        .ok_or_else(|| anyhow::anyhow!("{}: empty record batch message", path.display()))?;
+
+    Ok((batch, mmap))
+}
+
 /// A shard backed by files on local disk.
 ///
-/// `metrics.arrow` is read into Arrow's heap buffers at open time —
-/// a 1 GB shard means ~1 GB of resident heap per open. The hot-path
-/// `&[i64]` slice returned by [`Shard::forward_column`] is a borrow
-/// into those buffers. True mmap-backed zero-copy reads for forward
-/// columns are a later optimisation; the trait signature does not
-/// foreclose it.
-///
-/// Inverted-index files (FST + postings) are already mmap'd.
+/// `metrics.arrow` is mmap'd zero-copy at open time: the `&[i64]` slice returned
+/// by [`Shard::forward_column`] is a view directly into the mapped file (paged
+/// in on demand by the OS, evictable under memory pressure — not process heap).
+/// Inverted-index files (FST + postings) are mmap'd the same way. So opening a
+/// shard reads no column data into the heap; it parses the IPC footer and builds
+/// array views over the mapping.
 pub struct DiskShard {
     metadata: Metadata,
     batch: RecordBatch,
     indexes: HashMap<String, InvertedIndex>,
+    /// Keeps the `metrics.arrow` mapping alive for the shard's lifetime: the
+    /// forward-column `Buffer`s are views into it via Arrow's custom allocation,
+    /// so it must not drop while `batch` lives. Held explicitly (not just via the
+    /// buffers' internal `Arc`) to make the contract visible and robust to any
+    /// future transform that replaces `batch`. Never read in normal operation —
+    /// its job is ownership.
+    #[allow(dead_code)]
+    mmap: Arc<Mmap>,
 }
 
 impl DiskShard {
@@ -351,22 +451,7 @@ impl DiskShard {
             );
         }
 
-        let file = fs::File::open(&metrics_path)
-            .with_context(|| format!("open {}", metrics_path.display()))?;
-        let mut reader = FileReader::try_new(file, None)
-            .with_context(|| format!("parse Arrow IPC {}", metrics_path.display()))?;
-
-        let batch = reader
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("{}: no record batches", metrics_path.display()))?
-            .with_context(|| format!("read record batch from {}", metrics_path.display()))?;
-
-        if reader.next().is_some() {
-            bail!(
-                "{}: forward-column invariant violated: expected exactly one record batch",
-                metrics_path.display(),
-            );
-        }
+        let (batch, mmap) = mmap_forward_batch(&metrics_path)?;
 
         validate_schema_matches(&metadata, &batch, &metrics_path)?;
         if batch.num_rows() as u64 != metadata.num_docs {
@@ -384,6 +469,7 @@ impl DiskShard {
             metadata,
             batch,
             indexes,
+            mmap,
         })
     }
 }

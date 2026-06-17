@@ -106,6 +106,49 @@ fn disk_shard_roundtrip_multi_column() {
 }
 
 #[test]
+fn forward_column_is_a_view_into_the_mmap() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let values: Vec<i64> = vec![10, 20, 30, 40];
+    write_shard(tmp.path(), (0, 0), vec![("x", values.clone())]);
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    let col = shard.forward_column("x").expect("column x");
+    assert_eq!(col, values.as_slice());
+
+    // The slice's bytes must lie inside the mmap'd metrics.arrow — proving the
+    // forward column is a zero-copy view into the file, not a heap copy.
+    let map: &[u8] = &shard.mmap;
+    let map_start = map.as_ptr() as usize;
+    let map_end = map_start + map.len();
+
+    let col_start = col.as_ptr() as usize;
+    let col_end = col_start + std::mem::size_of_val(col);
+    assert!(
+        col_start >= map_start && col_end <= map_end,
+        "forward column ({col_start:#x}..{col_end:#x}) not inside mmap \
+         ({map_start:#x}..{map_end:#x}) — read was not zero-copy",
+    );
+}
+
+#[test]
+fn open_rejects_corrupt_metrics_file_without_panicking() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    write_shard(tmp.path(), (0, 0), vec![("x", vec![1, 2, 3])]);
+    // Clobber the forward-column file with garbage — past the 10-byte truncation
+    // guard, into footer parsing — so a corrupt footer length / block bounds must
+    // produce a clean error rather than an underflow / `slice_with_length` panic.
+    std::fs::write(tmp.path().join("metrics.arrow"), [0xABu8; 64]).expect("clobber");
+
+    let err = DiskShard::open(tmp.path())
+        .err()
+        .expect("corrupt metrics.arrow must error");
+    assert!(
+        err.to_string().contains("metrics.arrow"),
+        "error should name the file: {err}",
+    );
+}
+
+#[test]
 fn disk_shard_rejects_missing_metadata() {
     let tmp = tempfile::tempdir().expect("tmpdir");
     let err = DiskShard::open(tmp.path())
