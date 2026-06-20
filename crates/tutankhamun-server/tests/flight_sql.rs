@@ -38,8 +38,9 @@ fn bitmap(docs: impl IntoIterator<Item = u32>) -> RoaringBitmap {
 /// One shard `s0` under `{root}/ds1`: country us→{0,2}, de→{1,3};
 /// fare [100, 200, 300, 400]. So count(*) = 4, sum(fare) per country: us=400,
 /// de=600.
-fn write_dataset(root: &Path) {
-    let shard = root.join("ds1").join("s0");
+async fn write_dataset(root: &Path) {
+    let dataset = root.join("ds1");
+    let shard = dataset.join("s0");
     let mut w = DiskShardWriter::new(&shard, (0, 0)).expect("new shard");
     w.add_metric("fare", vec![100, 200, 300, 400])
         .expect("fare");
@@ -48,6 +49,11 @@ fn write_dataset(root: &Path) {
     country.insert("de".to_string(), bitmap([1, 3]));
     w.add_string_field("country", country).expect("country");
     w.finalize().expect("finalize");
+    // Publish the dataset catalog, as ingest would — the daemon resolves the
+    // shard set from the manifest.
+    tutankhamun_server::ingest::write_local_manifest(&dataset)
+        .await
+        .expect("write manifest");
 }
 
 async fn connect(addr: SocketAddr) -> FlightSqlServiceClient<Channel> {
@@ -96,7 +102,7 @@ async fn start_with_budget(
 ) {
     let storage = tempfile::tempdir().expect("storage tmp");
     let cache = tempfile::tempdir().expect("cache tmp");
-    write_dataset(storage.path());
+    write_dataset(storage.path()).await;
     let storage_url = url::Url::from_directory_path(storage.path())
         .expect("absolute path")
         .to_string();

@@ -93,24 +93,15 @@ directly.
 - [x] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
 - [x] `ShardSource` trait — server-side abstraction over where
       shards come from — §3.3 v1 disciplines
-- [~] Object-storage `ShardSource` implementation — §3.3 v1
-      (`ObjectStoreShardSource` works, but discovery is currently run
-      **per query** — a full `store.list()` + a GET of every shard's
-      `metadata.json` (shard_source.rs:81), called fresh from
-      `provider.rs`/`scan.rs` on every query. Not acceptable against
-      object storage (LIST + N round-trips per query); must move behind a
-      cached, version-checked catalog — see the per-dataset manifest item
-      under Ingest. Marked incomplete until discovery is no longer
-      per-query. **Amplifier:** the FlightSQL two-phase flow plans the query
-      *twice* — `get_flight_info_statement` plans to return the output schema,
-      then `do_get_statement` plans again to execute (flight_sql.rs:616, :644)
-      — and each plan re-resolves the dataset through
-      `DatasetSchemaProvider::table` → `TutankhamunTableProvider::try_new`,
-      which touches storage on every reference (flight_sql.rs:1102). So a
-      single client query triggers discovery 2–3×. The manifest fix makes each
-      resolution a cheap cached read, so this collapses without needing a
-      separate change; caching the resolved provider/schema per dataset URL
-      would also help in the interim.)
+- [x] Object-storage `ShardSource` implementation — §3.3 v1
+      (the daemon no longer discovers per query: it resolves a dataset's shard
+      set from the per-dataset manifest (Ingest, below) via
+      `ServiceInner::resolve_summaries`, etag-cached so a warm plan costs one
+      `head()` and the FlightSQL double-plan all hits the same cached `Arc`. The
+      old `store.list()` + N-metadata-GET walk (`ObjectStoreShardSource::discover`)
+      remains as the `ShardSource` impl behind the one-shot `t9n sql` CLI path
+      (`TutankhamunTableProvider::try_new`), where per-query cost is a non-issue;
+      the daemon hot path is off it entirely.)
 - [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
 - [ ] K8s DNS `ShardLocator` implementation — §1.3
 - [ ] Static-file `ShardLocator` implementation — §1.3
@@ -433,16 +424,23 @@ directly.
       `--state-dir`) — for cache in v1; for WAL in v2 — §3.3 v1
 - [ ] `flamdex-to-tutankhamun` migration tool — read old Imhotep
       Flamdex shards, write in new format — §2.1
-- [ ] Per-dataset manifest (catalog snapshot) — §3.3
-      (a small versioned object per dataset: the authoritative shard set
-      + schema + version, written atomically. Today `ShardSource::discover()`
-      runs a full `store.list()` **plus a GET of every shard's
-      `metadata.json` on every query** (shard_source.rs:81) — a LIST + N
-      round-trips per query, costly against S3/GCS. The manifest replaces
-      that with one manifest read + a cheap version/etag check, and a query
-      resolves a single consistent snapshot. Supersedes per-query
-      `discover()`; the manifest version is also the cache-invalidation
-      signal, so no manual `reload` op is needed.)
+- [x] Per-dataset manifest (catalog snapshot) — §3.3
+      (`manifest.json` at each dataset root — `{format_version, version,
+      shards: [{location, metadata}]}` — is the authoritative shard set
+      (`manifest.rs`). Ingest is the only writer: `upload_ingest_tree` (remote)
+      and `write_local_manifest` (local dir) call `write_manifest`, which merges
+      the just-written shards into any existing manifest (by location, new wins),
+      bumps the version, and PUTs it last (a manifest only ever names fully-present
+      shards). The daemon reads it via `resolve_summaries`: one `head()` for the
+      etag — unchanged → reuse the cached `Arc`, changed → re-read — so a re-ingest
+      is picked up without a restart and the FlightSQL double-plan shares one
+      parse. Replaces per-query `discover()` on the daemon path; a dataset with no
+      manifest has no shards (no discover() fallback — pre-v1, no back-compat).
+      Scope notes: schema is carried per-shard in each entry's metadata (no
+      separate dataset-level schema field yet); the write is a plain PUT under a
+      single-writer assumption — the atomic conditional-swap concurrent writers
+      need lands with *Atomic re-ingest* below. Follow-on: a short TTL on the
+      etag `head()` to coalesce the 2–3 resolves within one client query.)
 - [ ] Atomic re-ingest / replace in place — §3.3
       (rebuild a dataset's shards and swap the manifest atomically, so a
       query never sees a mixed/partial state mid-rewrite. Without the

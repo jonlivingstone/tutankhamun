@@ -260,6 +260,13 @@ impl Cache {
         Ok(())
     }
 
+    /// The object store this cache fetches shards from, rooted at the dataset
+    /// URL. Shared so the daemon can reuse the one store it already memoized per
+    /// dataset (e.g. to read the dataset's manifest) rather than reopening one.
+    pub(crate) fn store(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.store)
+    }
+
     /// Resident shard count and total bytes held in the local cache, for the
     /// `/status` "loaded" view. Cheap in-memory read of the cache state.
     pub(crate) fn resident(&self) -> (usize, u64) {

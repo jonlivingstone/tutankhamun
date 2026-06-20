@@ -73,7 +73,7 @@ use crate::bitmap_cache::BitmapCache;
 use crate::cache::{Cache, Validation};
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
-use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
+use crate::shard_source::ShardSummary;
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
 use crate::status::{DatasetLoad, DatasetsReport, SessionsSummary, StatusSource, StructuralReport};
@@ -108,6 +108,10 @@ pub struct TutankhamunFlightSqlService {
     inner: Arc<ServiceInner>,
 }
 
+/// A cached shard-set resolution: the manifest etag it was read at, paired with
+/// the parsed shard set. The etag gates reuse (see [`ServiceInner::summaries`]).
+type CachedSummaries = (String, Arc<Vec<ShardSummary>>);
+
 struct ServiceInner {
     storage_url: String,
     cache_dir: PathBuf,
@@ -120,14 +124,15 @@ struct ServiceInner {
     /// its own store — so a single root cache can't serve sub-prefix datasets.
     /// Keying by URL keeps each dataset's cache consistent across queries.
     caches: Mutex<HashMap<String, Arc<Cache>>>,
-    /// Resolved shard set per dataset URL, cached for the daemon's lifetime so
-    /// queries don't re-run `discover()` (a `list()` + GET of every shard's
-    /// metadata) on every plan. No invalidation in this slice: a dataset that
-    /// gains/loses shards after it's first queried needs a restart to refresh
-    /// (the per-dataset manifest follow-on adds cheap etag-based invalidation
-    /// behind this same seam). Only non-empty resolutions are cached, so a
-    /// not-yet-populated dataset still appears once it has shards.
-    summaries: Mutex<HashMap<String, Arc<Vec<ShardSummary>>>>,
+    /// Resolved shard set per dataset URL, keyed alongside the manifest object's
+    /// etag at the time it was read. A query resolves the shard set by reading
+    /// the dataset's `manifest.json`; this caches the parse so repeat plans skip
+    /// it. Invalidation is the etag: each resolve does a cheap `head()` on the
+    /// manifest, reuses the cached `Arc` when the etag is unchanged, and re-reads
+    /// when it differs — so a re-ingest is picked up without a restart. Only
+    /// non-empty resolutions with a known etag are cached, so a not-yet-populated
+    /// dataset (no manifest) still appears once it's ingested.
+    summaries: Mutex<HashMap<String, CachedSummaries>>,
     /// Live sessions keyed by their opaque token. Holds the persistent context
     /// (and its session-scoped temp views); reaped on idle / max age.
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -219,32 +224,44 @@ impl ServiceInner {
         Ok(cache)
     }
 
-    /// Resolve the dataset's shard set, cached for the daemon's lifetime. Warm
-    /// hits skip `discover()` (the per-query `list()` + N metadata GETs); the
-    /// same `Arc` then feeds schema resolution and the scan. Only non-empty
-    /// resolutions are cached (an empty result = dataset not yet populated, so
-    /// it re-resolves next time). See the `summaries` field for the no-
-    /// invalidation trade.
-    async fn resolve_summaries(&self, url: &str) -> anyhow::Result<Arc<Vec<ShardSummary>>> {
-        if let Some(s) = self
-            .summaries
-            .lock()
-            .expect("summaries cache lock")
-            .get(url)
+    /// Resolve the dataset's shard set from its `manifest.json`, caching the
+    /// parsed result keyed by the manifest's etag. A warm hit costs one `head()`
+    /// (etag unchanged → reuse the `Arc`); a re-ingest changes the etag and is
+    /// re-read, so the daemon picks up new shards without a restart. A dataset
+    /// with no manifest resolves empty and is not cached, so it appears once
+    /// it's ingested. The same `Arc` then feeds schema resolution and the scan.
+    async fn resolve_summaries(
+        &self,
+        url: &str,
+        store: &dyn ObjectStore,
+    ) -> anyhow::Result<Arc<Vec<ShardSummary>>> {
+        // Cheap freshness probe: the manifest's etag. Absent manifest → no shards.
+        let etag = match store.head(&crate::manifest::manifest_path()).await {
+            Ok(meta) => meta.e_tag,
+            Err(object_store::Error::NotFound { .. }) => return Ok(Arc::new(Vec::new())),
+            Err(e) => return Err(e.into()),
+        };
+
+        if let Some(etag) = &etag
+            && let Some((cached_etag, summaries)) = self
+                .summaries
+                .lock()
+                .expect("summaries cache lock")
+                .get(url)
+            && cached_etag == etag
         {
-            return Ok(Arc::clone(s));
+            return Ok(Arc::clone(summaries));
         }
-        let registry = StorageRegistry::from_url(url)?;
-        let summaries = Arc::new(
-            ObjectStoreShardSource::new(registry.store())
-                .discover()
-                .await?,
-        );
-        if !summaries.is_empty() {
+
+        let manifest = crate::manifest::load(store).await?.unwrap_or_default();
+        let summaries = Arc::new(manifest.into_summaries()?);
+        if let Some(etag) = etag
+            && !summaries.is_empty()
+        {
             self.summaries
                 .lock()
                 .expect("summaries cache lock")
-                .insert(url.to_string(), Arc::clone(&summaries));
+                .insert(url.to_string(), (etag, Arc::clone(&summaries)));
         }
         Ok(summaries)
     }
@@ -255,8 +272,12 @@ impl ServiceInner {
     /// seam for "dataset URL → provider"; callers map the `Option`/error to their
     /// own response (a query's "table not found", a listing's "skip").
     async fn table_provider(&self, url: &str) -> anyhow::Result<Option<TutankhamunTableProvider>> {
+        // One `cache_for` per resolution: it memoizes the dataset's store, which
+        // `resolve_summaries` reuses for its manifest `head()`/read rather than
+        // reopening one (and re-establishing the credential/HTTP stack on cloud
+        // backends) per call.
         let cache = self.cache_for(url)?;
-        let summaries = self.resolve_summaries(url).await?;
+        let summaries = self.resolve_summaries(url, &*cache.store()).await?;
         if summaries.is_empty() {
             return Ok(None);
         }
@@ -1150,9 +1171,10 @@ impl SchemaProvider for DatasetSchemaProvider {
 
         let base = self.inner.storage_url.trim_end_matches('/');
         let url = format!("{base}/{name}");
-        // Resolve through the daemon's cache (warm hits skip `discover()`); the
-        // provider holds the same `Arc` the scan reuses. An empty dataset is a
-        // clean "table not found" (None), not an internal error.
+        // Resolve through the daemon's manifest cache (warm hits skip the
+        // re-read on an unchanged etag); the provider holds the same `Arc` the
+        // scan reuses. An empty/absent dataset is a clean "table not found"
+        // (None), not an internal error.
         match self.inner.table_provider(&url).await {
             Ok(Some(p)) => Ok(Some(Arc::new(p) as Arc<dyn TableProvider>)),
             Ok(None) => Ok(None),
@@ -1309,9 +1331,9 @@ mod tests {
         Session::new(SessionContext::new(), now, baseline)
     }
 
-    /// The per-dataset summary cache: a second resolve reuses the cached `Arc`
-    /// (no re-`discover()`), and an empty/not-yet-populated dataset isn't cached
-    /// (so it appears once it has shards).
+    /// The per-dataset summary cache: a dataset with no manifest resolves empty
+    /// and isn't cached; once a manifest is written, a second resolve reuses the
+    /// cached `Arc` (etag unchanged → no re-read).
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_summaries_caches_and_skips_empty() {
         use crate::shard::DiskShardWriter;
@@ -1341,28 +1363,43 @@ mod tests {
             metrics,
         );
         let ds_url = format!("{}/ds", storage_url.trim_end_matches('/'));
+        let store = StorageRegistry::from_url(&ds_url)
+            .expect("registry")
+            .store();
 
-        // No shards yet: resolves empty and is NOT cached.
+        // No manifest yet: resolves empty and is NOT cached.
         let empty = svc
             .inner
-            .resolve_summaries(&ds_url)
+            .resolve_summaries(&ds_url, &*store)
             .await
             .expect("resolve empty");
         assert!(empty.is_empty());
         assert!(
             !svc.inner.summaries.lock().unwrap().contains_key(&ds_url),
-            "an empty dataset must not be cached, so it resolves again once populated",
+            "a manifest-less dataset must not be cached, so it resolves again once ingested",
         );
 
-        // Populate one shard, then resolve twice — the second reuses the Arc.
-        let mut w =
-            DiskShardWriter::new(&root.path().join("ds").join("shard-0"), (0, 0)).expect("writer");
+        // Write one shard and publish a manifest (as ingest would), then resolve
+        // twice — the second reuses the Arc (etag unchanged).
+        let ds_dir = root.path().join("ds");
+        let mut w = DiskShardWriter::new(&ds_dir.join("shard-0"), (0, 0)).expect("writer");
         w.add_metric("x", vec![1, 2, 3]).expect("add_metric");
         w.finalize().expect("finalize");
+        crate::ingest::write_local_manifest(&ds_dir)
+            .await
+            .expect("write manifest");
 
-        let first = svc.inner.resolve_summaries(&ds_url).await.expect("resolve");
-        assert_eq!(first.len(), 1, "the one written shard is discovered");
-        let second = svc.inner.resolve_summaries(&ds_url).await.expect("resolve");
+        let first = svc
+            .inner
+            .resolve_summaries(&ds_url, &*store)
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 1, "the one manifested shard resolves");
+        let second = svc
+            .inner
+            .resolve_summaries(&ds_url, &*store)
+            .await
+            .expect("resolve");
         assert!(
             Arc::ptr_eq(&first, &second),
             "the rerun reuses the cached shard set (no re-discover)",
