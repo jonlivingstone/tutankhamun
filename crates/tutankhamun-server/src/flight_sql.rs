@@ -100,6 +100,11 @@ const MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 /// `SessionContext` and cursor state, and the lever for admission control: if
 /// this can't be reserved the daemon is at capacity (§2.2). Tunable.
 const SESSION_BASELINE_BYTES: u64 = 1 << 20; // 1 MiB
+/// How long a planned-but-unfetched statement ticket lives before the reaper
+/// drops it. A client issues `DoGet` immediately after `GetFlightInfo`, so an
+/// entry only lingers if the client abandons the query mid-flow; this bounds
+/// that leak. Plenty generous for any real client round-trip.
+const PLAN_TICKET_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// `FlightSQL` service over a daemon's storage root. Cheap to clone (tonic
 /// clones the service per request): the state is a shared handle.
@@ -142,6 +147,11 @@ struct ServiceInner {
     /// statement sees its session's temp views. Entries are dropped on
     /// `ClosePreparedStatement`. Parameter binding is not yet supported.
     prepared: Mutex<HashMap<String, String>>,
+    /// Ad-hoc statements planned by `GetFlightInfo` and awaiting their `DoGet`,
+    /// keyed by a server-issued ticket UUID. `DoGet` removes and executes the
+    /// stashed plan (single-use); the reaper drops any the client abandons (see
+    /// [`PLAN_TICKET_TTL`]). This is what lets a query plan once instead of twice.
+    plans: Mutex<HashMap<String, StashedPlan>>,
     /// Daemon-wide memory budget (§2.2). Every session's [`SessionMemoryHandle`]
     /// charges through it; query scans reserve the forward-column working set.
     budget: Arc<MemoryBudget>,
@@ -181,6 +191,21 @@ struct Session {
     last_access: Mutex<Instant>,
     #[allow(dead_code)] // RAII: returns the baseline to the budget on reap
     baseline: SessionReservation,
+}
+
+/// A query planned by `GetFlightInfo` and awaiting its `DoGet`. The Flight
+/// two-phase flow plans for the output schema, then fetches; rather than stuff
+/// the SQL in the ticket and re-plan on fetch, we stash the planned `DataFrame`
+/// here under a server-issued ticket id and execute it directly on `DoGet` — one
+/// plan, one dataset resolution per query. The `DataFrame` is self-contained (it
+/// owns its `SessionState` snapshot and the resolved providers are baked into its
+/// plan), so it needs nothing from the originating context. `preview` feeds the
+/// execute-time query span without keeping the SQL text around (the schema is
+/// recovered from the `DataFrame` at execute, so it isn't stored).
+struct StashedPlan {
+    df: DataFrame,
+    preview: String,
+    created_at: Instant,
 }
 
 impl Session {
@@ -306,9 +331,17 @@ impl ServiceInner {
         Ok(names)
     }
 
-    /// Drop sessions past their idle timeout or maximum age. Returns the count
-    /// reaped.
+    /// Drop sessions past their idle timeout or maximum age, plus any stashed
+    /// query plans whose `DoGet` never came (past [`PLAN_TICKET_TTL`]). Returns
+    /// the session count reaped.
     fn reap_expired(&self, now: Instant) -> usize {
+        // Abandoned GetFlightInfo plans: a normal DoGet removes its own entry, so
+        // this only catches clients that planned and never fetched.
+        self.plans
+            .lock()
+            .expect("plans lock")
+            .retain(|_, p| now.saturating_duration_since(p.created_at) <= PLAN_TICKET_TTL);
+
         let mut sessions = self.sessions.lock().expect("sessions lock");
         let before = sessions.len();
         sessions.retain(|_, s| !s.is_expired(now, IDLE_TIMEOUT, MAX_AGE));
@@ -412,6 +445,7 @@ impl TutankhamunFlightSqlService {
                 summaries: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 prepared: Mutex::new(HashMap::new()),
+                plans: Mutex::new(HashMap::new()),
                 budget,
                 session_pct,
                 bitmap_cache,
@@ -465,11 +499,10 @@ impl TutankhamunFlightSqlService {
         ctx
     }
 
-    /// Plan and execute `query` against `ctx`, returning the output schema and
-    /// collected batches. Shared by the statement and prepared-statement `do_get`
-    /// paths. Wraps the work in a per-query span (§3.4) with `plan` / `execute`
-    /// sub-spans, records the metrics histogram, and records `rows` / `error` on
-    /// the query span. `prepared` distinguishes the two callers.
+    /// Plan and execute `query` against `ctx` (the prepared-statement `do_get`
+    /// path). Wraps the work in a per-query span (§3.4) with `plan` / `execute`
+    /// sub-spans; the execute half is shared with [`Self::execute_df`] via
+    /// [`Self::collect_planned`]. `prepared` labels the span.
     #[allow(clippy::result_large_err)]
     async fn execute_query(
         &self,
@@ -486,29 +519,65 @@ impl TutankhamunFlightSqlService {
             error = tracing::field::Empty,
         );
         async {
-            let (df, schema) = plan(ctx, query).instrument(info_span!("plan")).await?;
-            let started = Instant::now();
-            let result = df.collect().instrument(info_span!("execute")).await;
-            let rows = match &result {
-                Ok(batches) => batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64,
-                Err(_) => 0,
-            };
-            self.inner
-                .metrics
-                .record_query(started.elapsed(), result.is_ok(), preview, rows);
-            match result {
-                Ok(batches) => {
-                    tracing::Span::current().record("rows", rows);
-                    Ok((schema, batches))
-                }
-                Err(e) => {
-                    tracing::Span::current().record("error", "execute");
-                    Err(plan_error(&e))
-                }
-            }
+            let (df, _) = plan(ctx, query).instrument(info_span!("plan")).await?;
+            self.collect_planned(df, preview).await
         }
         .instrument(span)
         .await
+    }
+
+    /// Execute an already-planned `DataFrame` — the `DoGet` half of the ad-hoc
+    /// two-phase flow, where the plan was built and resolved in `GetFlightInfo`.
+    /// Wraps a per-query span with only an `execute` sub-span (nothing to plan).
+    #[allow(clippy::result_large_err)]
+    async fn execute_df(
+        &self,
+        df: DataFrame,
+        preview: String,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+        let span = info_span!(
+            "query",
+            sql = %preview,
+            prepared = false,
+            rows = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        async { self.collect_planned(df, preview).await }
+            .instrument(span)
+            .await
+    }
+
+    /// Drive a planned `DataFrame` to completion and record the query metrics +
+    /// `rows`/`error` span fields. The execute half shared by `execute_query` and
+    /// `execute_df`; must run inside their `"query"` span (it records on the
+    /// current span). The schema is recovered from `df` before `collect` consumes
+    /// it, so callers needn't carry it separately.
+    #[allow(clippy::result_large_err)]
+    async fn collect_planned(
+        &self,
+        df: DataFrame,
+        preview: String,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
+        let schema = df.schema().inner().clone();
+        let started = Instant::now();
+        let result = df.collect().instrument(info_span!("execute")).await;
+        let rows = match &result {
+            Ok(batches) => batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64,
+            Err(_) => 0,
+        };
+        self.inner
+            .metrics
+            .record_query(started.elapsed(), result.is_ok(), preview, rows);
+        match result {
+            Ok(batches) => {
+                tracing::Span::current().record("rows", rows);
+                Ok((schema, batches))
+            }
+            Err(e) => {
+                tracing::Span::current().record("error", "execute");
+                Err(plan_error(&e))
+            }
+        }
     }
 
     /// Mint an opaque session and return its token. The token is server-issued
@@ -687,40 +756,67 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         query: CommandStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
-        // Plan (not execute) to learn the output schema. The ticket carries the
-        // SQL itself, so the matching `do_get_statement` is self-contained — it
-        // re-resolves the same session from its own metadata.
+        // Plan once to learn the output schema, then stash the planned DataFrame
+        // and hand back a ticket that names it — `do_get_statement` executes it
+        // directly instead of re-planning the SQL. The stashed DataFrame is
+        // self-contained (it owns its SessionState snapshot and the resolved
+        // providers), so the local `ctx` can drop here.
+        //
+        // The ticket is now valid only on this daemon (the plan lives in memory
+        // here). For single-node v1 that's correct — the endpoint has no
+        // `location`, meaning "fetch from this same server" — and it's the same
+        // affinity sessions already require. When multi-node HA lands, set
+        // `FlightEndpoint.location` to this daemon's address so a proxy routes the
+        // `DoGet` back to the daemon holding the plan.
         let session = self.resolve_session(request.metadata())?;
         let ctx = self.context_for(session.as_ref());
-        let (_df, schema) = plan(&ctx, &query.query).await?;
+        let (df, schema) = plan(&ctx, &query.query).await?;
+
+        let ticket_id = Uuid::new_v4().to_string();
+        self.inner.plans.lock().expect("plans lock").insert(
+            ticket_id.clone(),
+            StashedPlan {
+                df,
+                preview: sql_preview(&query.query),
+                created_at: Instant::now(),
+            },
+        );
 
         let ticket = TicketStatementQuery {
-            statement_handle: query.query.into_bytes().into(),
+            statement_handle: ticket_id.into_bytes().into(),
         };
-        let endpoint =
-            FlightEndpoint::new().with_ticket(Ticket::new(ticket.as_any().encode_to_vec()));
-        let info = FlightInfo::new()
-            .try_with_schema(schema.as_ref())
-            .map_err(|e| Status::internal(format!("encode schema: {e}")))?
-            .with_endpoint(endpoint)
-            .with_descriptor(request.into_inner());
-        Ok(Response::new(info))
+        flight_info_for(
+            schema.as_ref(),
+            Ticket::new(ticket.as_any().encode_to_vec()),
+            request,
+        )
     }
 
     async fn do_get_statement(
         &self,
         ticket: TicketStatementQuery,
-        request: Request<Ticket>,
+        _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let query = String::from_utf8(ticket.statement_handle.to_vec())
-            .map_err(|e| Status::invalid_argument(format!("ticket handle not UTF-8 SQL: {e}")))?;
-        let session = self.resolve_session(request.metadata())?;
-        let ctx = self.context_for(session.as_ref());
-        // `execute_query` wraps this in a per-query span (§3.4). `collect` drives
-        // the plan; the FTGS/scan execs bridge async→sync on their own scoped
-        // threads (`block_on_scan`), so it is safe to await here without parking a
-        // worker on a nested `block_on`.
-        let (schema, batches) = self.execute_query(&ctx, &query, false).await?;
+        let ticket_id = String::from_utf8(ticket.statement_handle.to_vec()).map_err(|e| {
+            Status::invalid_argument(format!("ticket handle not a UTF-8 plan id: {e}"))
+        })?;
+        // Single-use: take the plan out of the registry. A retried DoGet on a
+        // consumed ticket re-issues GetFlightInfo (the only place planning now
+        // happens), so a missing entry is a clean not-found.
+        let stashed = self
+            .inner
+            .plans
+            .lock()
+            .expect("plans lock")
+            .remove(&ticket_id)
+            .ok_or_else(|| {
+                Status::not_found("plan not found or expired; re-issue GetFlightInfo")
+            })?;
+        // No re-plan, no re-resolve: execute the DataFrame planned in
+        // GetFlightInfo. `collect` drives it; the FTGS/scan execs bridge
+        // async→sync on their own scoped threads (`block_on_scan`), so it is safe
+        // to await here without parking a worker on a nested `block_on`.
+        let (schema, batches) = self.execute_df(stashed.df, stashed.preview).await?;
 
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
@@ -1331,6 +1427,18 @@ mod tests {
         Session::new(SessionContext::new(), now, baseline)
     }
 
+    /// A `StashedPlan` over a trivial, storage-free query — enough to exercise the
+    /// registry (insert / single-use removal / reaping) and `execute_df`.
+    async fn test_stashed_plan(created_at: Instant) -> StashedPlan {
+        let ctx = SessionContext::new();
+        let df = ctx.sql("SELECT 1 AS x").await.expect("plan trivial query");
+        StashedPlan {
+            df,
+            preview: "SELECT 1 AS x".to_string(),
+            created_at,
+        }
+    }
+
     /// The per-dataset summary cache: a dataset with no manifest resolves empty
     /// and isn't cached; once a manifest is written, a second resolve reuses the
     /// cached `Arc` (etag unchanged → no re-read).
@@ -1444,6 +1552,71 @@ mod tests {
         let map = svc.inner.sessions.lock().unwrap();
         assert!(map.contains_key("fresh"));
         assert!(!map.contains_key("stale"));
+    }
+
+    /// The reaper drops a planned-but-unfetched ticket past its TTL and keeps a
+    /// fresh one (an abandoned `GetFlightInfo` whose `DoGet` never came).
+    #[tokio::test]
+    async fn stashed_plan_reaped_by_ttl() {
+        let svc = svc();
+        let now = Instant::now();
+        let stale_at = now
+            .checked_sub(PLAN_TICKET_TTL + Duration::from_secs(1))
+            .expect("instant in range");
+        let fresh = test_stashed_plan(now).await;
+        let stale = test_stashed_plan(stale_at).await;
+        {
+            let mut map = svc.inner.plans.lock().unwrap();
+            map.insert("fresh".to_string(), fresh);
+            map.insert("stale".to_string(), stale);
+        }
+        svc.inner.reap_expired(now);
+        let map = svc.inner.plans.lock().unwrap();
+        assert!(map.contains_key("fresh"));
+        assert!(!map.contains_key("stale"));
+    }
+
+    /// `DoGet` on a ticket with no stashed plan (expired / re-fetched / bogus) is
+    /// a clean not-found, telling the client to re-issue `GetFlightInfo`.
+    #[tokio::test]
+    async fn do_get_unknown_ticket_is_not_found() {
+        let svc = svc();
+        let ticket = TicketStatementQuery {
+            statement_handle: Uuid::new_v4().to_string().into_bytes().into(),
+        };
+        // The Ok variant (a boxed stream) isn't `Debug`, so match rather than
+        // `expect_err`.
+        let err =
+            FlightSqlService::do_get_statement(&svc, ticket, Request::new(Ticket::new(vec![])))
+                .await
+                .err()
+                .expect("unknown ticket errors");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// A stashed plan is consumed by its `DoGet`: the entry is gone afterwards, so
+    /// a replay can't re-run a query the client already fetched.
+    #[tokio::test]
+    async fn stash_is_single_use() {
+        let svc = svc();
+        let plan = test_stashed_plan(Instant::now()).await;
+        svc.inner
+            .plans
+            .lock()
+            .unwrap()
+            .insert("tkt".to_string(), plan);
+
+        let ticket = TicketStatementQuery {
+            statement_handle: "tkt".to_string().into_bytes().into(),
+        };
+        let resp =
+            FlightSqlService::do_get_statement(&svc, ticket, Request::new(Ticket::new(vec![])))
+                .await;
+        assert!(resp.is_ok(), "stashed plan executes");
+        assert!(
+            !svc.inner.plans.lock().unwrap().contains_key("tkt"),
+            "the plan is removed on DoGet (single-use)",
+        );
     }
 
     #[test]

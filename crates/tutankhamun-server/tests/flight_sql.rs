@@ -446,6 +446,45 @@ async fn flight_sql_count_and_group_by_roundtrip() {
         .expect("serve returned ok");
 }
 
+/// Regression guard for the single-plan path: `GetFlightInfo` plans + stashes the
+/// query, and `DoGet` executes that stashed plan WITHOUT re-resolving the
+/// dataset. Proven by deleting the dataset's manifest between the two calls — the
+/// old double-plan would re-resolve on `DoGet` and fail to find the table; the
+/// single-plan path runs the already-planned query, so it must still succeed.
+#[tokio::test(flavor = "multi_thread")]
+async fn do_get_executes_stashed_plan_without_re_resolving() {
+    let (addr, shutdown, server, storage, _cache) = start().await;
+    let mut client = connect(addr).await;
+
+    // GetFlightInfo: plan + stash; the returned ticket names the stashed plan.
+    let info = client
+        .execute("SELECT count(*) AS n FROM ds1".to_string(), None)
+        .await
+        .expect("get_flight_info");
+
+    // Drop the manifest the dataset resolved through. Shard files remain, so
+    // executing an already-planned scan still works; only re-resolution would
+    // break here.
+    std::fs::remove_file(storage.path().join("ds1").join("manifest.json"))
+        .expect("remove manifest");
+
+    let batches = do_get(&mut client, info).await;
+    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 1);
+    assert_eq!(
+        int64(&batches[0], 0).value(0),
+        4,
+        "the stashed plan returns the full count after the manifest is gone",
+    );
+
+    drop(client);
+    shutdown.trigger();
+    server
+        .await
+        .expect("server task join")
+        .expect("serve returned ok");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn session_temp_view_persists_across_calls_and_is_isolated() {
     let (addr, shutdown, server, _storage, _cache) = start().await;
