@@ -165,6 +165,10 @@ struct ServiceInner {
     aggregate_cache: Arc<AggregateCache>,
     /// Daemon metrics (§3.4): session gauge + query latency/counters.
     metrics: Arc<Metrics>,
+    /// The object store rooted at [`Self::storage_url`], built once and reused
+    /// (the storage root is fixed for the daemon's life). Backs `list_datasets`
+    /// so it doesn't reopen a store on every catalog / `/status` call.
+    root_store: OnceLock<Arc<dyn ObjectStore>>,
 }
 
 // Manual `Debug`: the cache and session maps hold `Cache`/`SessionContext`
@@ -230,23 +234,37 @@ impl Session {
 }
 
 impl ServiceInner {
-    /// Get or create the [`Cache`] rooted at dataset `url`. Synchronous under
-    /// the lock — [`Cache::open`] does a one-time dir scan, no `await`.
-    fn cache_for(&self, url: &str) -> anyhow::Result<Arc<Cache>> {
+    /// Get or create the [`Cache`] rooted at dataset `url`, reusing `store` (the
+    /// caller already built it to probe the manifest) rather than reopening one.
+    /// Synchronous under the lock — [`Cache::open`] does a one-time dir scan, no
+    /// `await`. Only called for datasets confirmed non-empty, so the `caches` map
+    /// never grows an entry for a name that isn't a real dataset.
+    fn cache_for(&self, url: &str, store: &Arc<dyn ObjectStore>) -> anyhow::Result<Arc<Cache>> {
         let mut caches = self.caches.lock().expect("cache map lock");
         if let Some(c) = caches.get(url) {
             return Ok(Arc::clone(c));
         }
-        let registry = StorageRegistry::from_url(url)?;
         let cache = Arc::new(Cache::open(
             self.cache_dir.clone(),
-            registry.store(),
+            Arc::clone(store),
             url.to_string(),
             self.size_cap,
             self.validation,
         )?);
         caches.insert(url.to_string(), Arc::clone(&cache));
         Ok(cache)
+    }
+
+    /// The object store rooted at the storage root, built once and memoized. A
+    /// racing first call may build twice; both are equivalent and only one is
+    /// kept.
+    fn root_store(&self) -> anyhow::Result<Arc<dyn ObjectStore>> {
+        if let Some(store) = self.root_store.get() {
+            return Ok(Arc::clone(store));
+        }
+        let store = StorageRegistry::from_url(&self.storage_url)?.store();
+        let _ = self.root_store.set(Arc::clone(&store));
+        Ok(store)
     }
 
     /// Resolve the dataset's shard set from its `manifest.json`, caching the
@@ -297,15 +315,18 @@ impl ServiceInner {
     /// seam for "dataset URL → provider"; callers map the `Option`/error to their
     /// own response (a query's "table not found", a listing's "skip").
     async fn table_provider(&self, url: &str) -> anyhow::Result<Option<TutankhamunTableProvider>> {
-        // One `cache_for` per resolution: it memoizes the dataset's store, which
-        // `resolve_summaries` reuses for its manifest `head()`/read rather than
-        // reopening one (and re-establishing the credential/HTTP stack on cloud
-        // backends) per call.
-        let cache = self.cache_for(url)?;
-        let summaries = self.resolve_summaries(url, &*cache.store()).await?;
+        // Probe the manifest with a lightweight store BEFORE opening a cache, so a
+        // `FROM <name>` that resolves to nothing (a typo, an empty or absent
+        // dataset) never creates a `Cache` (a dir scan + a `caches` entry). Only a
+        // dataset that actually has shards gets one — the same store then backs it,
+        // so it isn't built twice. This bounds the `caches`/`summaries` maps by
+        // what exists, not by every table name a client references.
+        let store = StorageRegistry::from_url(url)?.store();
+        let summaries = self.resolve_summaries(url, &*store).await?;
         if summaries.is_empty() {
             return Ok(None);
         }
+        let cache = self.cache_for(url, &store)?;
         Ok(Some(TutankhamunTableProvider::from_summaries(
             url.to_string(),
             cache,
@@ -319,8 +340,7 @@ impl ServiceInner {
     /// the names. A non-dataset top-level dir would list too, but resolving it
     /// as a table is then a clean "not found".
     async fn list_datasets(&self) -> anyhow::Result<Vec<String>> {
-        let registry = StorageRegistry::from_url(&self.storage_url)?;
-        let listing = registry.store().list_with_delimiter(None).await?;
+        let listing = self.root_store()?.list_with_delimiter(None).await?;
         let mut names: Vec<String> = listing
             .common_prefixes
             .iter()
@@ -451,6 +471,7 @@ impl TutankhamunFlightSqlService {
                 bitmap_cache,
                 aggregate_cache,
                 metrics,
+                root_store: OnceLock::new(),
             }),
         }
     }
@@ -1511,6 +1532,21 @@ mod tests {
         assert!(
             Arc::ptr_eq(&first, &second),
             "the rerun reuses the cached shard set (no re-discover)",
+        );
+    }
+
+    /// Resolving a name that isn't a real dataset (no manifest) returns `None`
+    /// and creates no `Cache` entry — so a client naming bogus/absent tables
+    /// can't grow the `caches` map.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn table_provider_skips_cache_for_absent_dataset() {
+        let svc = svc();
+        let url = "memory:///no_such_dataset";
+        let provider = svc.inner.table_provider(url).await.expect("resolve");
+        assert!(provider.is_none(), "absent dataset resolves to no provider");
+        assert!(
+            !svc.inner.caches.lock().unwrap().contains_key(url),
+            "no Cache is opened for a name that isn't a dataset",
         );
     }
 
