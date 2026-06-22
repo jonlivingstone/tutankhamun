@@ -31,6 +31,7 @@
 pub mod size;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path as StdPath, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,7 +45,7 @@ use object_store::path::Path;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::shard::{Metadata, sha256_file};
+use crate::shard::{DiskShard, Metadata, sha256_file};
 use crate::shard_source::ShardSummary;
 
 const SHARD_KEY_LEN: usize = 16;
@@ -84,11 +85,30 @@ struct CacheState {
     shards: HashMap<String, ShardEntry>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ShardEntry {
     local_dir: PathBuf,
     size_bytes: u64,
     last_access: SystemTime,
+    /// The shard opened once and held resident, so repeat queries skip
+    /// `DiskShard::open` (footer parse + array views + mmap). Held alongside the
+    /// files it maps, so eviction drops both together. `None` until first opened
+    /// (or for the file-only `fetch_shard` path). The mmap it pins is reclaimable
+    /// page cache, so it isn't charged against the memory budget.
+    parsed: Option<Arc<DiskShard>>,
+}
+
+// `DiskShard` is intentionally not `Debug` (mmap/FST internals are noise); show
+// only whether a parse is resident.
+impl fmt::Debug for ShardEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShardEntry")
+            .field("local_dir", &self.local_dir)
+            .field("size_bytes", &self.size_bytes)
+            .field("last_access", &self.last_access)
+            .field("parsed", &self.parsed.is_some())
+            .finish()
+    }
 }
 
 impl Cache {
@@ -136,28 +156,88 @@ impl Cache {
         // other waits here and then finds the complete dir — so no one observes a
         // half-written shard. (Installs are atomic, so "complete" is all-or-nothing.)
         let _fetch_guard = self.fetch_locks[bucket(&key)].lock().await;
+        self.ensure_files_present(summary, &local_dir).await?;
 
+        let now = SystemTime::now();
+        touch_dir_mtime(&local_dir, now);
+        self.register(&key, &local_dir, dir_size(&local_dir)?, now, None)?;
+
+        Ok(local_dir)
+    }
+
+    /// Like [`fetch_shard`](Self::fetch_shard) but returns the *parsed*
+    /// [`DiskShard`], opened once and held resident — so repeat queries skip the
+    /// footer parse + mmap. The daemon scan path; the parse rides the same cache
+    /// entry as the files (evicted together). On the default `Trust` path a
+    /// resident parse is returned with no filesystem touch.
+    pub async fn fetch_parsed_shard(&self, summary: &ShardSummary) -> Result<Arc<DiskShard>> {
+        let key = self.shard_key(&summary.location);
+        let local_dir = self.dir.join(&key);
+
+        // Fast path: a resident parse needs no I/O — shards are immutable and the
+        // entry's presence means its files are installed. (Verify re-hashes every
+        // fetch, so it always takes the slow path below.)
+        if self.validation == Validation::Trust
+            && let Some(shard) = self.cached_parse(&key)
+        {
+            return Ok(shard);
+        }
+
+        let _fetch_guard = self.fetch_locks[bucket(&key)].lock().await;
+        let reinstalled = self.ensure_files_present(summary, &local_dir).await?;
+        // Reuse the parse unless the files under its mmap were just replaced (a
+        // Verify re-download); also catches a race where another task opened it
+        // while we waited on the fetch lock.
+        if !reinstalled && let Some(shard) = self.cached_parse(&key) {
+            return Ok(shard);
+        }
+
+        let now = SystemTime::now();
+        touch_dir_mtime(&local_dir, now);
+        let shard = Arc::new(DiskShard::open(&local_dir)?);
+        self.register(
+            &key,
+            &local_dir,
+            dir_size(&local_dir)?,
+            now,
+            Some(Arc::clone(&shard)),
+        )?;
+        Ok(shard)
+    }
+
+    /// Ensure the shard's files are resident at `local_dir`, downloading on miss
+    /// (and, under `Verify`, re-hashing against `content_hashes` + re-downloading
+    /// on mismatch). Returns whether the files were (re)installed — a `Verify`
+    /// re-download invalidates any cached parse. Caller holds the per-shard lock.
+    async fn ensure_files_present(
+        &self,
+        summary: &ShardSummary,
+        local_dir: &StdPath,
+    ) -> Result<bool> {
         let stale = match self.validation {
             // Trust: a present copy is good enough (immutable shards, atomic installs).
-            Validation::Trust => !local_present(&local_dir),
-            // Verify: re-hash the resident files against the manifest each fetch.
-            Validation::Verify => validate_local(&local_dir, &summary.metadata).is_err(),
+            Validation::Trust => !local_present(local_dir),
+            // Verify: re-hash the resident files against the metadata each fetch.
+            Validation::Verify => validate_local(local_dir, &summary.metadata).is_err(),
         };
         if stale {
-            self.download(&summary.location, &local_dir).await?;
+            self.download(&summary.location, local_dir).await?;
             if self.validation == Validation::Verify {
-                validate_local(&local_dir, &summary.metadata)
+                validate_local(local_dir, &summary.metadata)
                     .with_context(|| format!("validate {}", local_dir.display()))?;
             }
         }
+        Ok(stale)
+    }
 
-        let size = dir_size(&local_dir)?;
-        let now = SystemTime::now();
-        touch_dir_mtime(&local_dir, now);
-
-        self.register(&key, &local_dir, size, now)?;
-
-        Ok(local_dir)
+    /// The resident parsed shard for `key`, bumping its LRU recency. `None` if the
+    /// shard isn't cached or hasn't been opened yet.
+    fn cached_parse(&self, key: &str) -> Option<Arc<DiskShard>> {
+        let mut state = self.state.lock().expect("cache state mutex");
+        let entry = state.shards.get_mut(key)?;
+        let shard = entry.parsed.clone()?;
+        entry.last_access = SystemTime::now();
+        Some(shard)
     }
 
     fn shard_key(&self, location: &Path) -> String {
@@ -220,6 +300,7 @@ impl Cache {
         local_dir: &StdPath,
         size_bytes: u64,
         now: SystemTime,
+        parsed: Option<Arc<DiskShard>>,
     ) -> Result<()> {
         let mut state = self.state.lock().expect("cache state mutex");
         if let Some(prev) = state.shards.insert(
@@ -228,6 +309,7 @@ impl Cache {
                 local_dir: local_dir.to_path_buf(),
                 size_bytes,
                 last_access: now,
+                parsed,
             },
         ) {
             state.total_bytes = state.total_bytes.saturating_sub(prev.size_bytes);
@@ -461,6 +543,9 @@ fn scan_existing(dir: &StdPath) -> Result<CacheState> {
                 local_dir: path,
                 size_bytes: size,
                 last_access: mtime,
+                // Pre-existing on-disk shards are registered file-only; the parse
+                // is built lazily on first query via `fetch_parsed_shard`.
+                parsed: None,
             },
         );
     }
@@ -700,6 +785,85 @@ mod tests {
         // (the third one is the protected just-inserted entry). The
         // protected shard alone may push us over the cap.
         assert!(cache.total_bytes() > 0, "non-empty after evictions");
+    }
+
+    #[tokio::test]
+    async fn fetch_parsed_shard_opens_once() {
+        let (cache_dir, store, summary) = corrupt_test_setup().await;
+        let cache = open_cache(cache_dir.path(), &store, Validation::Trust);
+
+        let a = cache.fetch_parsed_shard(&summary).await.unwrap();
+        let b = cache.fetch_parsed_shard(&summary).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "the second fetch reuses the resident parse (opened once)"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_parsed_shard_verify_reuses_parse_when_files_valid() {
+        let (cache_dir, store, summary) = corrupt_test_setup().await;
+        let cache = open_cache(cache_dir.path(), &store, Validation::Verify);
+
+        let a = cache.fetch_parsed_shard(&summary).await.unwrap();
+        let b = cache.fetch_parsed_shard(&summary).await.unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "verify re-hashes the files each fetch but reuses the parse when they're valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_parsed_shard_reopens_after_eviction() {
+        let registry = StorageRegistry::from_url("memory:///").unwrap();
+        let store = registry.store();
+
+        let mut summaries = Vec::new();
+        for i in 0..3 {
+            let local = tempfile::tempdir().unwrap();
+            let values: Vec<i64> = (0..2000).map(|n| n + i * 1000).collect();
+            write_local_shard(local.path(), values);
+            let remote = format!("data/shard-{i:03}");
+            upload_shard(&*store, &remote, local.path()).await;
+            let metadata: Metadata = serde_json::from_slice(
+                &store
+                    .get(&Path::from(format!("{remote}/metadata.json")))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            summaries.push(ShardSummary {
+                location: Path::from(remote),
+                metadata,
+            });
+            std::mem::forget(local);
+        }
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(
+            cache_dir.path().to_path_buf(),
+            Arc::clone(&store),
+            "memory:///".to_string(),
+            32 * 1024, // small cap forces eviction after the first shard
+            Validation::Trust,
+        )
+        .unwrap();
+
+        let a = cache.fetch_parsed_shard(&summaries[0]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cache.fetch_parsed_shard(&summaries[1]).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cache.fetch_parsed_shard(&summaries[2]).await.unwrap();
+
+        // shard-000 (and its parse) was evicted, so re-fetching re-opens it.
+        let a2 = cache.fetch_parsed_shard(&summaries[0]).await.unwrap();
+        assert!(
+            !Arc::ptr_eq(&a, &a2),
+            "an evicted shard is re-opened on the next fetch"
+        );
     }
 
     #[tokio::test]

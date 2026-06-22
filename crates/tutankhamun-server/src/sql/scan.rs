@@ -117,7 +117,7 @@ pub(crate) async fn for_each_shard_batch<F>(
     mut work: F,
 ) -> anyhow::Result<()>
 where
-    F: FnMut(&[(u64, DiskShard, FilterResult)]) -> anyhow::Result<()>,
+    F: FnMut(&[(u64, Arc<DiskShard>, FilterResult)]) -> anyhow::Result<()>,
 {
     // The dataset's shard set is resolved once per query by the caller (cached in
     // the daemon); here we only time-prune it (cheap — metadata only), so the
@@ -151,11 +151,12 @@ where
     };
 
     for chunk in selected.chunks(width) {
-        let mut shards: Vec<(u64, DiskShard, FilterResult)> = Vec::with_capacity(chunk.len());
+        let mut shards: Vec<(u64, Arc<DiskShard>, FilterResult)> = Vec::with_capacity(chunk.len());
         for summary in chunk {
             let id = BitmapCache::shard_id(ctx.url, summary.location.as_ref());
-            let local_dir = ctx.cache.fetch_shard(summary).await?;
-            let shard = DiskShard::open(&local_dir)?;
+            // Opened once and held resident by the cache — repeat queries reuse the
+            // parse (footer + mmap) instead of re-opening every shard.
+            let shard = ctx.cache.fetch_parsed_shard(summary).await?;
             let selection = if let Some(bc) = ctx.bitmap_cache {
                 bc.resolve(&shard, id, pushed)?
             } else {
@@ -166,8 +167,11 @@ where
             shards.push((id, shard, selection));
         }
         work(&shards)?;
-        // `shards` drops here, releasing this batch's forward-column residency
-        // before the next batch opens.
+        // `shards` drops here, releasing this batch's *extra* shard refs before
+        // the next batch opens. The cache holds its own `Arc<DiskShard>` per
+        // shard, so the mmap stays resident across queries (bounded by the cache
+        // size cap, reclaimable page cache) — but the §2.2 heap envelope is
+        // unaffected: the per-batch heap working set is built and dropped here.
     }
     Ok(())
 }
