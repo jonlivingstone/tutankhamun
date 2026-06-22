@@ -204,34 +204,12 @@ pub async fn upload_ingest_tree(local_root: &Path, url: &str) -> Result<()> {
     }))
     .buffer_unordered(concurrency)
     .try_for_each(|()| async { Ok(()) })
-    .await?;
-
-    // Every shard is in place; publish the dataset's catalog so queries
-    // resolve the shard set from one manifest read instead of walking the
-    // backend. Done last, for the same reason metadata.json is uploaded last
-    // per shard — a manifest only ever names shards that are fully present.
-    write_dataset_manifest(&*store, local_root).await
-}
-
-/// Build manifest entries for every shard under `root`: each shard dir's
-/// location relative to `root` (empty for a single-shard root) paired with its
-/// parsed `metadata.json`. Mirrors discovery's "directory containing
-/// metadata.json" rule, so it covers `--shard-by none` and bucketed layouts.
-pub fn manifest_entries(root: &Path) -> Result<Vec<crate::manifest::ManifestShard>> {
-    find_shard_dirs(root)?
-        .into_iter()
-        .map(|dir| {
-            let location = shard_rel_location(root, &dir);
-            let metadata = read_shard_metadata(&dir)?;
-            Ok(crate::manifest::ManifestShard { location, metadata })
-        })
-        .collect()
+    .await
 }
 
 /// A shard directory's location relative to the dataset `root`, as a
-/// `/`-joined backend path (empty for a single-shard root). The shared rule for
-/// turning a discovered shard dir into the prefix it lives under in storage —
-/// the upload prefix and the manifest entry's `location` must agree.
+/// `/`-joined backend path (empty for a single-shard root) — the prefix the
+/// shard's files are uploaded under in storage.
 fn shard_rel_location(root: &Path, dir: &Path) -> String {
     dir.strip_prefix(root)
         .expect("find_shard_dirs returns paths under root")
@@ -246,27 +224,6 @@ fn read_shard_metadata(dir: &Path) -> Result<Metadata> {
     let path = dir.join(METADATA_FILE);
     let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))
-}
-
-/// Scan the shards under `local_tree` and write/update the dataset manifest in
-/// `store` (the dataset-rooted backend). Called after a dataset's shards are in
-/// place — uploaded to object storage, or written to a local directory.
-pub async fn write_dataset_manifest(store: &dyn ObjectStore, local_tree: &Path) -> Result<()> {
-    let entries = manifest_entries(local_tree)?;
-    crate::manifest::write_manifest(store, entries).await
-}
-
-/// Write/update the manifest for a dataset written straight to a local
-/// directory (`t9n ingest` to a path, no upload). Opens a filesystem store
-/// rooted at `dir` and delegates to [`write_dataset_manifest`], so a locally
-/// ingested dataset is queryable by a daemon pointed at it.
-pub async fn write_local_manifest(dir: &Path) -> Result<()> {
-    let url = crate::shard_source::resolve_source_url(
-        dir.to_str()
-            .context("dataset directory path is not valid UTF-8")?,
-    )?;
-    let store = crate::storage::StorageRegistry::from_url(&url)?.store();
-    write_dataset_manifest(&*store, dir).await
 }
 
 fn upload_concurrency() -> usize {

@@ -94,14 +94,17 @@ directly.
 - [x] `ShardSource` trait — server-side abstraction over where
       shards come from — §3.3 v1 disciplines
 - [x] Object-storage `ShardSource` implementation — §3.3 v1
-      (the daemon no longer discovers per query: it resolves a dataset's shard
-      set from the per-dataset manifest (Ingest, below) via
-      `ServiceInner::resolve_summaries`, etag-cached so a warm plan costs one
-      `head()` and the FlightSQL double-plan all hits the same cached `Arc`. The
-      old `store.list()` + N-metadata-GET walk (`ObjectStoreShardSource::discover`)
-      remains as the `ShardSource` impl behind the one-shot `t9n sql` CLI path
-      (`TutankhamunTableProvider::try_new`), where per-query cost is a non-issue;
-      the daemon hot path is off it entirely.)
+      (the daemon resolves a dataset's shard set by walking its storage —
+      `ObjectStoreShardSource::discover` (a `store.list()` over the dataset dir,
+      reading each shard's `metadata.json`) — cached per dataset URL in
+      `ServiceInner::resolve_summaries` for the daemon's life. Discovery is
+      once-per-dataset, not per-query: `warm_cache` walks every dataset into the
+      cache at startup (the boot scan that used to log-and-discard now populates
+      the query cache), and first-query lazy resolution covers anything ingested
+      later. New/changed shards in an already-cached dataset need a restart to
+      refresh — the accepted v1 trade (live invalidation is a v2 concern; see the
+      manifest item under Ingest). The storage layout is the source of truth; no
+      catalog file.)
 - [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
 - [ ] K8s DNS `ShardLocator` implementation — §1.3
 - [ ] Static-file `ShardLocator` implementation — §1.3
@@ -424,23 +427,21 @@ directly.
       `--state-dir`) — for cache in v1; for WAL in v2 — §3.3 v1
 - [ ] `flamdex-to-tutankhamun` migration tool — read old Imhotep
       Flamdex shards, write in new format — §2.1
-- [x] Per-dataset manifest (catalog snapshot) — §3.3
-      (`manifest.json` at each dataset root — `{format_version, version,
-      shards: [{location, metadata}]}` — is the authoritative shard set
-      (`manifest.rs`). Ingest is the only writer: `upload_ingest_tree` (remote)
-      and `write_local_manifest` (local dir) call `write_manifest`, which merges
-      the just-written shards into any existing manifest (by location, new wins),
-      bumps the version, and PUTs it last (a manifest only ever names fully-present
-      shards). The daemon reads it via `resolve_summaries`: one `head()` for the
-      etag — unchanged → reuse the cached `Arc`, changed → re-read — so a re-ingest
-      is picked up without a restart and the FlightSQL double-plan shares one
-      parse. Replaces per-query `discover()` on the daemon path; a dataset with no
-      manifest has no shards (no discover() fallback — pre-v1, no back-compat).
-      Scope notes: schema is carried per-shard in each entry's metadata (no
-      separate dataset-level schema field yet); the write is a plain PUT under a
-      single-writer assumption — the atomic conditional-swap concurrent writers
-      need lands with *Atomic re-ingest* below. Follow-on: a short TTL on the
-      etag `head()` to coalesce the 2–3 resolves within one client query.)
+- [ ] Per-dataset manifest (catalog snapshot) — §3.3, **v2**
+      (a derived, rebuildable, **optional** index over the shards in object
+      storage — never the authority. The shards are the source of truth (§1.3
+      "all persistent state in object storage; local storage is a rebuildable
+      cache"); a manifest is only an accelerator that lets a reader learn a large
+      dataset's shard set with one read instead of a full `list()` + N
+      metadata-`GET`s, and lets multiple readers sharing a dataset see a consistent
+      snapshot as a *writer* adds shards. So it belongs in **v2 streaming**, where
+      a writer actively maintains it (rebuildable from the shards if missing/stale)
+      and shard churn is frequent enough to justify it — not v1 batch, where the
+      daemon walks-and-caches (Engine — abstractions, above) and changes are rare.
+      An earlier v1 attempt made `manifest.json` the *authoritative* shard set with
+      no walk fallback, which silently broke every pre-manifest dataset (a missing
+      file = "no data"); it was reverted. v2's version: writer-maintained, walk is
+      the rebuild source + fallback, never required for reads.)
 - [ ] Atomic re-ingest / replace in place — §3.3
       (rebuild a dataset's shards and swap the manifest atomically, so a
       query never sees a mixed/partial state mid-rewrite. Without the

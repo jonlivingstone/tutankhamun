@@ -38,9 +38,8 @@ fn bitmap(docs: impl IntoIterator<Item = u32>) -> RoaringBitmap {
 /// One shard `s0` under `{root}/ds1`: country us→{0,2}, de→{1,3};
 /// fare [100, 200, 300, 400]. So count(*) = 4, sum(fare) per country: us=400,
 /// de=600.
-async fn write_dataset(root: &Path) {
-    let dataset = root.join("ds1");
-    let shard = dataset.join("s0");
+fn write_dataset(root: &Path) {
+    let shard = root.join("ds1").join("s0");
     let mut w = DiskShardWriter::new(&shard, (0, 0)).expect("new shard");
     w.add_metric("fare", vec![100, 200, 300, 400])
         .expect("fare");
@@ -49,11 +48,8 @@ async fn write_dataset(root: &Path) {
     country.insert("de".to_string(), bitmap([1, 3]));
     w.add_string_field("country", country).expect("country");
     w.finalize().expect("finalize");
-    // Publish the dataset catalog, as ingest would — the daemon resolves the
-    // shard set from the manifest.
-    tutankhamun_server::ingest::write_local_manifest(&dataset)
-        .await
-        .expect("write manifest");
+    // No catalog file — the daemon discovers the shard by walking the dataset
+    // dir (it contains `metadata.json`).
 }
 
 async fn connect(addr: SocketAddr) -> FlightSqlServiceClient<Channel> {
@@ -102,7 +98,7 @@ async fn start_with_budget(
 ) {
     let storage = tempfile::tempdir().expect("storage tmp");
     let cache = tempfile::tempdir().expect("cache tmp");
-    write_dataset(storage.path()).await;
+    write_dataset(storage.path());
     let storage_url = url::Url::from_directory_path(storage.path())
         .expect("absolute path")
         .to_string();
@@ -437,45 +433,6 @@ async fn flight_sql_count_and_group_by_roundtrip() {
         .execute("SELECT count(*) FROM does_not_exist".to_string(), None)
         .await;
     assert!(missing.is_err(), "unknown dataset should error");
-
-    drop(client);
-    shutdown.trigger();
-    server
-        .await
-        .expect("server task join")
-        .expect("serve returned ok");
-}
-
-/// Regression guard for the single-plan path: `GetFlightInfo` plans + stashes the
-/// query, and `DoGet` executes that stashed plan WITHOUT re-resolving the
-/// dataset. Proven by deleting the dataset's manifest between the two calls — the
-/// old double-plan would re-resolve on `DoGet` and fail to find the table; the
-/// single-plan path runs the already-planned query, so it must still succeed.
-#[tokio::test(flavor = "multi_thread")]
-async fn do_get_executes_stashed_plan_without_re_resolving() {
-    let (addr, shutdown, server, storage, _cache) = start().await;
-    let mut client = connect(addr).await;
-
-    // GetFlightInfo: plan + stash; the returned ticket names the stashed plan.
-    let info = client
-        .execute("SELECT count(*) AS n FROM ds1".to_string(), None)
-        .await
-        .expect("get_flight_info");
-
-    // Drop the manifest the dataset resolved through. Shard files remain, so
-    // executing an already-planned scan still works; only re-resolution would
-    // break here.
-    std::fs::remove_file(storage.path().join("ds1").join("manifest.json"))
-        .expect("remove manifest");
-
-    let batches = do_get(&mut client, info).await;
-    let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
-    assert_eq!(rows, 1);
-    assert_eq!(
-        int64(&batches[0], 0).value(0),
-        4,
-        "the stashed plan returns the full count after the manifest is gone",
-    );
 
     drop(client);
     shutdown.trigger();

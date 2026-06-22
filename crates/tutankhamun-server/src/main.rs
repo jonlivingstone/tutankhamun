@@ -21,9 +21,6 @@ use tutankhamun_server::metrics;
 use tutankhamun_server::ops_http::{self, OpsState};
 use tutankhamun_server::runtime;
 use tutankhamun_server::shard::Aggregate;
-use tutankhamun_server::shard_source::{
-    ObjectStoreShardSource, ShardManager, ShardSource, ShardSummary,
-};
 use tutankhamun_server::shutdown::{self, ShutdownHandle};
 use tutankhamun_server::storage::{self, StorageRegistry};
 
@@ -483,6 +480,8 @@ async fn serve(config: Config) -> anyhow::Result<()> {
     // both ops and gRPC are live.
     let grpc_addr = config.grpc_addr.parse()?;
     let grpc_listener = flight_sql::bind(grpc_addr).await?;
+    // A handle for the startup warm-up below, before `svc` moves into the server.
+    let scan_svc = svc.clone();
     let grpc_task = tokio::spawn({
         let shutdown = shutdown.clone();
         async move {
@@ -501,9 +500,11 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Run the startup scans as a background task so they don't block reaching
     // the signal handler — a slow LIST against a large S3 bucket would
-    // otherwise widen the window in which SIGTERM bypasses the graceful
-    // drain. The scans are informational; aborting mid-flight on shutdown
-    // is safe.
+    // otherwise widen the window in which SIGTERM bypasses the graceful drain.
+    // `warm_cache` discovers each dataset's shard set into the query cache (and
+    // logs it); aborting mid-flight on shutdown is safe (lazy resolution covers
+    // anything not yet warmed). `log_storage_scan` is the per-prefix byte/object
+    // summary.
     let scan_task = tokio::spawn({
         let storage = Arc::clone(&storage);
         async move {
@@ -511,10 +512,7 @@ async fn serve(config: Config) -> anyhow::Result<()> {
             // concurrently bounds startup-scan wall-clock by the slower one
             // rather than their sum.
             let store = storage.store();
-            tokio::join!(
-                log_storage_scan(&*store),
-                log_shard_scan(Arc::clone(&store)),
-            );
+            tokio::join!(log_storage_scan(&*store), scan_svc.warm_cache());
         }
     });
 
@@ -534,33 +532,6 @@ async fn serve(config: Config) -> anyhow::Result<()> {
 
     info!("shutdown complete");
     Ok(())
-}
-
-async fn log_shard_scan(store: Arc<dyn object_store::ObjectStore>) {
-    let source: Arc<dyn ShardSource> = Arc::new(ObjectStoreShardSource::new(store));
-    let mut manager = ShardManager::new(source);
-    match manager.refresh().await {
-        Ok(()) => log_shards(manager.all_shards()),
-        Err(e) => warn!(error = ?e, "shard scan failed; daemon will continue"),
-    }
-}
-
-fn log_shards(shards: &[ShardSummary]) {
-    if shards.is_empty() {
-        info!("shard scan complete: no shards discovered");
-        return;
-    }
-    for s in shards {
-        info!(
-            location = %s.location.as_ref(),
-            num_docs = s.metadata.num_docs,
-            time_range_start = s.metadata.time_range_start,
-            time_range_end = s.metadata.time_range_end,
-            "shard"
-        );
-    }
-    let total_docs: u64 = shards.iter().map(|s| s.metadata.num_docs).sum();
-    info!(shards = shards.len(), total_docs, "shard scan complete");
 }
 
 async fn log_storage_scan(store: &dyn object_store::ObjectStore) {

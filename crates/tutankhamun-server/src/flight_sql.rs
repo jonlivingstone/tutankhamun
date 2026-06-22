@@ -46,7 +46,7 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::metadata::MetadataMap;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{Instrument as _, info, info_span};
+use tracing::{Instrument as _, info, info_span, warn};
 use uuid::Uuid;
 
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -73,7 +73,7 @@ use crate::bitmap_cache::BitmapCache;
 use crate::cache::{Cache, Validation};
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
-use crate::shard_source::ShardSummary;
+use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
 use crate::status::{DatasetLoad, DatasetsReport, SessionsSummary, StatusSource, StructuralReport};
@@ -113,10 +113,6 @@ pub struct TutankhamunFlightSqlService {
     inner: Arc<ServiceInner>,
 }
 
-/// A cached shard-set resolution: the manifest etag it was read at, paired with
-/// the parsed shard set. The etag gates reuse (see [`ServiceInner::summaries`]).
-type CachedSummaries = (String, Arc<Vec<ShardSummary>>);
-
 struct ServiceInner {
     storage_url: String,
     cache_dir: PathBuf,
@@ -129,15 +125,12 @@ struct ServiceInner {
     /// its own store — so a single root cache can't serve sub-prefix datasets.
     /// Keying by URL keeps each dataset's cache consistent across queries.
     caches: Mutex<HashMap<String, Arc<Cache>>>,
-    /// Resolved shard set per dataset URL, keyed alongside the manifest object's
-    /// etag at the time it was read. A query resolves the shard set by reading
-    /// the dataset's `manifest.json`; this caches the parse so repeat plans skip
-    /// it. Invalidation is the etag: each resolve does a cheap `head()` on the
-    /// manifest, reuses the cached `Arc` when the etag is unchanged, and re-reads
-    /// when it differs — so a re-ingest is picked up without a restart. Only
-    /// non-empty resolutions with a known etag are cached, so a not-yet-populated
-    /// dataset (no manifest) still appears once it's ingested.
-    summaries: Mutex<HashMap<String, CachedSummaries>>,
+    /// Resolved shard set per dataset URL, discovered by walking the dataset's
+    /// storage and cached for the daemon's life (see [`Self::resolve_summaries`]).
+    /// Populated eagerly at startup by `warm_cache` and lazily on first query.
+    /// Only non-empty resolutions are cached, so a bogus `FROM` name persists
+    /// nothing; a changed dataset needs a restart to refresh.
+    summaries: Mutex<HashMap<String, Arc<Vec<ShardSummary>>>>,
     /// Live sessions keyed by their opaque token. Holds the persistent context
     /// (and its session-scoped temp views); reaped on idle / max age.
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -205,9 +198,11 @@ struct Session {
 /// owns its `SessionState` snapshot and the resolved providers are baked into its
 /// plan), so it needs nothing from the originating context. `preview` feeds the
 /// execute-time query span without keeping the SQL text around (the schema is
-/// recovered from the `DataFrame` at execute, so it isn't stored).
+/// recovered from the `DataFrame` at execute, so it isn't stored); `prepared`
+/// labels that span — ad-hoc statements stash `false`, prepared ones `true`.
 struct StashedPlan {
     df: DataFrame,
+    prepared: bool,
     preview: String,
     created_at: Instant,
 }
@@ -235,7 +230,7 @@ impl Session {
 
 impl ServiceInner {
     /// Get or create the [`Cache`] rooted at dataset `url`, reusing `store` (the
-    /// caller already built it to probe the manifest) rather than reopening one.
+    /// caller already built it to discover the shard set) rather than reopening one.
     /// Synchronous under the lock — [`Cache::open`] does a one-time dir scan, no
     /// `await`. Only called for datasets confirmed non-empty, so the `caches` map
     /// never grows an entry for a name that isn't a real dataset.
@@ -267,44 +262,33 @@ impl ServiceInner {
         Ok(store)
     }
 
-    /// Resolve the dataset's shard set from its `manifest.json`, caching the
-    /// parsed result keyed by the manifest's etag. A warm hit costs one `head()`
-    /// (etag unchanged → reuse the `Arc`); a re-ingest changes the etag and is
-    /// re-read, so the daemon picks up new shards without a restart. A dataset
-    /// with no manifest resolves empty and is not cached, so it appears once
-    /// it's ingested. The same `Arc` then feeds schema resolution and the scan.
+    /// Resolve the dataset's shard set by walking its storage (the object-store
+    /// listing — a dataset is its directory of shards), cached per dataset URL for
+    /// the daemon's life. The storage layout is the source of truth; the cache
+    /// makes discovery once-per-dataset rather than per-query. New/changed shards
+    /// in an already-resolved dataset need a restart to refresh (the v1 trade —
+    /// see `warm_cache` for the startup pass). An empty/absent dataset resolves
+    /// empty and is not cached, so a bogus `FROM` name persists nothing.
     async fn resolve_summaries(
         &self,
         url: &str,
-        store: &dyn ObjectStore,
+        store: Arc<dyn ObjectStore>,
     ) -> anyhow::Result<Arc<Vec<ShardSummary>>> {
-        // Cheap freshness probe: the manifest's etag. Absent manifest → no shards.
-        let etag = match store.head(&crate::manifest::manifest_path()).await {
-            Ok(meta) => meta.e_tag,
-            Err(object_store::Error::NotFound { .. }) => return Ok(Arc::new(Vec::new())),
-            Err(e) => return Err(e.into()),
-        };
-
-        if let Some(etag) = &etag
-            && let Some((cached_etag, summaries)) = self
-                .summaries
-                .lock()
-                .expect("summaries cache lock")
-                .get(url)
-            && cached_etag == etag
+        if let Some(summaries) = self
+            .summaries
+            .lock()
+            .expect("summaries cache lock")
+            .get(url)
         {
             return Ok(Arc::clone(summaries));
         }
 
-        let manifest = crate::manifest::load(store).await?.unwrap_or_default();
-        let summaries = Arc::new(manifest.into_summaries()?);
-        if let Some(etag) = etag
-            && !summaries.is_empty()
-        {
+        let summaries = Arc::new(ObjectStoreShardSource::new(store).discover().await?);
+        if !summaries.is_empty() {
             self.summaries
                 .lock()
                 .expect("summaries cache lock")
-                .insert(url.to_string(), (etag, Arc::clone(&summaries)));
+                .insert(url.to_string(), Arc::clone(&summaries));
         }
         Ok(summaries)
     }
@@ -315,14 +299,14 @@ impl ServiceInner {
     /// seam for "dataset URL → provider"; callers map the `Option`/error to their
     /// own response (a query's "table not found", a listing's "skip").
     async fn table_provider(&self, url: &str) -> anyhow::Result<Option<TutankhamunTableProvider>> {
-        // Probe the manifest with a lightweight store BEFORE opening a cache, so a
+        // Discover with a lightweight store BEFORE opening a cache, so a
         // `FROM <name>` that resolves to nothing (a typo, an empty or absent
         // dataset) never creates a `Cache` (a dir scan + a `caches` entry). Only a
         // dataset that actually has shards gets one — the same store then backs it,
         // so it isn't built twice. This bounds the `caches`/`summaries` maps by
         // what exists, not by every table name a client references.
         let store = StorageRegistry::from_url(url)?.store();
-        let summaries = self.resolve_summaries(url, &*store).await?;
+        let summaries = self.resolve_summaries(url, Arc::clone(&store)).await?;
         if summaries.is_empty() {
             return Ok(None);
         }
@@ -476,6 +460,44 @@ impl TutankhamunFlightSqlService {
         }
     }
 
+    /// Walk every dataset under the storage root and populate the per-dataset
+    /// shard-set cache, logging each shard — the startup discovery pass. The
+    /// storage layout is the source of truth; this turns the boot-time scan into
+    /// a warm cache (rather than discarding it) so first queries skip discovery.
+    /// Best-effort: a dataset that fails to list/discover is logged and skipped;
+    /// lazy resolution in [`ServiceInner::resolve_summaries`] covers it on first
+    /// query. Run as a background task so a large store doesn't gate readiness.
+    pub async fn warm_cache(&self) {
+        let datasets = match self.inner.list_datasets().await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = ?e, "startup scan: list datasets failed; daemon continues");
+                return;
+            }
+        };
+        let base = self.inner.storage_url.trim_end_matches('/');
+        let mut total_shards = 0usize;
+        let mut total_docs = 0u64;
+        for name in datasets {
+            let url = format!("{base}/{name}");
+            let store = match StorageRegistry::from_url(&url) {
+                Ok(r) => r.store(),
+                Err(e) => {
+                    warn!(dataset = %name, error = ?e, "startup scan: open store failed");
+                    continue;
+                }
+            };
+            match self.inner.resolve_summaries(&url, store).await {
+                Ok(summaries) => {
+                    total_shards += summaries.len();
+                    total_docs += log_shards(&summaries);
+                }
+                Err(e) => warn!(dataset = %name, error = ?e, "startup scan: discover failed"),
+            }
+        }
+        info!(shards = total_shards, total_docs, "shard scan complete");
+    }
+
     /// Mint a fresh [`SessionMemoryHandle`] capped at `session_pct`% of the
     /// global budget.
     fn new_memory_handle(&self) -> Arc<SessionMemoryHandle> {
@@ -520,18 +542,19 @@ impl TutankhamunFlightSqlService {
         ctx
     }
 
-    /// Plan and execute `query` against `ctx` (the prepared-statement `do_get`
-    /// path). Wraps the work in a per-query span (§3.4) with `plan` / `execute`
-    /// sub-spans; the execute half is shared with [`Self::execute_df`] via
-    /// [`Self::collect_planned`]. `prepared` labels the span.
+    /// Execute an already-planned `DataFrame` and return its schema + collected
+    /// batches — the `DoGet` half of the two-phase flow, shared by the ad-hoc and
+    /// prepared paths (the plan was built and resolved in `GetFlightInfo`). Wraps a
+    /// per-query span (§3.4) with an `execute` sub-span (nothing to plan here),
+    /// records the metrics histogram + `rows`/`error`, and labels the span with
+    /// `prepared`. The schema is recovered from `df` before `collect` consumes it.
     #[allow(clippy::result_large_err)]
-    async fn execute_query(
+    async fn execute_df(
         &self,
-        ctx: &SessionContext,
-        query: &str,
+        df: DataFrame,
         prepared: bool,
+        preview: String,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
-        let preview = sql_preview(query);
         let span = info_span!(
             "query",
             sql = %preview,
@@ -540,65 +563,78 @@ impl TutankhamunFlightSqlService {
             error = tracing::field::Empty,
         );
         async {
-            let (df, _) = plan(ctx, query).instrument(info_span!("plan")).await?;
-            self.collect_planned(df, preview).await
+            let schema = df.schema().inner().clone();
+            let started = Instant::now();
+            let result = df.collect().instrument(info_span!("execute")).await;
+            let rows = match &result {
+                Ok(batches) => batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64,
+                Err(_) => 0,
+            };
+            self.inner
+                .metrics
+                .record_query(started.elapsed(), result.is_ok(), preview, rows);
+            match result {
+                Ok(batches) => {
+                    tracing::Span::current().record("rows", rows);
+                    Ok((schema, batches))
+                }
+                Err(e) => {
+                    tracing::Span::current().record("error", "execute");
+                    Err(plan_error(&e))
+                }
+            }
         }
         .instrument(span)
         .await
     }
 
-    /// Execute an already-planned `DataFrame` — the `DoGet` half of the ad-hoc
-    /// two-phase flow, where the plan was built and resolved in `GetFlightInfo`.
-    /// Wraps a per-query span with only an `execute` sub-span (nothing to plan).
-    #[allow(clippy::result_large_err)]
-    async fn execute_df(
-        &self,
-        df: DataFrame,
-        preview: String,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
-        let span = info_span!(
-            "query",
-            sql = %preview,
-            prepared = false,
-            rows = tracing::field::Empty,
-            error = tracing::field::Empty,
+    /// Plan-stash a `DataFrame` under a fresh server-issued id and return the id.
+    /// Both `GetFlightInfo` handlers call this and then build their own ticket
+    /// carrying the id; `do_get_stashed` consumes it. `prepared` labels the
+    /// execute-time span; `sql` feeds the bounded preview.
+    fn stash_plan(&self, df: DataFrame, prepared: bool, sql: &str) -> String {
+        let id = Uuid::new_v4().to_string();
+        self.inner.plans.lock().expect("plans lock").insert(
+            id.clone(),
+            StashedPlan {
+                df,
+                prepared,
+                preview: sql_preview(sql),
+                created_at: Instant::now(),
+            },
         );
-        async { self.collect_planned(df, preview).await }
-            .instrument(span)
-            .await
+        id
     }
 
-    /// Drive a planned `DataFrame` to completion and record the query metrics +
-    /// `rows`/`error` span fields. The execute half shared by `execute_query` and
-    /// `execute_df`; must run inside their `"query"` span (it records on the
-    /// current span). The schema is recovered from `df` before `collect` consumes
-    /// it, so callers needn't carry it separately.
+    /// Execute the single-use stashed plan named by `handle` and stream the
+    /// result — the shared `DoGet` body for ad-hoc and prepared statements. Both
+    /// carry a per-execution plan id in their (opaque) ticket handle; planning
+    /// happened in `GetFlightInfo`, so this never re-plans or re-resolves. A
+    /// consumed/expired id is a clean not-found (the client re-issues
+    /// `GetFlightInfo`). `collect` drives the plan; the FTGS/scan execs bridge
+    /// async→sync on their own scoped threads (`block_on_scan`), so awaiting here
+    /// parks no worker on a nested `block_on`.
     #[allow(clippy::result_large_err)]
-    async fn collect_planned(
+    async fn do_get_stashed(
         &self,
-        df: DataFrame,
-        preview: String,
-    ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
-        let schema = df.schema().inner().clone();
-        let started = Instant::now();
-        let result = df.collect().instrument(info_span!("execute")).await;
-        let rows = match &result {
-            Ok(batches) => batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64,
-            Err(_) => 0,
-        };
-        self.inner
-            .metrics
-            .record_query(started.elapsed(), result.is_ok(), preview, rows);
-        match result {
-            Ok(batches) => {
-                tracing::Span::current().record("rows", rows);
-                Ok((schema, batches))
-            }
-            Err(e) => {
-                tracing::Span::current().record("error", "execute");
-                Err(plan_error(&e))
-            }
-        }
+        handle: &[u8],
+    ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
+        let plan_id = String::from_utf8(handle.to_vec()).map_err(|e| {
+            Status::invalid_argument(format!("ticket handle not a UTF-8 plan id: {e}"))
+        })?;
+        let stashed = self
+            .inner
+            .plans
+            .lock()
+            .expect("plans lock")
+            .remove(&plan_id)
+            .ok_or_else(|| {
+                Status::not_found("plan not found or expired; re-issue GetFlightInfo")
+            })?;
+        let (schema, batches) = self
+            .execute_df(stashed.df, stashed.prepared, stashed.preview)
+            .await?;
+        Ok(batches_stream(schema, batches))
     }
 
     /// Mint an opaque session and return its token. The token is server-issued
@@ -693,17 +729,25 @@ fn encode_schema(schema: &Schema) -> Result<bytes::Bytes, Status> {
     Ok(message.0)
 }
 
-/// Stream a single metadata `RecordBatch` as a `DoGet` response, the same
-/// encoder path the statement results use.
+/// Stream `batches` as a `DoGet` response under an explicit `schema` (the vec may
+/// be empty, so the schema can't be derived from a batch). The shared encoder
+/// path for query results and metadata.
+fn batches_stream(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Response<<TutankhamunFlightSqlService as FlightService>::DoGetStream> {
+    let stream = FlightDataEncoderBuilder::new()
+        .with_schema(schema)
+        .build(futures::stream::iter(batches.into_iter().map(Ok)))
+        .map_err(Status::from);
+    Response::new(Box::pin(stream))
+}
+
+/// Stream a single metadata `RecordBatch` as a `DoGet` response.
 fn batch_stream(
     batch: RecordBatch,
 ) -> Response<<TutankhamunFlightSqlService as FlightService>::DoGetStream> {
-    let schema = batch.schema();
-    let stream = FlightDataEncoderBuilder::new()
-        .with_schema(schema)
-        .build(futures::stream::iter(std::iter::once(Ok(batch))))
-        .map_err(Status::from);
-    Response::new(Box::pin(stream))
+    batches_stream(batch.schema(), vec![batch])
 }
 
 /// Fixed `GetSqlInfo` capability set, built once. Identifier-case flags follow
@@ -791,18 +835,11 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         // `DoGet` back to the daemon holding the plan.
         let session = self.resolve_session(request.metadata())?;
         let ctx = self.context_for(session.as_ref());
-        let (df, schema) = plan(&ctx, &query.query).await?;
+        let (df, schema) = plan(&ctx, &query.query)
+            .instrument(info_span!("plan"))
+            .await?;
 
-        let ticket_id = Uuid::new_v4().to_string();
-        self.inner.plans.lock().expect("plans lock").insert(
-            ticket_id.clone(),
-            StashedPlan {
-                df,
-                preview: sql_preview(&query.query),
-                created_at: Instant::now(),
-            },
-        );
-
+        let ticket_id = self.stash_plan(df, false, &query.query);
         let ticket = TicketStatementQuery {
             statement_handle: ticket_id.into_bytes().into(),
         };
@@ -818,32 +855,7 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         ticket: TicketStatementQuery,
         _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let ticket_id = String::from_utf8(ticket.statement_handle.to_vec()).map_err(|e| {
-            Status::invalid_argument(format!("ticket handle not a UTF-8 plan id: {e}"))
-        })?;
-        // Single-use: take the plan out of the registry. A retried DoGet on a
-        // consumed ticket re-issues GetFlightInfo (the only place planning now
-        // happens), so a missing entry is a clean not-found.
-        let stashed = self
-            .inner
-            .plans
-            .lock()
-            .expect("plans lock")
-            .remove(&ticket_id)
-            .ok_or_else(|| {
-                Status::not_found("plan not found or expired; re-issue GetFlightInfo")
-            })?;
-        // No re-plan, no re-resolve: execute the DataFrame planned in
-        // GetFlightInfo. `collect` drives it; the FTGS/scan execs bridge
-        // async→sync on their own scoped threads (`block_on_scan`), so it is safe
-        // to await here without parking a worker on a nested `block_on`.
-        let (schema, batches) = self.execute_df(stashed.df, stashed.preview).await?;
-
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        self.do_get_stashed(&ticket.statement_handle).await
     }
 
     async fn do_put_statement_update(
@@ -917,32 +929,32 @@ impl FlightSqlService for TutankhamunFlightSqlService {
         query: CommandPreparedStatementQuery,
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
+        // Plan this execution once and stash it, exactly like the ad-hoc path —
+        // `do_get_prepared_statement` then runs the stashed plan instead of
+        // re-planning. The long-lived `prepared` map (SQL by handle) is untouched;
+        // it still feeds re-planning on the next execution and the DDL/`do_put`
+        // paths. The ticket carries the per-execution plan id (not the prepared
+        // handle): swap it into the echoed command so the blanket `do_get` routes
+        // a `CommandPreparedStatementQuery` whose handle is the plan id.
         let sql = self.prepared_sql(&query.prepared_statement_handle)?;
         let session = self.resolve_session(request.metadata())?;
         let ctx = self.context_for(session.as_ref());
-        let (_df, schema) = plan(&ctx, &sql).await?;
+        let (df, schema) = plan(&ctx, &sql).instrument(info_span!("plan")).await?;
 
-        // The ticket carries the prepared command (the handle); the blanket
-        // `do_get` routes it back to `do_get_prepared_statement`.
-        let ticket = Ticket::new(query.as_any().encode_to_vec());
+        let plan_id = self.stash_plan(df, true, &sql);
+        let mut ticket_cmd = query;
+        ticket_cmd.prepared_statement_handle = plan_id.into_bytes().into();
+        let ticket = Ticket::new(ticket_cmd.as_any().encode_to_vec());
         flight_info_for(schema.as_ref(), ticket, request)
     }
 
     async fn do_get_prepared_statement(
         &self,
         query: CommandPreparedStatementQuery,
-        request: Request<Ticket>,
+        _request: Request<Ticket>,
     ) -> Result<Response<<Self as FlightService>::DoGetStream>, Status> {
-        let sql = self.prepared_sql(&query.prepared_statement_handle)?;
-        let session = self.resolve_session(request.metadata())?;
-        let ctx = self.context_for(session.as_ref());
-        let (schema, batches) = self.execute_query(&ctx, &sql, true).await?;
-
-        let stream = FlightDataEncoderBuilder::new()
-            .with_schema(schema)
-            .build(futures::stream::iter(batches.into_iter().map(Ok)))
-            .map_err(Status::from);
-        Ok(Response::new(Box::pin(stream)))
+        // The handle is the per-execution plan id stashed by GetFlightInfo.
+        self.do_get_stashed(&query.prepared_statement_handle).await
     }
 
     async fn do_put_prepared_statement_query(
@@ -1288,10 +1300,10 @@ impl SchemaProvider for DatasetSchemaProvider {
 
         let base = self.inner.storage_url.trim_end_matches('/');
         let url = format!("{base}/{name}");
-        // Resolve through the daemon's manifest cache (warm hits skip the
-        // re-read on an unchanged etag); the provider holds the same `Arc` the
-        // scan reuses. An empty/absent dataset is a clean "table not found"
-        // (None), not an internal error.
+        // Resolve through the daemon's per-dataset discovery cache (warm hits skip
+        // the walk); the provider holds the same `Arc` the scan reuses. An
+        // empty/absent dataset is a clean "table not found" (None), not an
+        // internal error.
         match self.inner.table_provider(&url).await {
             Ok(Some(p)) => Ok(Some(Arc::new(p) as Arc<dyn TableProvider>)),
             Ok(None) => Ok(None),
@@ -1333,11 +1345,29 @@ fn session_token(md: &MetadataMap) -> Option<String> {
 }
 
 /// Plan `query` against `ctx` and return the `DataFrame` plus its output schema.
-/// Shared by the two ad-hoc statement roundtrips so they derive it identically.
+/// Shared by the ad-hoc and prepared `GetFlightInfo` paths so they derive it
+/// identically.
 async fn plan(ctx: &SessionContext, query: &str) -> Result<(DataFrame, SchemaRef), Status> {
     let df = ctx.sql(query).await.map_err(|e| plan_error(&e))?;
     let schema = df.schema().inner().clone();
     Ok((df, schema))
+}
+
+/// Log each shard (location, doc count, time range) and return the doc total —
+/// the per-dataset slice of the startup discovery inventory `warm_cache` emits.
+fn log_shards(summaries: &[ShardSummary]) -> u64 {
+    let mut total_docs = 0;
+    for s in summaries {
+        info!(
+            location = %s.location.as_ref(),
+            num_docs = s.metadata.num_docs,
+            time_range_start = s.metadata.time_range_start,
+            time_range_end = s.metadata.time_range_end,
+            "shard"
+        );
+        total_docs += s.metadata.num_docs;
+    }
+    total_docs
 }
 
 /// Bind the gRPC listener. Returns once accepting, so the caller can mark
@@ -1455,14 +1485,15 @@ mod tests {
         let df = ctx.sql("SELECT 1 AS x").await.expect("plan trivial query");
         StashedPlan {
             df,
+            prepared: false,
             preview: "SELECT 1 AS x".to_string(),
             created_at,
         }
     }
 
-    /// The per-dataset summary cache: a dataset with no manifest resolves empty
-    /// and isn't cached; once a manifest is written, a second resolve reuses the
-    /// cached `Arc` (etag unchanged → no re-read).
+    /// The per-dataset summary cache: an empty dataset dir resolves empty and is
+    /// NOT cached; once a shard is written, a resolve discovers it by walking, and
+    /// a second resolve reuses the cached `Arc` (no re-walk).
     #[tokio::test(flavor = "multi_thread")]
     async fn resolve_summaries_caches_and_skips_empty() {
         use crate::shard::DiskShardWriter;
@@ -1492,50 +1523,74 @@ mod tests {
             metrics,
         );
         let ds_url = format!("{}/ds", storage_url.trim_end_matches('/'));
-        let store = StorageRegistry::from_url(&ds_url)
-            .expect("registry")
-            .store();
+        let store = || {
+            StorageRegistry::from_url(&ds_url)
+                .expect("registry")
+                .store()
+        };
 
-        // No manifest yet: resolves empty and is NOT cached.
+        // No shards yet: resolves empty and is NOT cached.
         let empty = svc
             .inner
-            .resolve_summaries(&ds_url, &*store)
+            .resolve_summaries(&ds_url, store())
             .await
             .expect("resolve empty");
         assert!(empty.is_empty());
         assert!(
             !svc.inner.summaries.lock().unwrap().contains_key(&ds_url),
-            "a manifest-less dataset must not be cached, so it resolves again once ingested",
+            "an empty dataset must not be cached, so it resolves again once it has shards",
         );
 
-        // Write one shard and publish a manifest (as ingest would), then resolve
-        // twice — the second reuses the Arc (etag unchanged).
+        // Write one shard, then resolve twice — discovery finds it by walking;
+        // the second resolve reuses the cached Arc.
         let ds_dir = root.path().join("ds");
         let mut w = DiskShardWriter::new(&ds_dir.join("shard-0"), (0, 0)).expect("writer");
         w.add_metric("x", vec![1, 2, 3]).expect("add_metric");
         w.finalize().expect("finalize");
-        crate::ingest::write_local_manifest(&ds_dir)
-            .await
-            .expect("write manifest");
 
         let first = svc
             .inner
-            .resolve_summaries(&ds_url, &*store)
+            .resolve_summaries(&ds_url, store())
             .await
             .expect("resolve");
-        assert_eq!(first.len(), 1, "the one manifested shard resolves");
+        assert_eq!(first.len(), 1, "the written shard is discovered by walking");
         let second = svc
             .inner
-            .resolve_summaries(&ds_url, &*store)
+            .resolve_summaries(&ds_url, store())
             .await
             .expect("resolve");
         assert!(
             Arc::ptr_eq(&first, &second),
-            "the rerun reuses the cached shard set (no re-discover)",
+            "the rerun reuses the cached shard set (no re-walk)",
         );
     }
 
-    /// Resolving a name that isn't a real dataset (no manifest) returns `None`
+    /// `do_get_stashed` executes the stashed plan WITHOUT re-resolving the dataset:
+    /// after clearing the summaries cache, a `DoGet` still runs and leaves the cache
+    /// empty (the scan reads shards via the `Cache`, never the summaries map). This
+    /// is the single-plan "no re-resolve" guard (ad-hoc and prepared share this
+    /// path).
+    #[tokio::test]
+    async fn do_get_stashed_does_not_re_resolve() {
+        let svc = svc();
+        let plan = test_stashed_plan(Instant::now()).await;
+        svc.inner
+            .plans
+            .lock()
+            .unwrap()
+            .insert("tkt".to_string(), plan);
+        // Whatever a prior resolve may have cached, start from empty.
+        svc.inner.summaries.lock().unwrap().clear();
+
+        let resp = svc.do_get_stashed(b"tkt").await;
+        assert!(resp.is_ok(), "stashed plan executes");
+        assert!(
+            svc.inner.summaries.lock().unwrap().is_empty(),
+            "DoGet ran the stash without resolving any dataset",
+        );
+    }
+
+    /// Resolving a name that isn't a real dataset (no shards) returns `None`
     /// and creates no `Cache` entry — so a client naming bogus/absent tables
     /// can't grow the `caches` map.
     #[tokio::test(flavor = "multi_thread")]

@@ -63,8 +63,6 @@ pub(crate) fn run(
         ingest::IngestDestination::Local(local) => {
             let n = ingest_to(&local)?;
             let shards = report_shards(&local)?;
-            let runtime = super::current_thread_runtime()?;
-            runtime.block_on(ingest::write_local_manifest(&local))?;
             println!(
                 "wrote {n} docs across {shards} shard(s) to {}",
                 local.display()

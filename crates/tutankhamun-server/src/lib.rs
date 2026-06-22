@@ -11,7 +11,6 @@ pub mod flight_sql;
 pub mod ftgs;
 pub mod group_lookup;
 pub mod ingest;
-pub mod manifest;
 pub mod memory;
 pub mod metrics;
 pub mod ops_http;

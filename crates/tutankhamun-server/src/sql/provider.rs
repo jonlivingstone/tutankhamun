@@ -69,8 +69,8 @@ impl TutankhamunTableProvider {
 impl TutankhamunTableProvider {
     /// Discover the dataset under `url` (one-shot, no cache) and build a
     /// provider. The CLI path: it walks the backend for shards directly. The
-    /// daemon never calls this — it resolves the shard set from the dataset
-    /// manifest and builds via [`Self::from_summaries`].
+    /// daemon never calls this — it walks once and caches per dataset
+    /// (`ServiceInner::resolve_summaries`), building via [`Self::from_summaries`].
     pub async fn try_new(url: String, cache: Arc<Cache>) -> anyhow::Result<Self> {
         let registry = StorageRegistry::from_url(&url)?;
         let source = ObjectStoreShardSource::new(registry.store());
