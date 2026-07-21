@@ -61,8 +61,13 @@ pub(crate) fn run(
 
     match ingest::IngestDestination::parse(output)? {
         ingest::IngestDestination::Local(local) => {
-            let n = ingest_to(&local)?;
-            let shards = report_shards(&local)?;
+            // Stage on the dataset's filesystem, then validate + publish: a
+            // schema-conflicting re-ingest fails before any shard goes live,
+            // leaving no orphaned shards to brick the dataset.
+            let staging = ingest::local_staging(&local)?;
+            let n = ingest_to(staging.path())?;
+            let shards = report_shards(staging.path())?;
+            ingest::publish_local(staging.path(), &local)?;
             println!(
                 "wrote {n} docs across {shards} shard(s) to {}",
                 local.display()
@@ -73,7 +78,9 @@ pub(crate) fn run(
             let n = ingest_to(staging.path())?;
             let shards = report_shards(staging.path())?;
             let runtime = super::current_thread_runtime()?;
-            runtime.block_on(ingest::upload_ingest_tree(staging.path(), &url))?;
+            // Validate the schema before uploading, so a conflicting re-ingest
+            // uploads nothing.
+            runtime.block_on(ingest::publish_remote(staging.path(), &url))?;
             println!("wrote {n} docs across {shards} shard(s) to {url}");
         }
     }

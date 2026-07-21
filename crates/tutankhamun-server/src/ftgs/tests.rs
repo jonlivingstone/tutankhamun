@@ -1,21 +1,25 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use arrow::buffer::{BooleanBuffer, NullBuffer};
 use roaring::RoaringBitmap;
 use tempfile::TempDir;
 
 use super::{
-    FtgsRow, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats, ftgs_scan,
-    ftgs_scan_merge, merge_ftgs, merge_into, render_term,
+    Finalized, FtgsRow, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats,
+    ftgs_scan, ftgs_scan_merge, merge_ftgs, merge_into, render_term,
 };
 use crate::group_lookup::GroupLookup;
 use crate::shard::{DiskShard, DiskShardWriter, FieldKind, Shard};
 
 /// Finalize a scalar stat to its `i64` output — panics via
-/// [`Finalized::int`](super::Finalized::int) if it isn't an `Int`-kind stat,
-/// which the scalar tests never produce.
+/// [`Finalized::int_opt`](super::Finalized::int_opt) if it isn't an `Int`-kind
+/// stat, which the scalar tests never produce. These helpers only feed
+/// non-NULL stats, so the `None` (all-NULL) case is unwrapped.
 fn fin_int(v: &StatValue) -> i64 {
-    v.finalize().int()
+    v.finalize()
+        .int_opt()
+        .expect("scalar test stat is non-NULL")
 }
 
 /// Postings map from a doc→term assignment given in doc-id order.
@@ -167,6 +171,61 @@ fn aggregate_docs_grouped_buckets_by_group() {
 }
 
 #[test]
+fn nullable_metric_skips_nulls_and_all_null_group_is_null() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path();
+    let mut w = DiskShardWriter::new(dir, (0, 0)).expect("new");
+    // revenue NULL at docs 1 and 3 (0 placeholders in the dense buffer).
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false, true]));
+    w.add_forward_column(
+        "revenue",
+        vec![10, 0, 30, 0, 50],
+        FieldKind::Metric,
+        Some(validity),
+    )
+    .expect("revenue");
+    w.finalize().expect("finalize");
+    let shard = DiskShard::open(dir).expect("open");
+
+    // groups: {0,1,4}→g1, {2}→g2, {3}→g3 (g3's only doc is NULL).
+    let mut g = GroupLookup::all_in_one_group(5);
+    for (doc, group) in [(0, 1), (1, 1), (2, 2), (3, 3), (4, 1)] {
+        g.set(doc, group);
+    }
+    let out = aggregate_docs_grouped(
+        &shard,
+        0..5,
+        &g,
+        &[
+            StatSpec::Sum("revenue"),
+            StatSpec::Min("revenue"),
+            StatSpec::Max("revenue"),
+            StatSpec::Avg("revenue"),
+            StatSpec::ApproxPercentile("revenue", 0.5, 100),
+        ],
+    )
+    .unwrap();
+
+    // g1 = {10, NULL, 50}: nulls skipped → sum 60, min 10, max 50, avg 60/2.
+    let g1 = &out[&1];
+    assert!(matches!(g1[0], StatValue::Scalar(60)));
+    assert!(matches!(g1[1], StatValue::Scalar(10)));
+    assert!(matches!(g1[2], StatValue::Scalar(50)));
+    // avg carries (sum, non-null count) un-finalized → 60/2.
+    assert!(matches!(g1[3], StatValue::Avg { sum: 60, count: 2 }));
+    // percentile buffered the two non-null values → a real digest, not NULL.
+    assert!(matches!(g1[4], StatValue::TDigest { .. }));
+    // g2 = {30}.
+    assert!(matches!(out[&2][0], StatValue::Scalar(30)));
+    // g3 = {NULL}: every stat — scalar AND the percentile sketch — is SQL NULL,
+    // not 0 / i64::MAX / NaN / an empty-digest 0.
+    for st in &out[&3] {
+        assert!(matches!(st, StatValue::Null), "all-NULL group must be NULL");
+    }
+    assert!(matches!(out[&3][4].finalize(), Finalized::Null));
+}
+
+#[test]
 fn approx_percentile_estimates_quantile() {
     let (_tmp, shard) = setup();
     // revenue {10,20,30,40,50}: median 30 (t-digest keeps all points exact
@@ -232,6 +291,22 @@ fn approx_top_k_merges_across_shards() {
         topk_rendered(&a[0]),
         vec![("UK".to_string(), 3), ("US".to_string(), 3)]
     );
+}
+
+#[test]
+fn combine_stats_treats_null_as_merge_identity() {
+    let spec = [StatSpec::Sum("x"), StatSpec::Min("x")];
+    // A group valued in one shard, all-NULL in the other (each direction).
+    let mut acc = vec![StatValue::Scalar(10), StatValue::Null];
+    let other = vec![StatValue::Null, StatValue::Scalar(7)];
+    combine_stats(&mut acc, &other, &spec);
+    assert!(matches!(acc[0], StatValue::Scalar(10))); // value ∘ NULL = value
+    assert!(matches!(acc[1], StatValue::Scalar(7))); // NULL ∘ value = value
+
+    // NULL ∘ NULL stays NULL.
+    let mut both_null = vec![StatValue::Null];
+    combine_stats(&mut both_null, &[StatValue::Null], &spec[..1]);
+    assert!(matches!(both_null[0], StatValue::Null));
 }
 
 #[test]

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use arrow::array::builder::NullBufferBuilder;
 use arrow::array::{
     Array, ArrayRef, Date32Array, Date64Array, Decimal128Array, Float32Array, Float64Array,
     Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray,
@@ -32,7 +33,9 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use roaring::RoaringBitmap;
 use tokio::io::AsyncReadExt;
 
-use crate::shard::{DiskShardWriter, FieldKind, METADATA_FILE, Metadata};
+use crate::shard::{
+    DatasetSchema, DiskShardWriter, FieldKind, METADATA_FILE, Metadata, SCHEMA_FILE, write_atomic,
+};
 
 /// Default decimal scale applied to float columns at ingest (`round(v × 10^3)`),
 /// i.e. three fractional digits. Overridable per column via `--scale`.
@@ -256,6 +259,107 @@ pub fn shard_summaries(root: &Path) -> Result<Vec<(PathBuf, u64)>> {
         .collect()
 }
 
+/// The schema inferred from every shard written under `root` — this ingest
+/// run's contribution to the dataset schema (kinds/scales declared, nullability
+/// data-driven and unioned across the run's shards).
+fn run_schema(root: &Path) -> Result<DatasetSchema> {
+    let mut dirs = find_shard_dirs(root)?;
+    dirs.sort();
+    let metas: Vec<Metadata> = dirs
+        .iter()
+        .map(|d| read_shard_metadata(d))
+        .collect::<Result<_>>()?;
+    DatasetSchema::infer_from_shards(&metas)
+}
+
+/// Reconcile this run's schema with the dataset's existing one: merge
+/// monotonically (nullability unions; a structural conflict bails at the source)
+/// when a schema is already recorded, else adopt the run's schema as the
+/// dataset's.
+fn reconcile(existing: Option<DatasetSchema>, run: DatasetSchema) -> Result<DatasetSchema> {
+    match existing {
+        Some(e) => e.merge(&run),
+        None => Ok(run),
+    }
+}
+
+/// A staging tempdir on the same filesystem as `dataset_root` (a sibling under
+/// its parent), so a run's shards can be published into place with a plain
+/// rename. Ingesting into staging first lets a schema-conflicting re-ingest fail
+/// before any shard goes live, instead of orphaning shards in the dataset.
+pub fn local_staging(dataset_root: &Path) -> Result<tempfile::TempDir> {
+    let parent = dataset_root
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    tempfile::Builder::new()
+        .prefix(".t9n-ingest-")
+        .tempdir_in(parent)
+        .with_context(|| format!("create ingest staging under {}", parent.display()))
+}
+
+/// Validate a **local** run staged under `staging` against the dataset's
+/// existing `schema.json`, then — only if it merges — publish the staged shards
+/// into `dataset_root` and write the evolved schema. Validating before the
+/// publish means a schema-conflicting re-ingest leaves the dataset untouched.
+pub fn publish_local(staging: &Path, dataset_root: &Path) -> Result<()> {
+    let run = run_schema(staging)?;
+    let path = dataset_root.join(SCHEMA_FILE);
+    let existing = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?,
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let schema = reconcile(existing, run)?;
+    publish_local_tree(staging, dataset_root)?;
+    let json = serde_json::to_vec_pretty(&schema).context("serialise schema.json")?;
+    write_atomic(&path, |tmp| {
+        std::fs::write(tmp, &json).with_context(|| format!("write {}", tmp.display()))
+    })
+}
+
+/// Move every file staged under `staging` into `dataset_root`, preserving each
+/// file's path relative to the staging root — a `--shard-by none` shard lands at
+/// the dataset root, bucketed shards under their date dirs. `metadata.json` files
+/// move last (as with the uploader) so a shard never becomes discoverable before
+/// its payload; a same-named file is replaced (re-ingesting a partition
+/// overwrites it). `staging` must share a filesystem with `dataset_root`.
+fn publish_local_tree(staging: &Path, dataset_root: &Path) -> Result<()> {
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    crate::shard::walk_files(staging, staging, &mut |abs, rel| {
+        files.push((abs.to_path_buf(), rel.to_string()));
+        Ok(())
+    })?;
+    // Payload before metadata.json, matching the uploader's completeness rule.
+    files.sort_by_key(|(_, rel)| rel.ends_with(METADATA_FILE));
+    for (src, rel) in files {
+        let dest = dataset_root.join(&rel);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        std::fs::rename(&src, &dest)
+            .with_context(|| format!("publish {} -> {}", src.display(), dest.display()))?;
+    }
+    Ok(())
+}
+
+/// Validate a **remote** run staged under `staging` against the remote dataset's
+/// `schema.json`, then — only if it merges — upload the staged shards and write
+/// the evolved schema. Validating before the upload means a schema-conflicting
+/// re-ingest uploads nothing.
+pub async fn publish_remote(staging: &Path, url: &str) -> Result<()> {
+    let run = run_schema(staging)?;
+    let store = crate::storage::StorageRegistry::from_url(url)?.store();
+    let existing = crate::shard_source::read_dataset_schema(&*store).await?;
+    let schema = reconcile(existing, run)?;
+    upload_ingest_tree(staging, url).await?;
+    crate::shard_source::write_dataset_schema(&*store, &schema).await
+}
+
 fn walk_shard_dirs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if dir.join(METADATA_FILE).is_file() {
         out.push(dir.to_path_buf());
@@ -409,6 +513,9 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
     // existing "all forward columns up front" ordering in the
     // resulting Arrow schema.
     let mut numeric_proto: Vec<NumericCol> = Vec::new();
+    // CSV is untyped: an empty field is a NULL (distinct from `0` or an
+    // empty-string term). Nullability is inferred from the data — a column is
+    // recorded nullable only if an empty field is actually seen.
     for name in &opts.metrics {
         numeric_proto.push(NumericCol {
             name: name.clone(),
@@ -416,6 +523,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
             values: Vec::new(),
             kind: FieldKind::Metric,
             scale: 0,
+            nulls: NullBufferBuilder::new(0),
         });
     }
     for name in &opts.ints {
@@ -425,6 +533,7 @@ pub fn ingest_csv(input: &Path, output: &Path, opts: &IngestOptions) -> Result<u
             values: Vec::new(),
             kind: FieldKind::Int,
             scale: 0,
+            nulls: NullBufferBuilder::new(0),
         });
     }
     let strings_proto: Vec<StringCol> = opts
@@ -519,6 +628,7 @@ pub fn ingest_parquet(
                 values: Vec::new(),
                 kind,
                 scale,
+                nulls: NullBufferBuilder::new(0),
             });
         }
     }
@@ -552,8 +662,8 @@ pub fn ingest_parquet(
         let batch =
             batch.with_context(|| format!("read parquet batch from {}", input.display()))?;
         let time_arr = batch.column(time_idx);
-        let mut numeric = Vec::with_capacity(numeric_proto.len());
-        let mut strings = Vec::with_capacity(strings_proto.len());
+        let mut numeric: Vec<Option<i64>> = Vec::with_capacity(numeric_proto.len());
+        let mut strings: Vec<Option<&str>> = Vec::with_capacity(strings_proto.len());
         for row in 0..batch.num_rows() {
             let t = extract_time(time_arr, row, &opts.time)?;
             numeric.clear();
@@ -665,10 +775,12 @@ fn extract_time(array: &ArrayRef, row: usize, name: &str) -> Result<i64> {
     Ok(v)
 }
 
-/// Extract a doc's numeric value as a scaled `i64` (see module docs).
-fn extract_numeric(array: &ArrayRef, row: usize, name: &str, scale: i8) -> Result<i64> {
+/// Extract a doc's numeric value as a scaled `i64` (see module docs), or `None`
+/// for a NULL. Nullability is data-driven: a NULL is accepted and recorded; a
+/// Parquet REQUIRED column never yields one, so non-nullable columns stay dense.
+fn extract_numeric(array: &ArrayRef, row: usize, name: &str, scale: i8) -> Result<Option<i64>> {
     if array.is_null(row) {
-        bail!("row {row}: null in numeric column {name:?}");
+        return Ok(None);
     }
     let v = match array.data_type() {
         DataType::Int64 => downcast_array::<Int64Array>(array, name)?.value(row),
@@ -694,17 +806,21 @@ fn extract_numeric(array: &ArrayRef, row: usize, name: &str, scale: i8) -> Resul
         ),
         other => bail!("column {name:?} has unsupported numeric type {other:?}"),
     };
-    Ok(v)
+    Ok(Some(v))
 }
 
-/// Extract a doc's string term from a Parquet column.
-fn extract_string<'a>(array: &'a ArrayRef, row: usize, name: &str) -> Result<&'a str> {
+/// Extract a doc's string term from a Parquet column, or `None` for a NULL —
+/// string fields are inherently sparse (an absent term reconstructs to NULL), so
+/// a null just contributes no term.
+fn extract_string<'a>(array: &'a ArrayRef, row: usize, name: &str) -> Result<Option<&'a str>> {
     if array.is_null(row) {
-        bail!("row {row}: null in string column {name:?}");
+        return Ok(None);
     }
     match array.data_type() {
-        DataType::Utf8 => Ok(downcast_array::<StringArray>(array, name)?.value(row)),
-        DataType::LargeUtf8 => Ok(downcast_array::<LargeStringArray>(array, name)?.value(row)),
+        DataType::Utf8 => Ok(Some(downcast_array::<StringArray>(array, name)?.value(row))),
+        DataType::LargeUtf8 => Ok(Some(
+            downcast_array::<LargeStringArray>(array, name)?.value(row),
+        )),
         other => bail!("string column {name:?} has unsupported type {other:?}"),
     }
 }
@@ -743,6 +859,20 @@ struct NumericCol {
     kind: FieldKind,
     /// Decimal scale recorded for this column (0 for plain integers / CSV).
     scale: i8,
+    /// Per-doc null mask. Nullability is **data-driven**: the builder allocates
+    /// nothing until the first NULL and `finish()` returns `None` when no NULL
+    /// was seen — so a shard's column is recorded nullable iff it actually holds
+    /// a NULL. A NULL doc stores a `0` placeholder in `values`.
+    nulls: NullBufferBuilder,
+}
+
+impl NumericCol {
+    /// Append one doc's value; `None` is a NULL — a `0` placeholder in `values`
+    /// plus a clear null bit.
+    fn push(&mut self, value: Option<i64>) {
+        self.values.push(value.unwrap_or(0));
+        self.nulls.append(value.is_some());
+    }
 }
 
 struct StringCol {
@@ -777,6 +907,7 @@ impl BucketBuilder {
                     values: Vec::new(),
                     kind: c.kind,
                     scale: c.scale,
+                    nulls: NullBufferBuilder::new(0),
                 })
                 .collect(),
             strings: strings_proto
@@ -802,20 +933,29 @@ impl BucketBuilder {
             let raw = row
                 .get(col.col_idx)
                 .with_context(|| format!("line {line}: missing {} column", col.kind))?;
-            let value: i64 = raw.parse().with_context(|| {
-                format!(
-                    "line {line}: {} column {:?} value {raw:?}: only int64 values are \
-                     supported (multiply decimal values by 100 etc. and round)",
-                    col.kind, col.name,
-                )
-            })?;
-            col.values.push(value);
+            // An empty field is a NULL (CSV columns are always nullable).
+            let value: Option<i64> = if raw.is_empty() {
+                None
+            } else {
+                Some(raw.parse().with_context(|| {
+                    format!(
+                        "line {line}: {} column {:?} value {raw:?}: only int64 values are \
+                         supported (multiply decimal values by 100 etc. and round)",
+                        col.kind, col.name,
+                    )
+                })?)
+            };
+            col.push(value);
         }
 
         for col in &mut self.strings {
             let term = row
                 .get(col.col_idx)
                 .with_context(|| format!("line {line}: missing string column"))?;
+            // An empty field is a NULL — no posting (the doc reconstructs to NULL).
+            if term.is_empty() {
+                continue;
+            }
             if let Some(bm) = col.postings.get_mut(term) {
                 bm.insert(self.doc_id);
             } else {
@@ -836,14 +976,21 @@ impl BucketBuilder {
     /// columns (in proto order), then the string terms (in proto order). The
     /// accumulation step for the Parquet front-end (values arrive typed, not as
     /// text to parse).
-    fn push_values(&mut self, t: i64, numeric: &[i64], strings: &[&str]) -> Result<()> {
+    fn push_values(
+        &mut self,
+        t: i64,
+        numeric: &[Option<i64>],
+        strings: &[Option<&str>],
+    ) -> Result<()> {
         self.time_values.push(t);
 
         for (col, &value) in self.numeric.iter_mut().zip(numeric) {
-            col.values.push(value);
+            col.push(value);
         }
 
         for (col, &term) in self.strings.iter_mut().zip(strings) {
+            // A NULL term contributes no posting (the doc reconstructs to NULL).
+            let Some(term) = term else { continue };
             // Look up first to avoid allocating a fresh String for terms
             // that already exist — low-cardinality columns repeat heavily.
             if let Some(bm) = col.postings.get_mut(term) {
@@ -882,18 +1029,15 @@ impl BucketBuilder {
             .add_int_field(&self.time_name, self.time_values)
             .with_context(|| format!("add time field {:?}", self.time_name))?;
         writer.set_time_field(&self.time_name);
-        for col in self.numeric {
+        for mut col in self.numeric {
             let name = col.name;
             let scale = col.scale;
-            match col.kind {
-                FieldKind::Metric => writer
-                    .add_metric(&name, col.values)
-                    .with_context(|| format!("add metric {name:?}"))?,
-                FieldKind::Int => writer
-                    .add_int_field(&name, col.values)
-                    .with_context(|| format!("add int field {name:?}"))?,
-                FieldKind::String => unreachable!("NumericCol only holds Metric or Int"),
-            }
+            // `finish()` yields `Some` only if a NULL was actually appended, so
+            // the shard records the column nullable iff it really holds a NULL.
+            let nulls = col.nulls.finish();
+            writer
+                .add_forward_column(&name, col.values, col.kind, nulls)
+                .with_context(|| format!("add {} {name:?}", col.kind))?;
             writer.set_field_scale(&name, scale);
         }
         for col in self.strings {
@@ -1067,6 +1211,168 @@ mod tests {
         // --scale on a decimal column is rejected (schema scale is authoritative).
         let bad = BTreeMap::from([("fare".to_string(), 2_i8)]);
         assert!(ingest_parquet(&pq, &dir.path().join("out3"), &mk_opts(), &bad).is_err());
+    }
+
+    #[test]
+    fn ingest_parquet_accepts_nulls_in_nullable_columns() {
+        use arrow::array::RecordBatch;
+        use arrow::datatypes::{Field, Schema};
+        use parquet::arrow::ArrowWriter;
+
+        // `passengers`/`zone` are nullable in the source schema and carry nulls.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Second, None), false),
+            Field::new("passengers", DataType::Int64, true),
+            Field::new("zone", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(TimestampSecondArray::from(vec![
+                    1_700_000_000,
+                    1_700_000_050,
+                    1_700_000_100,
+                ])),
+                Arc::new(Int64Array::from(vec![Some(2), None, Some(4)])),
+                Arc::new(StringArray::from(vec![Some("a"), Some("b"), None])),
+            ],
+        )
+        .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let pq = dir.path().join("in.parquet");
+        {
+            let f = std::fs::File::create(&pq).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, None).unwrap();
+            w.write(&batch).unwrap();
+            w.close().unwrap();
+        }
+
+        let opts = IngestOptions {
+            time: "ts".into(),
+            metrics: vec!["passengers".into()],
+            strings: vec!["zone".into()],
+            ints: Vec::new(),
+            delimiter: b',',
+            shard_by: ShardBy::None,
+        };
+        let out = dir.path().join("out");
+        let n = ingest_parquet(&pq, &out, &opts, &BTreeMap::new()).unwrap();
+        assert_eq!(n, 3);
+
+        let shard = DiskShard::open(&out).unwrap();
+        // Dense values with a 0 placeholder at the null; validity marks doc 1.
+        assert_eq!(shard.forward_column("passengers").unwrap(), &[2, 0, 4]);
+        let nulls = shard
+            .forward_column_validity("passengers")
+            .expect("validity present");
+        assert!(nulls.is_valid(0) && nulls.is_null(1) && nulls.is_valid(2));
+        assert!(
+            shard
+                .metadata()
+                .fields
+                .iter()
+                .find(|f| f.name == "passengers")
+                .unwrap()
+                .nullable
+        );
+    }
+
+    #[test]
+    fn ingest_csv_treats_empty_fields_as_null() {
+        let dir = tempfile::tempdir().unwrap();
+        // Row 2 has an empty metric and an empty string field — both NULL.
+        let csv = "ts,val,zone\n1700000000,10,a\n1700000050,,\n1700000100,30,c\n";
+        let path = write_csv(dir.path(), csv);
+        let out = dir.path().join("out");
+        let n = ingest_csv(&path, &out, &opts("ts", &["val"], &["zone"])).unwrap();
+        assert_eq!(n, 3);
+
+        let shard = DiskShard::open(&out).unwrap();
+        assert_eq!(shard.forward_column("val").unwrap(), &[10, 0, 30]);
+        let nulls = shard
+            .forward_column_validity("val")
+            .expect("validity present");
+        assert!(nulls.is_valid(0) && nulls.is_null(1) && nulls.is_valid(2));
+    }
+
+    #[test]
+    fn ingest_writes_and_evolves_dataset_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let read_schema = || -> DatasetSchema {
+            serde_json::from_slice(&std::fs::read(out.join(SCHEMA_FILE)).unwrap()).unwrap()
+        };
+        let val_nullable =
+            |s: &DatasetSchema| s.fields.iter().find(|f| f.name == "val").unwrap().nullable;
+        // Ingest a CSV via the real staged-publish flow (stage → validate → move).
+        let ingest_day = |csv: &Path| {
+            let staging = local_staging(&out).unwrap();
+            ingest_csv(csv, staging.path(), &opts_daily("ts", &["val"], &[])).unwrap();
+            publish_local(staging.path(), &out).unwrap();
+        };
+
+        // Day 1 (2023-11-14), no empty fields → val recorded non-nullable.
+        std::fs::write(dir.path().join("d1.csv"), "ts,val\n1700000000,10\n").unwrap();
+        ingest_day(&dir.path().join("d1.csv"));
+        assert!(
+            !val_nullable(&read_schema()),
+            "no nulls ⇒ non-nullable dataset column"
+        );
+
+        // Day 2 introduces a null → the stored schema evolves to nullable
+        // monotonically; day 1's shard is published untouched alongside it.
+        std::fs::write(dir.path().join("d2.csv"), "ts,val\n1700100000,\n").unwrap();
+        ingest_day(&dir.path().join("d2.csv"));
+        assert!(
+            val_nullable(&read_schema()),
+            "a null in any shard ⇒ nullable dataset column"
+        );
+        // Both days' shards are live under the dataset root.
+        assert_eq!(find_shard_dirs(&out).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn conflicting_reingest_fails_without_touching_the_dataset() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+
+        // First ingest: `val` is a metric.
+        std::fs::write(dir.path().join("a.csv"), "ts,val\n1700000000,10\n").unwrap();
+        let staging = local_staging(&out).unwrap();
+        ingest_csv(
+            &dir.path().join("a.csv"),
+            staging.path(),
+            &opts_daily("ts", &["val"], &[]),
+        )
+        .unwrap();
+        publish_local(staging.path(), &out).unwrap();
+        let before: Vec<_> = find_shard_dirs(&out).unwrap();
+        assert_eq!(before.len(), 1);
+
+        // Re-ingest a different day with `val` now a string → structural conflict.
+        std::fs::write(dir.path().join("b.csv"), "ts,val\n1700200000,hello\n").unwrap();
+        let staging = local_staging(&out).unwrap();
+        ingest_csv(
+            &dir.path().join("b.csv"),
+            staging.path(),
+            &opts_daily("ts", &[], &["val"]),
+        )
+        .unwrap();
+        let err = publish_local(staging.path(), &out).unwrap_err();
+        assert!(
+            err.to_string().contains("schema conflict"),
+            "expected a schema-conflict error, got: {err}"
+        );
+
+        // The dataset is untouched: no orphaned shard, schema unchanged.
+        assert_eq!(find_shard_dirs(&out).unwrap(), before);
+        let schema: DatasetSchema =
+            serde_json::from_slice(&std::fs::read(out.join(SCHEMA_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            schema.fields.iter().find(|f| f.name == "val").unwrap().kind,
+            FieldKind::Metric
+        );
     }
 
     fn write_csv(dir: &Path, contents: &str) -> std::path::PathBuf {

@@ -13,14 +13,40 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use object_store::ObjectStore;
 use object_store::path::Path;
 
-use crate::shard::Metadata;
+use crate::shard::{DatasetSchema, Metadata, SCHEMA_FILE};
 
 const METADATA_FILE: &str = "metadata.json";
+
+/// Read a dataset's [`DatasetSchema`] from `store` (rooted at the dataset), or
+/// `None` when the artifact is absent — a missing file degrades to inference,
+/// never an error (the schema is a rebuildable cache, not authoritative-or-bust).
+pub async fn read_dataset_schema(store: &dyn ObjectStore) -> Result<Option<DatasetSchema>> {
+    match store.get(&Path::from(SCHEMA_FILE)).await {
+        Ok(res) => {
+            let bytes = res.bytes().await?;
+            let schema =
+                serde_json::from_slice(&bytes).with_context(|| format!("parse {SCHEMA_FILE}"))?;
+            Ok(Some(schema))
+        }
+        Err(object_store::Error::NotFound { .. }) => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("read {SCHEMA_FILE}")),
+    }
+}
+
+/// Write a dataset's [`DatasetSchema`] to `store` (rooted at the dataset).
+pub async fn write_dataset_schema(store: &dyn ObjectStore, schema: &DatasetSchema) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(schema).context("serialise schema.json")?;
+    store
+        .put(&Path::from(SCHEMA_FILE), bytes.into())
+        .await
+        .with_context(|| format!("write {SCHEMA_FILE}"))?;
+    Ok(())
+}
 
 /// One discovered shard. Holds the shard's directory path within the
 /// backend and a copy of its `metadata.json` contents.
@@ -376,6 +402,7 @@ mod tests {
                 name: "x".into(),
                 kind: FieldKind::Metric,
                 scale: 0,
+                nullable: false,
             }],
             content_hashes: std::collections::BTreeMap::default(),
             time_field: None,

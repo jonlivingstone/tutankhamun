@@ -30,6 +30,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
 use anyhow::{Context as _, Result, bail};
+use arrow::buffer::NullBuffer;
 use rayon::prelude::*;
 
 use crate::bit_tree::BitTree;
@@ -124,6 +125,10 @@ impl StatSpec<'_> {
 /// produces the typed output ([`Finalized`]).
 #[derive(Debug, Clone)]
 pub enum StatValue {
+    /// A SQL NULL result — a scalar stat (`Sum`/`Min`/`Max`/`Avg`) over a group
+    /// whose every contributing doc was NULL. The merge identity: combining it
+    /// with any value yields that value.
+    Null,
     /// `Count`/`Sum`/`Min`/`Max` — the value is already the result.
     Scalar(i64),
     /// `Avg` — running `(sum, count)`, both additive across shards,
@@ -165,6 +170,9 @@ fn top_k_sorted(map: HashMap<Box<[u8]>, i64>, n: usize) -> Vec<(Box<[u8]>, i64)>
 /// (scalars and borrows), so the enum is too.
 #[derive(Debug, Clone, Copy)]
 pub enum Finalized<'a> {
+    /// A SQL NULL (an all-NULL scalar group) — the output builder emits a null
+    /// slot regardless of the column's value type.
+    Null,
     /// `Count`/`Sum`/`Min`/`Max`, the HLL estimate, or the rounded
     /// percentile.
     Int(i64),
@@ -178,22 +186,26 @@ pub enum Finalized<'a> {
 }
 
 impl<'a> Finalized<'a> {
-    /// Pull the one variant the column's [`OutputKind`] guarantees. The kind
+    /// Pull the one variant the column's [`OutputKind`] guarantees, mapping a
+    /// NULL (all-NULL scalar group) to `None` for the output builder. The kind
     /// and the value both derive from the same `StatSpec`, so the other arms
     /// are unreachable — a tight, local invariant at each reshape dispatch
     /// arm (and a clear panic if a test ever violates it).
     #[must_use]
-    pub fn int(self) -> i64 {
+    pub fn int_opt(self) -> Option<i64> {
         match self {
-            Finalized::Int(v) => v,
+            Finalized::Null => None,
+            Finalized::Int(v) => Some(v),
             _ => unreachable!("an Int column holds only Int-kind stats"),
         }
     }
 
+    /// Like [`int_opt`](Self::int_opt) but maps a NULL (all-NULL avg group) to `None`.
     #[must_use]
-    pub fn float(self) -> f64 {
+    pub fn float_opt(self) -> Option<f64> {
         match self {
-            Finalized::Float(v) => v,
+            Finalized::Null => None,
+            Finalized::Float(v) => Some(v),
             _ => unreachable!("a Float64 column is an avg stat"),
         }
     }
@@ -224,6 +236,7 @@ impl StatValue {
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn finalize(&self) -> Finalized<'_> {
         match self {
+            StatValue::Null => Finalized::Null,
             StatValue::Scalar(v) => Finalized::Int(*v),
             StatValue::Hll(h) => Finalized::Int(h.estimate()),
             // `approx_percentile_cont` returns the column's (`Int64`) type,
@@ -231,8 +244,8 @@ impl StatValue {
             StatValue::TDigest { digest, percentile } => {
                 Finalized::Int(digest.quantile(*percentile).round() as i64)
             }
-            // `count >= 1` by construction (a group exists because it has a
-            // doc), so the quotient is well-defined.
+            // `count >= 1` by construction: `take_value` maps an all-NULL group to
+            // `StatValue::Null`, and the merge only ever sums positive counts.
             StatValue::Avg { sum, count } => Finalized::Float(*sum as f64 / *count as f64),
             StatValue::TopK { items, k, .. } => Finalized::TopK(&items[..(*k).min(items.len())]),
             StatValue::Theta(s) => Finalized::Theta(s),
@@ -272,6 +285,10 @@ pub fn combine_stats(acc: &mut [StatValue], other: &[StatValue], specs: &[StatSp
                 *a = top_k_sorted(map, *capacity);
             }
             (StatValue::Theta(a), StatValue::Theta(b)) => a.union(b),
+            // NULL is the merge identity (an all-NULL group in one shard): the
+            // value side wins, NULL∘NULL stays NULL.
+            (_, StatValue::Null) => {}
+            (a @ StatValue::Null, b) => *a = b.clone(),
             _ => unreachable!("stat variants match across shards (same specs)"),
         }
     }
@@ -292,6 +309,65 @@ pub struct FtgsRow {
     pub stats: Vec<StatValue>,
 }
 
+/// A forward column plus its optional null mask. `at(doc)` yields the doc's
+/// value or `None` for a NULL. Non-nullable columns carry `valid: None`, so the
+/// hot path pays only one always-false branch.
+#[derive(Clone, Copy)]
+pub(crate) struct Column<'a> {
+    values: &'a [i64],
+    valid: Option<&'a NullBuffer>,
+}
+
+impl<'a> Column<'a> {
+    /// Bind a shard's forward column and its validity mask, or `None` if the
+    /// shard has no such forward column.
+    pub(crate) fn new(shard: &'a dyn Shard, name: &str) -> Option<Column<'a>> {
+        shard.forward_column(name).map(|values| Column {
+            values,
+            valid: shard.forward_column_validity(name),
+        })
+    }
+
+    /// The doc's value, or `None` for a SQL NULL.
+    #[inline]
+    pub(crate) fn at(&self, doc: usize) -> Option<i64> {
+        if self.valid.is_some_and(|v| v.is_null(doc)) {
+            None
+        } else {
+            Some(self.values[doc])
+        }
+    }
+
+    /// A per-group "saw a non-NULL value" tracker, allocated only for a nullable
+    /// column — a non-nullable column never skips, so every live group has a
+    /// value and needs no NULL bookkeeping.
+    fn seen_tracker(&self, num_groups: usize) -> Option<Vec<bool>> {
+        self.valid.is_some().then(|| vec![false; num_groups])
+    }
+}
+
+/// Record that `group` saw a non-NULL value (no-op for a non-nullable column,
+/// whose `seen` is `None`).
+#[inline]
+fn mark_seen(seen: &mut Option<Vec<bool>>, group: usize) {
+    if let Some(seen) = seen {
+        seen[group] = true;
+    }
+}
+
+/// Take a scalar group's value, mapping an all-NULL group — a nullable column
+/// where `group` saw no value — to [`StatValue::Null`]. Resets `seen[group]` so
+/// the slot is reusable for the next term.
+fn take_scalar(value: i64, seen: &mut Option<Vec<bool>>, group: usize) -> StatValue {
+    if let Some(seen) = seen {
+        // Nullable column: NULL unless this group saw a non-NULL value.
+        if !std::mem::replace(&mut seen[group], false) {
+            return StatValue::Null;
+        }
+    }
+    StatValue::Scalar(value)
+}
+
 /// Live per-group accumulator for one stat. Each variant owns its own
 /// `slots` (one per group) seeded to the operator's identity, so the
 /// inner loop is a flat array write and a sketch variant can pick a
@@ -301,24 +377,32 @@ enum Stat<'a> {
         slots: Vec<i64>,
     },
     Sum {
-        col: &'a [i64],
+        col: Column<'a>,
         slots: Vec<i64>,
+        /// `Some` iff `col` is nullable — tracks which groups saw a non-NULL
+        /// value so an all-NULL group finalizes to SQL NULL, not `0`.
+        seen: Option<Vec<bool>>,
     },
     Min {
-        col: &'a [i64],
+        col: Column<'a>,
         slots: Vec<i64>,
+        /// See [`Stat::Sum::seen`] — else an all-NULL group keeps the `i64::MAX`
+        /// identity.
+        seen: Option<Vec<bool>>,
     },
     Max {
-        col: &'a [i64],
+        col: Column<'a>,
         slots: Vec<i64>,
+        seen: Option<Vec<bool>>,
     },
     Avg {
-        col: &'a [i64],
+        col: Column<'a>,
         sum: Vec<i64>,
+        /// Non-NULL count; `0` ⇒ an all-NULL group, finalized to SQL NULL.
         count: Vec<i64>,
     },
     Hll {
-        col: &'a [i64],
+        col: Column<'a>,
         sketches: Vec<Hll>,
     },
     /// `approx_distinct` over a `String` column, which has no forward
@@ -335,7 +419,7 @@ enum Stat<'a> {
     /// each group buffers its values and the digest is constructed at
     /// `take_value`. `percentile`/`max_size` ride along to finalize.
     ApproxPercentile {
-        col: &'a [i64],
+        col: Column<'a>,
         percentile: f64,
         max_size: usize,
         buffers: Vec<Vec<f64>>,
@@ -343,7 +427,7 @@ enum Stat<'a> {
     /// `approx_top_k` over a forward (`Int`/`Metric`) column: count per
     /// `i64` value, resolved to its `encode_int_key` bytes at `take_value`.
     TopKInt {
-        col: &'a [i64],
+        col: Column<'a>,
         k: usize,
         capacity: usize,
         counts: Vec<HashMap<i64, i64>>,
@@ -360,7 +444,7 @@ enum Stat<'a> {
     },
     /// `theta` over an `Int`/`Metric` forward column: hash `col[doc]`.
     ThetaInt {
-        col: &'a [i64],
+        col: Column<'a>,
         nominal: usize,
         sketches: Vec<ThetaSketch>,
     },
@@ -377,28 +461,40 @@ enum Stat<'a> {
 impl<'a> Stat<'a> {
     /// Resolve a spec against the shard and allocate `num_groups`
     /// identity-seeded slots.
+    #[allow(clippy::too_many_lines)] // one arm per stat kind — breadth, not depth
     fn new(spec: StatSpec<'a>, shard: &'a dyn Shard, num_groups: usize) -> Result<Self> {
-        let column = |name: &str| -> Result<&'a [i64]> {
-            shard
-                .forward_column(name)
+        let column = |name: &str| -> Result<Column<'a>> {
+            Column::new(shard, name)
                 .with_context(|| format!("stat field {name:?} has no forward column"))
         };
         Ok(match spec {
             StatSpec::Count => Stat::Count {
                 slots: vec![0; num_groups],
             },
-            StatSpec::Sum(name) => Stat::Sum {
-                col: column(name)?,
-                slots: vec![0; num_groups],
-            },
-            StatSpec::Min(name) => Stat::Min {
-                col: column(name)?,
-                slots: vec![i64::MAX; num_groups],
-            },
-            StatSpec::Max(name) => Stat::Max {
-                col: column(name)?,
-                slots: vec![i64::MIN; num_groups],
-            },
+            StatSpec::Sum(name) => {
+                let col = column(name)?;
+                Stat::Sum {
+                    slots: vec![0; num_groups],
+                    seen: col.seen_tracker(num_groups),
+                    col,
+                }
+            }
+            StatSpec::Min(name) => {
+                let col = column(name)?;
+                Stat::Min {
+                    slots: vec![i64::MAX; num_groups],
+                    seen: col.seen_tracker(num_groups),
+                    col,
+                }
+            }
+            StatSpec::Max(name) => {
+                let col = column(name)?;
+                Stat::Max {
+                    slots: vec![i64::MIN; num_groups],
+                    seen: col.seen_tracker(num_groups),
+                    col,
+                }
+            }
             StatSpec::Avg(name) => Stat::Avg {
                 col: column(name)?,
                 sum: vec![0; num_groups],
@@ -407,7 +503,7 @@ impl<'a> Stat<'a> {
             // `Int`/`Metric` have a dense forward column; `String` does
             // not, so it sources term bytes from the inverted index.
             StatSpec::ApproxCountDistinct(name) => {
-                if let Some(col) = shard.forward_column(name) {
+                if let Some(col) = Column::new(shard, name) {
                     Stat::Hll {
                         col,
                         sketches: vec![Hll::default(); num_groups],
@@ -430,7 +526,7 @@ impl<'a> Stat<'a> {
             // `Int`/`Metric` count via the forward column; `String` counts
             // per term index from the inverted index.
             StatSpec::TopK(name, k, capacity) => {
-                if let Some(col) = shard.forward_column(name) {
+                if let Some(col) = Column::new(shard, name) {
                     Stat::TopKInt {
                         col,
                         k,
@@ -450,7 +546,7 @@ impl<'a> Stat<'a> {
             }
             // `Int`/`Metric` hash the forward column; `String` hashes terms.
             StatSpec::Theta(name, nominal) => {
-                if let Some(col) = shard.forward_column(name) {
+                if let Some(col) = Column::new(shard, name) {
                     Stat::ThetaInt {
                         col,
                         nominal,
@@ -474,14 +570,35 @@ impl<'a> Stat<'a> {
     fn update(&mut self, group: usize, doc: usize) {
         match self {
             Stat::Count { slots } => slots[group] += 1,
-            Stat::Sum { col, slots } => slots[group] += col[doc],
-            Stat::Min { col, slots } => slots[group] = slots[group].min(col[doc]),
-            Stat::Max { col, slots } => slots[group] = slots[group].max(col[doc]),
-            Stat::Avg { col, sum, count } => {
-                sum[group] += col[doc];
-                count[group] += 1;
+            Stat::Sum { col, slots, seen } => {
+                if let Some(v) = col.at(doc) {
+                    slots[group] += v;
+                    mark_seen(seen, group);
+                }
             }
-            Stat::Hll { col, sketches } => sketches[group].insert(col[doc]),
+            Stat::Min { col, slots, seen } => {
+                if let Some(v) = col.at(doc) {
+                    slots[group] = slots[group].min(v);
+                    mark_seen(seen, group);
+                }
+            }
+            Stat::Max { col, slots, seen } => {
+                if let Some(v) = col.at(doc) {
+                    slots[group] = slots[group].max(v);
+                    mark_seen(seen, group);
+                }
+            }
+            Stat::Avg { col, sum, count } => {
+                if let Some(v) = col.at(doc) {
+                    sum[group] += v;
+                    count[group] += 1;
+                }
+            }
+            Stat::Hll { col, sketches } => {
+                if let Some(v) = col.at(doc) {
+                    sketches[group].insert(v);
+                }
+            }
             Stat::HllBytes {
                 doc_term,
                 terms,
@@ -491,8 +608,16 @@ impl<'a> Stat<'a> {
                     sketches[group].insert_bytes(&terms[t as usize]);
                 }
             }
-            Stat::ApproxPercentile { col, buffers, .. } => buffers[group].push(col[doc] as f64),
-            Stat::TopKInt { col, counts, .. } => *counts[group].entry(col[doc]).or_default() += 1,
+            Stat::ApproxPercentile { col, buffers, .. } => {
+                if let Some(v) = col.at(doc) {
+                    buffers[group].push(v as f64);
+                }
+            }
+            Stat::TopKInt { col, counts, .. } => {
+                if let Some(v) = col.at(doc) {
+                    *counts[group].entry(v).or_default() += 1;
+                }
+            }
             Stat::TopKBytes {
                 doc_term, counts, ..
             } => {
@@ -500,7 +625,11 @@ impl<'a> Stat<'a> {
                     *counts[group].entry(t).or_default() += 1;
                 }
             }
-            Stat::ThetaInt { col, sketches, .. } => sketches[group].insert(col[doc]),
+            Stat::ThetaInt { col, sketches, .. } => {
+                if let Some(v) = col.at(doc) {
+                    sketches[group].insert(v);
+                }
+            }
             Stat::ThetaBytes {
                 doc_term,
                 terms,
@@ -521,19 +650,26 @@ impl<'a> Stat<'a> {
     /// the cost scales with groups seen, not the group count.
     fn take_value(&mut self, group: usize) -> StatValue {
         match self {
-            Stat::Count { slots } | Stat::Sum { slots, .. } => {
-                StatValue::Scalar(std::mem::take(&mut slots[group]))
+            Stat::Count { slots } => StatValue::Scalar(std::mem::take(&mut slots[group])),
+            Stat::Sum { slots, seen, .. } => {
+                take_scalar(std::mem::take(&mut slots[group]), seen, group)
             }
-            Stat::Min { slots, .. } => {
-                StatValue::Scalar(std::mem::replace(&mut slots[group], i64::MAX))
+            Stat::Min { slots, seen, .. } => {
+                take_scalar(std::mem::replace(&mut slots[group], i64::MAX), seen, group)
             }
-            Stat::Max { slots, .. } => {
-                StatValue::Scalar(std::mem::replace(&mut slots[group], i64::MIN))
+            Stat::Max { slots, seen, .. } => {
+                take_scalar(std::mem::replace(&mut slots[group], i64::MIN), seen, group)
             }
-            Stat::Avg { sum, count, .. } => StatValue::Avg {
-                sum: std::mem::take(&mut sum[group]),
-                count: std::mem::take(&mut count[group]),
-            },
+            Stat::Avg { sum, count, .. } => {
+                let count = std::mem::take(&mut count[group]);
+                let sum = std::mem::take(&mut sum[group]);
+                // An all-NULL group (no non-NULL doc) is SQL NULL, not 0/0.
+                if count == 0 {
+                    StatValue::Null
+                } else {
+                    StatValue::Avg { sum, count }
+                }
+            }
             Stat::Hll { sketches, .. } | Stat::HllBytes { sketches, .. } => {
                 StatValue::Hll(std::mem::take(&mut sketches[group]))
             }
@@ -542,10 +678,19 @@ impl<'a> Stat<'a> {
                 max_size,
                 buffers,
                 ..
-            } => StatValue::TDigest {
-                digest: TDigest::from_values(std::mem::take(&mut buffers[group]), *max_size),
-                percentile: *percentile,
-            },
+            } => {
+                let values = std::mem::take(&mut buffers[group]);
+                // An all-NULL group buffered no value; the percentile of an empty
+                // set is SQL NULL (an empty t-digest would otherwise finalize to 0).
+                if values.is_empty() {
+                    StatValue::Null
+                } else {
+                    StatValue::TDigest {
+                        digest: TDigest::from_values(values, *max_size),
+                        percentile: *percentile,
+                    }
+                }
+            }
             Stat::TopKInt {
                 k,
                 capacity,

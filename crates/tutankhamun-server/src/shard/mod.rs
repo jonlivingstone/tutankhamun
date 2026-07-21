@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{Array, Int64Array, RecordBatch};
-use arrow::buffer::Buffer;
+use arrow::buffer::{Buffer, NullBuffer};
 use arrow::datatypes::DataType;
 use chrono::DateTime;
 use fst::{IntoStreamer, Streamer};
@@ -49,8 +49,11 @@ mod writer;
 use filter::combine_filters;
 pub use filter::{FilterClause, FilterOp, FilterResult, matched_doc_set};
 pub use writer::DiskShardWriter;
+pub(crate) use writer::write_atomic;
 
 pub(crate) const METADATA_FILE: &str = "metadata.json";
+/// The dataset-level schema artifact, at a dataset root (above/beside shards).
+pub const SCHEMA_FILE: &str = "schema.json";
 pub(crate) const METRICS_FILE: &str = "metrics.arrow";
 const POSTINGS_DIR: &str = "postings";
 const POSTING_EXT: &str = "posting";
@@ -114,12 +117,25 @@ pub struct FieldSchema {
     /// JSON (omitted when 0) so existing shards deserialize unchanged.
     #[serde(default, skip_serializing_if = "is_zero_scale")]
     pub scale: i8,
+    /// Whether the column holds SQL NULLs. `Metric`/`Int` only — `String` is
+    /// sparse (an absent term is already NULL) and the time field is always
+    /// present. In a *shard's* `metadata.json` this is data-driven (the shard
+    /// actually contains a NULL); in a *dataset's* [`DatasetSchema`] it is the
+    /// union — the column may be NULL in some shard. Omitted from the JSON when
+    /// false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nullable: bool,
 }
 
 // Signature dictated by serde's `skip_serializing_if` (takes `&T`).
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_scale(scale: &i8) -> bool {
     *scale == 0
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Field type within a shard.
@@ -150,6 +166,103 @@ impl std::fmt::Display for FieldKind {
     }
 }
 
+/// The dataset-level schema artifact (`schema.json` at a dataset root): the one
+/// schema every shard is read under. Distinct from the reverted shard-catalog
+/// manifest — it records column types/nullability, never *which shards exist*,
+/// so it doesn't fight discovery. Authoritative when present; rebuildable from
+/// the shards via [`infer_from_shards`](Self::infer_from_shards) when absent (so
+/// a missing file degrades to inference, never a dead dataset).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatasetSchema {
+    pub format_version: u32,
+    pub fields: Vec<FieldSchema>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_field: Option<String>,
+}
+
+impl DatasetSchema {
+    /// Derive the dataset schema from its shards' metadata — the "inferred if not
+    /// provided" path and the per-ingest run schema. Requires structural
+    /// agreement (same field set; per field equal name/kind/scale; same time
+    /// field) — a genuine mismatch (Int vs String, different scale) can't be one
+    /// table and bails. Nullability is the **union**: a column is nullable iff
+    /// any shard holds a NULL.
+    pub fn infer_from_shards<'m>(metas: impl IntoIterator<Item = &'m Metadata>) -> Result<Self> {
+        let metas: Vec<&Metadata> = metas.into_iter().collect();
+        let first = metas
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("cannot infer schema from zero shards"))?;
+        let mut fields = first.fields.clone();
+        for m in &metas[1..] {
+            if !same_structure(&m.fields, &fields) || m.time_field != first.time_field {
+                bail!(
+                    "shards have inconsistent schemas: a column's name/kind/scale \
+                     or the time field differs across shards"
+                );
+            }
+            for (acc, f) in fields.iter_mut().zip(&m.fields) {
+                acc.nullable |= f.nullable;
+            }
+        }
+        Ok(Self {
+            format_version: FORMAT_VERSION,
+            fields,
+            time_field: first.time_field.clone(),
+        })
+    }
+
+    /// Evolve this stored schema with a freshly-ingested run's schema. Structure
+    /// must match (a conflicting kind/scale, a changed field set, or a different
+    /// time field is rejected here — at ingest, at the source of the mistake).
+    /// Nullability is **monotonic**: a column that was non-null stays recorded
+    /// nullable once any ingest contributes a NULL.
+    pub fn merge(self, run: &DatasetSchema) -> Result<Self> {
+        self.unify_nullability(
+            run,
+            "schema conflict: the dataset schema and this ingest disagree",
+        )
+    }
+
+    /// Reconcile this stored (authoritative) schema with the nullability the
+    /// shards actually hold: structure stays authoritative from the file, but
+    /// observed nullability is OR-ed in. A stale `schema.json` that under-reports
+    /// a column as non-nullable therefore can't make the reader drop NULL groups
+    /// or declare an Arrow field non-nullable while a shard holds NULLs.
+    pub fn reconcile_with_shards(self, observed: &DatasetSchema) -> Result<Self> {
+        self.unify_nullability(observed, "stored dataset schema and the shards disagree")
+    }
+
+    /// Structural agreement (same field set; per field equal name/kind/scale;
+    /// same time field) plus a monotonic nullability union. `ctx` prefixes the
+    /// error when the two schemas structurally diverge.
+    fn unify_nullability(mut self, other: &DatasetSchema, ctx: &str) -> Result<Self> {
+        if !same_structure(&self.fields, &other.fields) || self.time_field != other.time_field {
+            bail!("{ctx} on a column's name/kind/scale, the field set, or the time field");
+        }
+        for (existing, f) in self.fields.iter_mut().zip(&other.fields) {
+            existing.nullable |= f.nullable;
+        }
+        Ok(self)
+    }
+
+    /// Whether a shard's `fields` structurally match this schema (same columns by
+    /// name/kind/scale; nullability aside) — a shard that doesn't would mis-project.
+    #[must_use]
+    pub fn matches(&self, fields: &[FieldSchema]) -> bool {
+        same_structure(&self.fields, fields)
+    }
+}
+
+/// Whether two field lists describe the same columns ignoring nullability — same
+/// length and, per field, equal name/kind/scale. Nullability is reconciled
+/// separately (union/monotonic), so it is deliberately not compared here.
+fn same_structure(a: &[FieldSchema], b: &[FieldSchema]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.name == y.name && x.kind == y.kind && x.scale == y.scale)
+}
+
 /// Read-only access to a shard's contents.
 pub trait Shard: Send + Sync {
     fn metadata(&self) -> &Metadata;
@@ -166,8 +279,20 @@ pub trait Shard: Send + Sync {
     }
 
     /// Borrow a metric column by field name, or `None` if no such
-    /// column exists.
+    /// column exists. The values are dense even for a nullable column (a NULL
+    /// slot holds a placeholder); pair with [`forward_column_validity`] for the
+    /// null mask.
+    ///
+    /// [`forward_column_validity`]: Shard::forward_column_validity
     fn forward_column(&self, name: &str) -> Option<&[i64]>;
+
+    /// Borrow a forward column's validity (null) mask, or `None` if the column
+    /// has no nulls (or doesn't exist). A `Some` mask marks which docs hold a
+    /// real value; a `None`-returning column is all-valid. Default returns
+    /// `None` so shard impls with only dense columns need no extra code.
+    fn forward_column_validity(&self, _name: &str) -> Option<&NullBuffer> {
+        None
+    }
 
     /// Borrow the inverted index for a string field, or `None` if no
     /// such field exists. Default implementation returns `None` so
@@ -486,6 +611,13 @@ impl Shard for DiskShard {
         Some(int64.values())
     }
 
+    fn forward_column_validity(&self, name: &str) -> Option<&NullBuffer> {
+        let index = self.batch.schema_ref().index_of(name).ok()?;
+        let array = self.batch.column(index);
+        let int64 = array.as_any().downcast_ref::<Int64Array>()?;
+        int64.nulls()
+    }
+
     fn inverted_index(&self, name: &str) -> Option<&InvertedIndex> {
         self.indexes.get(name)
     }
@@ -694,6 +826,10 @@ pub struct MetricAggregates {
     pub sum: i128,
     pub min: Option<i64>,
     pub max: Option<i64>,
+    /// Number of non-NULL values that contributed to `sum`/`min`/`max`. This is
+    /// the avg denominator — NULL docs (skipped from the aggregate) must not
+    /// dilute it, so it can be below the filter-matched doc count.
+    pub count: u64,
 }
 
 impl MetricAggregates {
@@ -716,6 +852,7 @@ impl MetricAggregates {
         self.sum += other.sum;
         self.min = Self::merge_min(self.min, other.min);
         self.max = Self::merge_max(self.max, other.max);
+        self.count += other.count;
     }
 }
 
@@ -748,8 +885,10 @@ impl QueryResult {
 /// every clause in `filters` (AND semantics; empty slice = match
 /// all), and compute sum/min/max for each named metric over the
 /// resulting doc set. Returns one [`MetricAggregates`] per input
-/// metric in declaration order. Avg is derived at display time from
-/// `sum / matched` so it composes correctly across shards.
+/// metric in declaration order. NULL values are skipped (a NULL doc's
+/// forward-column slot is a placeholder), so each metric carries its own
+/// non-NULL `count`; avg is derived at display time from `sum / count`
+/// so it composes correctly across shards and ignores NULLs.
 ///
 /// All three aggregates are computed in a single scan; picking which
 /// one(s) to display is the caller's job.
@@ -762,11 +901,11 @@ pub fn query_shard(
     let metadata = shard.metadata();
 
     // One pass that validates kind, rejects duplicate names, and
-    // collects the column slices. Duplicates would produce confusing
-    // repeated output lines (same column summed twice); the caller
-    // almost certainly meant something else.
+    // collects the column slices (with their null masks, if any).
+    // Duplicates would produce confusing repeated output lines (same
+    // column summed twice); the caller almost certainly meant something else.
     let mut seen = std::collections::HashSet::new();
-    let cols: Vec<&[i64]> = metrics
+    let cols: Vec<(&[i64], Option<&NullBuffer>)> = metrics
         .iter()
         .map(|m| {
             // Metric or Int field — both contribute a forward column.
@@ -774,9 +913,10 @@ pub fn query_shard(
             if !seen.insert(*m) {
                 bail!("metric {m:?} declared more than once");
             }
-            Ok(shard
+            let col = shard
                 .forward_column(m)
-                .expect("metric field kind validated above"))
+                .expect("metric field kind validated above");
+            Ok((col, shard.forward_column_validity(m)))
         })
         .collect::<Result<_>>()?;
 
@@ -785,7 +925,11 @@ pub fn query_shard(
         FilterResult::All => {
             let aggs: Vec<MetricAggregates> = cols
                 .iter()
-                .map(|col| aggregate_iter(col.iter().copied()))
+                .map(|(col, validity)| {
+                    aggregate_iter(col.iter().enumerate().filter_map(|(d, &v)| {
+                        validity.is_none_or(|vb| vb.is_valid(d)).then_some(v)
+                    }))
+                })
                 .collect();
             (metadata.num_docs, aggs)
         }
@@ -793,7 +937,12 @@ pub fn query_shard(
         FilterResult::Bitmap(bm) => {
             let aggs: Vec<MetricAggregates> = cols
                 .iter()
-                .map(|col| aggregate_iter(bm.iter().map(|d| col[d as usize])))
+                .map(|(col, validity)| {
+                    aggregate_iter(bm.iter().filter_map(|d| {
+                        let d = d as usize;
+                        validity.is_none_or(|vb| vb.is_valid(d)).then(|| col[d])
+                    }))
+                })
                 .collect();
             (bm.len(), aggs)
         }
@@ -806,9 +955,9 @@ pub fn query_shard(
     })
 }
 
-/// Empty iterator yields `MetricAggregates::default()` (sum=0,
-/// min/max=None) — the contract `format_aggregate` relies on to render
-/// "n/a" for empty matches.
+/// Empty iterator yields `MetricAggregates::default()` (sum=0, min/max=None,
+/// count=0) — the contract `format_aggregate` relies on to render "n/a" for an
+/// all-NULL or empty match.
 fn aggregate_iter(values: impl Iterator<Item = i64>) -> MetricAggregates {
     let mut iter = values;
     let Some(first) = iter.next() else {
@@ -817,6 +966,7 @@ fn aggregate_iter(values: impl Iterator<Item = i64>) -> MetricAggregates {
     let mut sum = i128::from(first);
     let mut min = first;
     let mut max = first;
+    let mut count = 1u64;
     for v in iter {
         sum += i128::from(v);
         if v < min {
@@ -825,11 +975,13 @@ fn aggregate_iter(values: impl Iterator<Item = i64>) -> MetricAggregates {
         if v > max {
             max = v;
         }
+        count += 1;
     }
     MetricAggregates {
         sum,
         min: Some(min),
         max: Some(max),
+        count,
     }
 }
 
@@ -865,7 +1017,7 @@ pub fn write_query_summary(
     };
     for (i, m) in metrics.iter().enumerate() {
         let label = format!("{m}:");
-        let value = format_aggregate(aggregate, &result.aggregates[i], result.matched);
+        let value = format_aggregate(aggregate, &result.aggregates[i]);
         writeln!(
             out,
             "{:<width$}   {op_name} = {value}",
@@ -877,19 +1029,19 @@ pub fn write_query_summary(
 }
 
 /// Render a single metric's aggregate value. `min`/`max`/`avg` are
-/// "n/a" when no docs matched (the underlying min/max are `None`,
-/// avg has zero denominator).
-fn format_aggregate(op: Aggregate, agg: &MetricAggregates, matched: u64) -> String {
+/// "n/a" when no non-NULL value contributed (min/max are `None`, avg's
+/// denominator `count` is zero).
+fn format_aggregate(op: Aggregate, agg: &MetricAggregates) -> String {
     match op {
         Aggregate::Sum => agg.sum.to_string(),
         Aggregate::Min => agg.min.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
         Aggregate::Max => agg.max.map_or_else(|| "n/a".to_string(), |v| v.to_string()),
         Aggregate::Avg => {
-            if matched == 0 {
+            if agg.count == 0 {
                 "n/a".to_string()
             } else {
                 #[allow(clippy::cast_precision_loss)]
-                let avg = (agg.sum as f64) / (matched as f64);
+                let avg = (agg.sum as f64) / (agg.count as f64);
                 format!("{avg:.2}")
             }
         }

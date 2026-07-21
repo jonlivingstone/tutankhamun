@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 
 use arrow::array::{ArrayRef, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray};
+use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use datafusion::common::Result as DfResult;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
@@ -225,9 +226,37 @@ fn int_column(
     col_name: &str,
     selection: &FilterResult,
 ) -> anyhow::Result<ArrayRef> {
-    Ok(Arc::new(Int64Array::from(gather_i64(
-        shard, col_name, selection,
-    )?)))
+    // Non-nullable (the common case): dense fast path, no per-doc validity work.
+    let Some(validity) = shard.forward_column_validity(col_name) else {
+        return Ok(Arc::new(Int64Array::from(gather_i64(
+            shard, col_name, selection,
+        )?)));
+    };
+    // Nullable: carry the null mask into the output so a NULL doc projects to SQL
+    // NULL (its `values` slot holds a placeholder).
+    let col = shard
+        .forward_column(col_name)
+        .ok_or_else(|| anyhow::anyhow!("no forward column for {col_name:?}"))?;
+    let array = match selection {
+        // Whole column: copy the dense values (as the non-nullable path also
+        // does) but carry the existing null buffer straight through — an
+        // Arc-backed clone — instead of re-deriving validity bit-by-bit through
+        // `Vec<Option<i64>>`.
+        FilterResult::All => {
+            Int64Array::new(ScalarBuffer::from(col.to_vec()), Some(validity.clone()))
+        }
+        FilterResult::Empty => Int64Array::from(Vec::<Option<i64>>::new()),
+        // A subset selection has to gather both value and validity per doc.
+        FilterResult::Bitmap(bm) => Int64Array::from(
+            bm.iter()
+                .map(|d| {
+                    let d = d as usize;
+                    validity.is_valid(d).then(|| col[d])
+                })
+                .collect::<Vec<Option<i64>>>(),
+        ),
+    };
+    Ok(Arc::new(array))
 }
 
 /// The time field: the same epoch-seconds forward column as any Int

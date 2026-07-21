@@ -12,11 +12,12 @@ use datafusion::common::Result as DfResult;
 use datafusion::common::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use object_store::ObjectStore;
 
 use super::exec::TutankhamunExec;
 use super::pushdown;
 use crate::cache::Cache;
-use crate::shard::{FieldKind, Metadata};
+use crate::shard::{DatasetSchema, FieldKind};
 use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
 use crate::storage::StorageRegistry;
 
@@ -73,39 +74,42 @@ impl TutankhamunTableProvider {
     /// (`ServiceInner::resolve_summaries`), building via [`Self::from_summaries`].
     pub async fn try_new(url: String, cache: Arc<Cache>) -> anyhow::Result<Self> {
         let registry = StorageRegistry::from_url(&url)?;
-        let source = ObjectStoreShardSource::new(registry.store());
+        let store = registry.store();
+        let source = ObjectStoreShardSource::new(Arc::clone(&store));
         let summaries = source
             .discover()
             .await
             .with_context(|| format!("discover shards at {url}"))?;
-        Self::from_summaries(url, cache, Arc::new(summaries))
+        let schema = resolve_dataset_schema(&*store, &summaries).await?;
+        Self::from_summaries(url, cache, Arc::new(summaries), &schema)
     }
 
-    /// Build a provider from an already-resolved shard set — no I/O. Derives the
-    /// Arrow schema from the first shard and checks every shard shares a field
-    /// set (a dataset is one logical table; a diverging shard would mis-project
-    /// or fail deep in the scan rather than here at registration). Errors if the
-    /// dataset is empty — `DataFusion` has no schema to register without a shard.
+    /// Build a provider from an already-resolved shard set and the dataset schema
+    /// — no I/O. The Arrow schema and field kinds come from `schema` (the
+    /// authoritative `schema.json` when present, else inferred from the shards).
+    /// Each shard is checked to structurally match (a diverging shard would
+    /// mis-project). Errors if the dataset is empty — `DataFusion` has no schema
+    /// to register without a shard.
     pub(crate) fn from_summaries(
         url: String,
         cache: Arc<Cache>,
         summaries: Arc<Vec<ShardSummary>>,
+        schema: &DatasetSchema,
     ) -> anyhow::Result<Self> {
-        let first = summaries
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("no shards at {url}"))?;
-        for s in &summaries[1..] {
-            if s.metadata.fields != first.metadata.fields {
+        if summaries.is_empty() {
+            anyhow::bail!("no shards at {url}");
+        }
+        for s in summaries.iter() {
+            if !schema.matches(&s.metadata.fields) {
                 anyhow::bail!(
-                    "shards at {url} have inconsistent schemas: {} and {} declare different fields",
-                    first.location,
+                    "shard {} at {url} does not match the dataset schema (a column's \
+                     name/kind/scale differs)",
                     s.location,
                 );
             }
         }
-        let schema = arrow_schema_from_metadata(&first.metadata);
-        let field_kinds = first
-            .metadata
+        let arrow = arrow_schema(schema);
+        let field_kinds = schema
             .fields
             .iter()
             .map(|f| (f.name.clone(), f.kind))
@@ -113,7 +117,7 @@ impl TutankhamunTableProvider {
         Ok(Self {
             url,
             cache,
-            schema,
+            schema: arrow,
             field_kinds,
             summaries,
         })
@@ -187,7 +191,25 @@ impl TableProvider for TutankhamunTableProvider {
     }
 }
 
-fn arrow_schema_from_metadata(metadata: &Metadata) -> SchemaRef {
+/// Resolve the dataset schema the reader projects against. The shards' actual
+/// null flags are always inferred; a present `schema.json` stays authoritative
+/// for structure (kind/scale/field-set/time) but has the observed nullability
+/// OR-ed in, so a stale file can't under-report a column as non-nullable and
+/// make the reader drop NULLs. When absent, the inferred schema stands alone
+/// (the "inferred if not provided" path, also covering pre-`schema.json`
+/// datasets) — a missing file degrades to inference, never an error.
+pub(crate) async fn resolve_dataset_schema(
+    store: &dyn ObjectStore,
+    summaries: &[ShardSummary],
+) -> anyhow::Result<DatasetSchema> {
+    let observed = DatasetSchema::infer_from_shards(summaries.iter().map(|s| &s.metadata))?;
+    match crate::shard_source::read_dataset_schema(store).await? {
+        Some(stored) => stored.reconcile_with_shards(&observed),
+        None => Ok(observed),
+    }
+}
+
+fn arrow_schema(schema: &DatasetSchema) -> SchemaRef {
     // Every declared field is exposed to DataFusion: Metric/Int as
     // Int64 (read from forward columns), String as Utf8
     // (reconstructed per doc from the inverted index at scan time),
@@ -195,8 +217,8 @@ fn arrow_schema_from_metadata(metadata: &Metadata) -> SchemaRef {
     // with date/timestamp literals. The time field is itself an Int
     // field on disk (epoch seconds); only its presentation type
     // differs. String reconstruction is O(num_docs) per shard per field.
-    let time_field = metadata.time_field.as_deref();
-    let fields: Vec<Field> = metadata
+    let time_field = schema.time_field.as_deref();
+    let fields: Vec<Field> = schema
         .fields
         .iter()
         .map(|f| {
@@ -218,9 +240,12 @@ fn arrow_schema_from_metadata(metadata: &Metadata) -> SchemaRef {
                 );
             }
             match f.kind {
-                // Forward columns are dense — every doc has an int
-                // value, so these are non-nullable.
-                FieldKind::Metric | FieldKind::Int => Field::new(&f.name, DataType::Int64, false),
+                // Forward columns are dense, but a declared-nullable one may hold
+                // SQL NULLs (placeholder value + a validity mask), so present it
+                // to DataFusion as nullable.
+                FieldKind::Metric | FieldKind::Int => {
+                    Field::new(&f.name, DataType::Int64, f.nullable)
+                }
                 // A string field is sparse: a doc with no term for it
                 // reconstructs to NULL, so the column is nullable.
                 FieldKind::String => Field::new(&f.name, DataType::Utf8, true),

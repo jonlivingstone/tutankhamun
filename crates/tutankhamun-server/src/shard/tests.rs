@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use arrow::buffer::BooleanBuffer;
+
 use super::*;
 
 fn write_shard(dir: &Path, time_range: (i64, i64), columns: Vec<(&str, Vec<i64>)>) {
@@ -50,11 +52,13 @@ fn metadata_roundtrips_through_serde_json() {
                 name: "a".into(),
                 kind: FieldKind::Metric,
                 scale: 0,
+                nullable: false,
             },
             FieldSchema {
                 name: "country".into(),
                 kind: FieldKind::String,
                 scale: 0,
+                nullable: false,
             },
         ],
         content_hashes: std::collections::BTreeMap::default(),
@@ -63,6 +67,111 @@ fn metadata_roundtrips_through_serde_json() {
     let bytes = serde_json::to_vec(&m).unwrap();
     let back: Metadata = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(m, back);
+}
+
+/// A shard `Metadata` carrying just the schema-relevant bits — for the
+/// `DatasetSchema` inference/merge tests.
+fn meta(fields: Vec<(&str, FieldKind, bool)>, time_field: Option<&str>) -> Metadata {
+    Metadata {
+        format_version: FORMAT_VERSION,
+        num_docs: 1,
+        time_range_start: 0,
+        time_range_end: 0,
+        fields: fields
+            .into_iter()
+            .map(|(name, kind, nullable)| FieldSchema {
+                name: name.into(),
+                kind,
+                scale: 0,
+                nullable,
+            })
+            .collect(),
+        content_hashes: std::collections::BTreeMap::default(),
+        time_field: time_field.map(String::from),
+    }
+}
+
+fn nullable_of(schema: &DatasetSchema, name: &str) -> bool {
+    schema
+        .fields
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap()
+        .nullable
+}
+
+#[test]
+fn dataset_schema_roundtrips_through_serde_json() {
+    let s = DatasetSchema {
+        format_version: FORMAT_VERSION,
+        fields: vec![FieldSchema {
+            name: "x".into(),
+            kind: FieldKind::Int,
+            scale: 2,
+            nullable: true,
+        }],
+        time_field: Some("ts".into()),
+    };
+    let bytes = serde_json::to_vec(&s).unwrap();
+    assert_eq!(s, serde_json::from_slice::<DatasetSchema>(&bytes).unwrap());
+}
+
+#[test]
+fn infer_from_shards_unions_nullability() {
+    // Shard A: x has a null (nullable); shard B: x dense. Union → nullable.
+    let a = meta(vec![("x", FieldKind::Metric, true)], Some("ts"));
+    let b = meta(vec![("x", FieldKind::Metric, false)], Some("ts"));
+    let schema = DatasetSchema::infer_from_shards(&[a, b]).unwrap();
+    assert!(
+        nullable_of(&schema, "x"),
+        "union: nullable in any shard ⇒ nullable"
+    );
+}
+
+#[test]
+fn infer_from_shards_bails_on_structural_mismatch() {
+    // Same column name, different kind — genuinely not one table.
+    let a = meta(vec![("x", FieldKind::Metric, false)], None);
+    let b = meta(vec![("x", FieldKind::String, false)], None);
+    assert!(DatasetSchema::infer_from_shards(&[a, b]).is_err());
+}
+
+#[test]
+fn merge_is_monotonic_and_rejects_conflict() {
+    let stored = DatasetSchema {
+        format_version: FORMAT_VERSION,
+        fields: vec![FieldSchema {
+            name: "x".into(),
+            kind: FieldKind::Metric,
+            scale: 0,
+            nullable: false,
+        }],
+        time_field: None,
+    };
+    // A later run that introduces a null flips x to nullable (monotonic).
+    let run = DatasetSchema {
+        fields: vec![FieldSchema {
+            name: "x".into(),
+            kind: FieldKind::Metric,
+            scale: 0,
+            nullable: true,
+        }],
+        ..stored.clone()
+    };
+    let evolved = stored.clone().merge(&run).unwrap();
+    assert!(nullable_of(&evolved, "x"));
+
+    // A run that changes the column's kind is a conflict, caught at ingest.
+    let conflict = DatasetSchema {
+        fields: vec![FieldSchema {
+            name: "x".into(),
+            kind: FieldKind::String,
+            scale: 0,
+            nullable: false,
+        }],
+        ..stored.clone()
+    };
+    assert!(stored.merge(&conflict).is_err());
 }
 
 #[test]
@@ -128,6 +237,112 @@ fn forward_column_is_a_view_into_the_mmap() {
         "forward column ({col_start:#x}..{col_end:#x}) not inside mmap \
          ({map_start:#x}..{map_end:#x}) — read was not zero-copy",
     );
+}
+
+#[test]
+fn nullable_forward_column_roundtrips_with_validity() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    // docs 1 and 3 are NULL — they hold a 0 placeholder in the dense buffer.
+    let values: Vec<i64> = vec![10, 0, 30, 0];
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false]));
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new writer");
+    w.add_forward_column("m", values.clone(), FieldKind::Metric, Some(validity))
+        .expect("add nullable column");
+    w.finalize().expect("finalize");
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    // Values stay dense (placeholders included) and zero-copy.
+    let col = shard.forward_column("m").expect("column m");
+    assert_eq!(col, values.as_slice());
+    let map: &[u8] = &shard.mmap;
+    let map_start = map.as_ptr() as usize;
+    let col_start = col.as_ptr() as usize;
+    assert!(
+        col_start >= map_start && col_start + std::mem::size_of_val(col) <= map_start + map.len(),
+        "nullable forward column was not a zero-copy view",
+    );
+    // The validity mask marks exactly docs 1 and 3 null.
+    let nulls = shard
+        .forward_column_validity("m")
+        .expect("validity present");
+    assert!(nulls.is_valid(0) && nulls.is_null(1) && nulls.is_valid(2) && nulls.is_null(3));
+    // The field is recorded nullable in metadata.
+    let field = shard
+        .metadata()
+        .fields
+        .iter()
+        .find(|f| f.name == "m")
+        .expect("field m");
+    assert!(field.nullable);
+}
+
+#[test]
+fn query_shard_skips_null_metric_values() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    // fare = [100, NULL, 300, NULL, 500] — NULL docs hold a 0 placeholder.
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false, true]));
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new writer");
+    w.add_forward_column(
+        "fare",
+        vec![100, 0, 300, 0, 500],
+        FieldKind::Metric,
+        Some(validity),
+    )
+    .expect("add nullable metric");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(tmp.path(), &[], &["fare"]).expect("query_shard");
+    let agg = &r.aggregates[0];
+    // NULLs skipped: the placeholder 0 is neither summed nor taken as the min.
+    assert_eq!(agg.sum, 900);
+    assert_eq!(agg.min, Some(100));
+    assert_eq!(agg.max, Some(500));
+    // avg divides by the 3 non-NULL values, not the 5 matched docs.
+    assert_eq!(agg.count, 3);
+    assert_eq!(format_aggregate(Aggregate::Avg, agg), "300.00");
+    // The matched row count still covers every doc.
+    assert_eq!(r.matched, 5);
+}
+
+#[test]
+fn query_shard_all_null_metric_is_na() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![false, false, false]));
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new writer");
+    w.add_forward_column("m", vec![0, 0, 0], FieldKind::Metric, Some(validity))
+        .expect("add nullable metric");
+    w.finalize().expect("finalize");
+
+    let r = query_shard(tmp.path(), &[], &["m"]).expect("query_shard");
+    let agg = &r.aggregates[0];
+    // No non-NULL value contributed: sum 0, min/max None, avg "n/a".
+    assert_eq!(agg.sum, 0);
+    assert_eq!(agg.min, None);
+    assert_eq!(agg.count, 0);
+    assert_eq!(format_aggregate(Aggregate::Min, agg), "n/a");
+    assert_eq!(format_aggregate(Aggregate::Avg, agg), "n/a");
+}
+
+#[test]
+fn all_valid_nullable_column_keeps_flag_but_has_no_null_buffer() {
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![true, true, true]));
+    let mut w = DiskShardWriter::new(tmp.path(), (0, 0)).expect("new writer");
+    w.add_forward_column("m", vec![1, 2, 3], FieldKind::Metric, Some(validity))
+        .expect("add nullable column");
+    w.finalize().expect("finalize");
+
+    let shard = DiskShard::open(tmp.path()).expect("open");
+    // The field stays nullable in metadata (uniform across a dataset's shards),
+    // but Arrow drops an all-valid null buffer, so validity reads back None.
+    let field = shard
+        .metadata()
+        .fields
+        .iter()
+        .find(|f| f.name == "m")
+        .expect("field m");
+    assert!(field.nullable);
+    assert!(shard.forward_column_validity("m").is_none());
 }
 
 #[test]
@@ -949,17 +1164,21 @@ fn metric_aggregates_absorb_composes_min_max_avg_across_shards() {
         sum: 60,
         min: Some(10),
         max: Some(40),
+        count: 3,
     };
     let b = MetricAggregates {
         sum: 40,
         min: Some(5),
         max: Some(25),
+        count: 2,
     };
     let mut acc = a;
     acc.absorb(&b);
     assert_eq!(acc.sum, 100);
     assert_eq!(acc.min, Some(5));
     assert_eq!(acc.max, Some(40));
+    // avg denominator composes: 3 + 2 non-NULL values across the two shards.
+    assert_eq!(acc.count, 5);
 
     // None on one side is a no-op for that side (empty shard).
     let empty = MetricAggregates::default();
@@ -968,6 +1187,7 @@ fn metric_aggregates_absorb_composes_min_max_avg_across_shards() {
     assert_eq!(acc.sum, 60);
     assert_eq!(acc.min, Some(10));
     assert_eq!(acc.max, Some(40));
+    assert_eq!(acc.count, 3);
 }
 
 #[test]

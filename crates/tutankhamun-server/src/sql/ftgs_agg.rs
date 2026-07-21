@@ -37,7 +37,7 @@ use crate::aggregate_cache::{AggregateCache, GroupTuple, ShardPartial};
 use crate::bitmap_cache::BitmapCache;
 use crate::cache::Cache;
 use crate::ftgs::{
-    OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats,
+    Column, OutputKind, StatSpec, StatValue, aggregate_docs, aggregate_docs_grouped, combine_stats,
     ftgs_scan, render_term, term_map,
 };
 use crate::group_lookup::GroupLookup;
@@ -228,9 +228,12 @@ async fn aggregate_grouped(
         .split_last()
         .expect("grouped path has at least one column");
     let cursor = cursor.as_str();
-    // The cursor is output column `prefix.len()`. A `String` cursor can be sparse
-    // (the SQL NULL group); `Int` is dense.
-    let cursor_is_string = matches!(schema.field(prefix.len()).data_type(), DataType::Utf8);
+    // Whether the cursor (output column `prefix.len()`) can leave matched docs
+    // term-less — the SQL NULL group. Read once from the dataset schema (uniform
+    // across shards): a `String` cursor is sparse, and a nullable `Int` cursor's
+    // NULL docs carry no index term; both surface as a nullable schema field
+    // (the provider presents `String` and nullable `Metric`/`Int` as nullable).
+    let cursor_nullable = schema.field(prefix.len()).is_nullable();
 
     let mut combined: BTreeMap<GroupTuple, Vec<StatValue>> = BTreeMap::new();
     let per_doc = per_doc_estimate(cols.len(), stat_specs.len());
@@ -243,7 +246,7 @@ async fn aggregate_grouped(
                     selection,
                     prefix,
                     cursor,
-                    cursor_is_string,
+                    cursor_nullable,
                     &stat_specs,
                 )
             })?;
@@ -265,7 +268,7 @@ fn cursor_walk_shard(
     selection: &FilterResult,
     prefix: &[String],
     cursor: &str,
-    cursor_is_string: bool,
+    cursor_nullable: bool,
     stat_specs: &[StatSpec<'_>],
 ) -> anyhow::Result<ShardPartial> {
     let matched: Option<&RoaringBitmap> = match selection {
@@ -291,8 +294,10 @@ fn cursor_walk_shard(
         tuple.push(Some(row.term));
         out.push((tuple, row.stats));
     }
-    // String cursors can leave matched docs term-less — the SQL NULL group.
-    if cursor_is_string {
+    // A cursor can leave matched docs term-less — the SQL NULL group: a String
+    // doc with no term, or a nullable Int doc whose NULL contributes no index
+    // term. (A non-nullable Int indexes every doc, so this stays empty.)
+    if cursor_nullable {
         let mut null_stats: BTreeMap<u32, Vec<StatValue>> = BTreeMap::new();
         accumulate_null_cursor(shard, matched, cursor, &groups, stat_specs, &mut null_stats)?;
         for (gid, st) in null_stats {
@@ -580,8 +585,9 @@ impl ComboMap {
 /// `FtgsRow.term` carries, so reshape decodes prefix and cursor columns
 /// the same way.
 enum DocKeys<'a> {
-    /// `Int`/`Metric`: dense forward column; key = order-preserving 8-byte.
-    Int(&'a [i64]),
+    /// `Int`/`Metric`: dense forward column; key = order-preserving 8-byte. A
+    /// NULL doc (nullable column) maps to a NULL key via [`Column::at`].
+    Int(Column<'a>),
     /// `String`: doc→term reverse map; `None` for a doc with no term.
     Str {
         doc_term: Vec<Option<u32>>,
@@ -594,7 +600,7 @@ enum DocKeys<'a> {
 
 impl<'a> DocKeys<'a> {
     fn build(shard: &'a dyn Shard, name: &str) -> anyhow::Result<DocKeys<'a>> {
-        if let Some(col) = shard.forward_column(name) {
+        if let Some(col) = Column::new(shard, name) {
             Ok(DocKeys::Int(col))
         } else {
             let (doc_term, terms) = term_map(shard, name)?;
@@ -622,7 +628,7 @@ impl<'a> DocKeys<'a> {
 
     fn key(&self, doc: usize) -> Option<Box<[u8]>> {
         match self {
-            DocKeys::Int(col) => Some(Box::from(encode_int_key(col[doc]).as_slice())),
+            DocKeys::Int(col) => col.at(doc).map(|v| Box::from(encode_int_key(v).as_slice())),
             DocKeys::Str { doc_term, terms } => doc_term[doc].map(|i| terms[i as usize].clone()),
             DocKeys::TimeBucket { col, unit } => Some(Box::from(
                 encode_int_key(truncate_epoch(col[doc], *unit)).as_slice(),
@@ -749,13 +755,11 @@ fn stat_columns(
             // `stat_array` validates `dtype` (Int64/UInt64) itself.
             OutputKind::Int => stat_array(
                 dtype,
-                rows.iter().map(|st| Some(st[s].finalize().int())).collect(),
+                rows.iter().map(|st| st[s].finalize().int_opt()).collect(),
             )?,
-            OutputKind::Float => float_array(
-                rows.iter()
-                    .map(|st| Some(st[s].finalize().float()))
-                    .collect(),
-            ),
+            OutputKind::Float => {
+                float_array(rows.iter().map(|st| st[s].finalize().float_opt()).collect())
+            }
             OutputKind::TopK => {
                 let DataType::List(item) = dtype else {
                     anyhow::bail!("approx_top_k output column is not a List, got {dtype:?}");
@@ -825,7 +829,8 @@ fn group_column(dtype: &DataType, values: &[Option<&[u8]>]) -> ArrayRef {
                 .map(|v| v.map(|b| decode_int_key(b).saturating_mul(1_000_000_000)))
                 .collect::<Vec<Option<i64>>>(),
         )),
-        // `Int` group: dense, so a `None` here never occurs.
+        // `Int`/`Metric` group: each non-NULL key decodes back to its i64; a
+        // `None` (a nullable column's NULL doc) renders as SQL NULL.
         _ => Arc::new(Int64Array::from(
             values
                 .iter()
@@ -938,7 +943,8 @@ fn reshape_global(
         let array = match spec.output_kind() {
             OutputKind::Int => {
                 let value = match stats {
-                    Some(st) => Some(st[s].finalize().int()),
+                    // `int_opt` is `None` for an all-NULL scalar group.
+                    Some(st) => st[s].finalize().int_opt(),
                     // Empty input: `0` for the counts, SQL NULL for the rest
                     // (`Sum`/`Min`/`Max`/`ApproxPercentile`).
                     None => match spec {
@@ -948,8 +954,10 @@ fn reshape_global(
                 };
                 stat_array(dtype, vec![value])?
             }
-            // `AVG`: present → sum/count; empty input → NULL.
-            OutputKind::Float => float_array(vec![stats.map(|st| st[s].finalize().float())]),
+            // `AVG`: present → sum/count (NULL if all-NULL); empty input → NULL.
+            OutputKind::Float => {
+                float_array(vec![stats.and_then(|st| st[s].finalize().float_opt())])
+            }
             // `approx_top_k`: one row holding the top-k list (or an empty
             // list when there was no input).
             OutputKind::TopK => {

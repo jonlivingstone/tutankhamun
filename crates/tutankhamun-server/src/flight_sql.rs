@@ -73,6 +73,7 @@ use crate::bitmap_cache::BitmapCache;
 use crate::cache::{Cache, Validation};
 use crate::memory::{MemoryBudget, SessionMemoryHandle, SessionReservation};
 use crate::metrics::Metrics;
+use crate::shard::DatasetSchema;
 use crate::shard_source::{ObjectStoreShardSource, ShardSource, ShardSummary};
 use crate::shutdown::ShutdownHandle;
 use crate::sql::{self, TutankhamunTableProvider};
@@ -131,6 +132,11 @@ struct ServiceInner {
     /// Only non-empty resolutions are cached, so a bogus `FROM` name persists
     /// nothing; a changed dataset needs a restart to refresh.
     summaries: Mutex<HashMap<String, Arc<Vec<ShardSummary>>>>,
+    /// Resolved dataset schema per URL (the authoritative `schema.json`, or
+    /// inferred from the shards when absent), cached for the daemon's life
+    /// alongside `summaries` so it's read at most once per dataset rather than
+    /// per query.
+    schemas: Mutex<HashMap<String, Arc<DatasetSchema>>>,
     /// Live sessions keyed by their opaque token. Holds the persistent context
     /// (and its session-scoped temp views); reaped on idle / max age.
     sessions: Mutex<HashMap<String, Arc<Session>>>,
@@ -293,6 +299,27 @@ impl ServiceInner {
         Ok(summaries)
     }
 
+    /// Resolve the dataset's schema — the authoritative `schema.json`, or inferred
+    /// from `summaries` when absent — cached per URL for the daemon's life (read
+    /// at most once per dataset). Same restart-to-refresh trade as the shard set.
+    async fn resolve_schema(
+        &self,
+        url: &str,
+        store: &Arc<dyn ObjectStore>,
+        summaries: &[ShardSummary],
+    ) -> anyhow::Result<Arc<DatasetSchema>> {
+        if let Some(schema) = self.schemas.lock().expect("schemas cache lock").get(url) {
+            return Ok(Arc::clone(schema));
+        }
+        let schema =
+            Arc::new(crate::sql::provider::resolve_dataset_schema(&**store, summaries).await?);
+        self.schemas
+            .lock()
+            .expect("schemas cache lock")
+            .insert(url.to_string(), Arc::clone(&schema));
+        Ok(schema)
+    }
+
     /// Resolve the dataset at `url` to a registered table provider via the
     /// cached shard set (`cache_for` + `resolve_summaries` + `from_summaries`),
     /// or `None` if the dataset is empty / not yet populated. The single daemon
@@ -310,11 +337,13 @@ impl ServiceInner {
         if summaries.is_empty() {
             return Ok(None);
         }
+        let schema = self.resolve_schema(url, &store, &summaries).await?;
         let cache = self.cache_for(url, &store)?;
         Ok(Some(TutankhamunTableProvider::from_summaries(
             url.to_string(),
             cache,
             summaries,
+            &schema,
         )?))
     }
 
@@ -447,6 +476,7 @@ impl TutankhamunFlightSqlService {
                 validation,
                 caches: Mutex::new(HashMap::new()),
                 summaries: Mutex::new(HashMap::new()),
+                schemas: Mutex::new(HashMap::new()),
                 sessions: Mutex::new(HashMap::new()),
                 prepared: Mutex::new(HashMap::new()),
                 plans: Mutex::new(HashMap::new()),

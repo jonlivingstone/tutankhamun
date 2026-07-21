@@ -14,7 +14,7 @@ use tempfile::TempDir;
 
 use super::TutankhamunTableProvider;
 use crate::cache::Cache;
-use crate::shard::DiskShardWriter;
+use crate::shard::{DiskShardWriter, FieldKind};
 use crate::storage::StorageRegistry;
 
 /// Build a two-shard dataset at `root`:
@@ -744,6 +744,175 @@ async fn group_by_string_emits_null_group_for_no_term_docs() {
     assert_eq!(rows.len(), 2);
     assert!(rows.contains(&(Some("us".to_string()), vec![10, 1])));
     assert!(rows.contains(&(None, vec![50, 2])));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_nullability_shards_register_and_present_nullable() {
+    use arrow::buffer::{BooleanBuffer, NullBuffer};
+
+    // Two shards of one dataset disagree on `fare`'s nullability: shard A has a
+    // NULL (doc 1), shard B is dense. Before the dataset-schema fix this failed
+    // registration ("inconsistent schemas"); now it registers (via inference,
+    // no schema.json) and presents `fare` nullable.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let root = tmp.path();
+
+    let mut a = DiskShardWriter::new(&root.join("a"), (0, 0)).expect("new a");
+    a.add_int_field("ts", vec![1_700_000_000, 1_700_000_100])
+        .expect("ts a");
+    a.set_time_field("ts");
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![true, false]));
+    a.add_forward_column("fare", vec![10, 0], FieldKind::Metric, Some(validity))
+        .expect("fare a");
+    a.finalize().expect("finalize a");
+
+    let mut b = DiskShardWriter::new(&root.join("b"), (0, 0)).expect("new b");
+    b.add_int_field("ts", vec![1_700_000_200]).expect("ts b");
+    b.set_time_field("ts");
+    b.add_metric("fare", vec![30]).expect("fare b"); // dense, no nulls
+    b.finalize().expect("finalize b");
+
+    let (provider, _cache_dir) = provider_for(root).await;
+    // The dataset presents `fare` nullable (union across shards).
+    let fare = provider
+        .schema()
+        .field_with_name("fare")
+        .unwrap()
+        .is_nullable();
+    assert!(fare, "fare is nullable in the dataset (a shard has a NULL)");
+
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+    // sum skips the NULL (10 + 30 = 40); count(*) counts all 3 rows.
+    let sql = "SELECT sum(fare) s, count(*) n FROM trips";
+    let rows = int_rows(&ctx.sql(sql).await.unwrap().collect().await.unwrap());
+    assert_eq!(rows, vec![vec![40, 3]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_schema_json_nullability_is_reconciled_up() {
+    use arrow::buffer::{BooleanBuffer, NullBuffer};
+
+    use crate::shard::{DatasetSchema, DiskShard, SCHEMA_FILE, Shard};
+
+    // A shard holds a NULL in `fare`, but a stale schema.json under-reports the
+    // column as non-nullable. The reader must OR-in the shard's real null flag,
+    // else it would drop the NULL group / mis-declare the Arrow field.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let root = tmp.path();
+    let mut a = DiskShardWriter::new(&root.join("a"), (0, 0)).expect("new a");
+    a.add_int_field("ts", vec![1_700_000_000, 1_700_000_100])
+        .expect("ts");
+    a.set_time_field("ts");
+    let validity = NullBuffer::new(BooleanBuffer::from(vec![true, false]));
+    a.add_forward_column("fare", vec![10, 0], FieldKind::Metric, Some(validity))
+        .expect("fare");
+    a.finalize().expect("finalize a");
+
+    // Write a schema.json that (wrongly) marks every column non-nullable.
+    let shard = DiskShard::open(&root.join("a")).expect("open");
+    let mut stale = DatasetSchema::infer_from_shards([shard.metadata()]).expect("infer");
+    for f in &mut stale.fields {
+        f.nullable = false;
+    }
+    std::fs::write(
+        root.join(SCHEMA_FILE),
+        serde_json::to_vec_pretty(&stale).expect("serialise"),
+    )
+    .expect("write schema.json");
+
+    let (provider, _cache_dir) = provider_for(root).await;
+    assert!(
+        provider
+            .schema()
+            .field_with_name("fare")
+            .unwrap()
+            .is_nullable(),
+        "a stale non-nullable schema.json must reconcile to nullable from the shard"
+    );
+
+    // The NULL is honored at query time: sum skips it, count(fare) excludes it.
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+    let rows = int_rows(
+        &ctx.sql("SELECT sum(fare) s, count(fare) c FROM trips")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows, vec![vec![10, 1]]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_by_nullable_int_prefix_emits_null_group() {
+    use arrow::buffer::{BooleanBuffer, NullBuffer};
+
+    // 4 docs. `team` (nullable Int) is the GROUP BY *prefix* (regrouped via
+    // DocKeys::Int); `country` (string) is the cursor. team is NULL at docs 1,3.
+    let tmp = tempfile::tempdir().expect("tmpdir");
+    let shard = tmp.path().join("s");
+    let mut w = DiskShardWriter::new(&shard, (0, 0)).expect("new");
+    let team_validity = NullBuffer::new(BooleanBuffer::from(vec![true, false, true, false]));
+    w.add_forward_column(
+        "team",
+        vec![10, 0, 10, 0],
+        FieldKind::Int,
+        Some(team_validity),
+    )
+    .expect("team");
+    w.add_metric("fare", vec![1, 2, 3, 4]).expect("fare");
+    let mut country = BTreeMap::new();
+    country.insert("de".to_string(), bitmap([2, 3]));
+    country.insert("us".to_string(), bitmap([0, 1]));
+    w.add_string_field("country", country).expect("country");
+    w.finalize().expect("finalize");
+
+    let (provider, _cache_dir) = provider_for(tmp.path()).await;
+    let ctx = super::session_context();
+    ctx.register_table("trips", Arc::new(provider)).unwrap();
+
+    let sql = "SELECT team, country, sum(fare) FROM trips GROUP BY team, country";
+    assert!(physical_plan(&ctx, sql).await.contains("FtgsAggExec"));
+
+    // Groups: (10,us)=doc0=1, (NULL,us)=doc1=2, (10,de)=doc2=3, (NULL,de)=doc3=4.
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let mut rows: Vec<(Option<i64>, Option<String>, i64)> = Vec::new();
+    for b in &batches {
+        let team = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let country = b
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let fare = b
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        for r in 0..b.num_rows() {
+            rows.push((
+                (!team.is_null(r)).then(|| team.value(r)),
+                (!country.is_null(r)).then(|| country.value(r).to_string()),
+                fare.value(r),
+            ));
+        }
+    }
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (None, Some("de".to_string()), 4),
+            (None, Some("us".to_string()), 2),
+            (Some(10), Some("de".to_string()), 3),
+            (Some(10), Some("us".to_string()), 1),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

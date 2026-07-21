@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{ArrayRef, Int64Array, RecordBatch};
+use arrow::buffer::{NullBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::FileWriter;
 use roaring::RoaringBitmap;
@@ -36,7 +37,7 @@ fn tmp_sibling(path: &Path) -> PathBuf {
 /// Write to a sibling `.tmp` file then atomically rename it into
 /// place. A crashed writer leaves the `.tmp` behind but never a
 /// half-written final file.
-fn write_atomic<F>(final_path: &Path, write_fn: F) -> Result<()>
+pub(crate) fn write_atomic<F>(final_path: &Path, write_fn: F) -> Result<()>
 where
     F: FnOnce(&Path) -> Result<()>,
 {
@@ -71,6 +72,11 @@ struct ForwardCol {
     name: String,
     values: Vec<i64>,
     kind: FieldKind,
+    /// Null mask, `Some` iff the field is declared nullable. A null doc holds a
+    /// placeholder in `values` and a clear bit here; it also contributes no term
+    /// to an `Int` field's index (so it falls into the SQL NULL group). `None`
+    /// ⇒ dense/non-nullable.
+    nulls: Option<NullBuffer>,
 }
 
 impl DiskShardWriter {
@@ -113,7 +119,23 @@ impl DiskShardWriter {
     /// `values` is owned so [`Int64Array::from`] can take it without a
     /// copy on `finalize`.
     pub fn add_metric(&mut self, name: &str, values: Vec<i64>) -> Result<()> {
-        self.add_forward_col(name, values, FieldKind::Metric)
+        self.add_forward_col(name, values, FieldKind::Metric, None)
+    }
+
+    /// Add a forward column of either kind with an optional null mask — the
+    /// general form behind [`add_metric`]/[`add_int_field`], used by ingest to
+    /// thread nullability. `nulls` is `Some` (even all-valid) for a declared
+    /// nullable field, `None` for a dense one; a `Some` mask makes the field's
+    /// `metadata.json` entry and Arrow field nullable. Same row-count rules as
+    /// [`add_metric`].
+    pub fn add_forward_column(
+        &mut self,
+        name: &str,
+        values: Vec<i64>,
+        kind: FieldKind,
+        nulls: Option<NullBuffer>,
+    ) -> Result<()> {
+        self.add_forward_col(name, values, kind, nulls)
     }
 
     /// Add an `Int` field — int64 forward column AND inverted index
@@ -123,10 +145,16 @@ impl DiskShardWriter {
     /// [`encode_int_key`]-encoded so FST lex order matches numeric
     /// order).
     pub fn add_int_field(&mut self, name: &str, values: Vec<i64>) -> Result<()> {
-        self.add_forward_col(name, values, FieldKind::Int)
+        self.add_forward_col(name, values, FieldKind::Int, None)
     }
 
-    fn add_forward_col(&mut self, name: &str, values: Vec<i64>, kind: FieldKind) -> Result<()> {
+    fn add_forward_col(
+        &mut self,
+        name: &str,
+        values: Vec<i64>,
+        kind: FieldKind,
+        nulls: Option<NullBuffer>,
+    ) -> Result<()> {
         let len = values.len() as u64;
         match self.num_docs {
             None => self.num_docs = Some(len),
@@ -135,11 +163,21 @@ impl DiskShardWriter {
             }
             Some(_) => {}
         }
+        if let Some(n) = &nulls {
+            if n.len() != values.len() {
+                bail!(
+                    "column {name:?} null mask has {} bits but {} values",
+                    n.len(),
+                    values.len()
+                );
+            }
+        }
         self.ensure_unused_name(name)?;
         self.forward_cols.push(ForwardCol {
             name: name.to_string(),
             values,
             kind,
+            nulls,
         });
         Ok(())
     }
@@ -219,6 +257,11 @@ impl DiskShardWriter {
             }
             let mut postings: BTreeMap<[u8; 8], RoaringBitmap> = BTreeMap::new();
             for (doc_id, &v) in col.values.iter().enumerate() {
+                // A NULL doc contributes no term — it's absent from the index, so
+                // the query layer's NULL-group machinery (covered_docs) picks it up.
+                if col.nulls.as_ref().is_some_and(|n| n.is_null(doc_id)) {
+                    continue;
+                }
                 postings
                     .entry(encode_int_key(v))
                     .or_default()
@@ -237,6 +280,7 @@ impl DiskShardWriter {
                 name: col.name.clone(),
                 kind: col.kind,
                 scale: self.scales.get(&col.name).copied().unwrap_or(0),
+                nullable: col.nulls.is_some(),
             });
         }
         for (name, _) in &self.string_fields {
@@ -244,6 +288,7 @@ impl DiskShardWriter {
                 name: name.clone(),
                 kind: FieldKind::String,
                 scale: 0,
+                nullable: false,
             });
         }
         let mut metadata = Metadata {
@@ -259,14 +304,20 @@ impl DiskShardWriter {
         let arrow_fields: Vec<Field> = self
             .forward_cols
             .iter()
-            .map(|c| Field::new(&c.name, DataType::Int64, false))
+            .map(|c| Field::new(&c.name, DataType::Int64, c.nulls.is_some()))
             .collect();
         let schema = Arc::new(Schema::new(arrow_fields));
 
         let arrays: Vec<ArrayRef> = self
             .forward_cols
             .into_iter()
-            .map(|c| Arc::new(Int64Array::from(c.values)) as ArrayRef)
+            .map(|c| {
+                let array = match c.nulls {
+                    Some(nulls) => Int64Array::new(ScalarBuffer::from(c.values), Some(nulls)),
+                    None => Int64Array::from(c.values),
+                };
+                Arc::new(array) as ArrayRef
+            })
             .collect();
 
         // Required when there are no forward columns (string-only
