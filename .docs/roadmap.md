@@ -17,47 +17,47 @@ directly.
 - [x] Cargo workspace structure (`tutankhamun-server`,
       `tutankhamun-client`, shared crates)
 - [x] Layered config: CLI (`clap`) + env + file + defaults
-      (`figment` or similar) — §1.3
+      (`figment` or similar) — §6.2
 - [x] Graceful shutdown — SIGTERM → drain → deregister → exit, with
-      configurable timeout — §1.3
+      configurable timeout — §6.2
 - [x] Ops HTTP server (default port 8080) with `/healthz`,
-      `/readyz` — §1.3
+      `/readyz` — §6.2
 - [x] `tokio` runtime configuration in `main()` (worker thread
-      count, etc.) — §2.3
-- [x] `rayon` thread pool configuration as a `OnceLock` — §2.3
+      count, etc.) — §5.2
+- [x] `rayon` thread pool configuration as a `OnceLock` — §5.2
 - [x] Async-to-Rayon dispatch helper (oneshot channel + Tokio
-      future) — §2.3
+      future) — §5.2
 
 ## Storage backends
 
 - [x] `object_store` integration with all backends enabled (S3,
       S3-compatible, GCS, Azure Blob, local filesystem, HTTP,
-      in-memory) — §1.4
+      in-memory) — §3.2
 - [x] Credential chain wiring (env, instance metadata, IRSA,
-      Workload Identity, SSO) — no hardcoded credentials — §1.4
+      Workload Identity, SSO) — no hardcoded credentials — §3.2
 - [x] Local hot-storage cache — directory creation, XDG defaults
-      via `directories` crate — §1.5
+      via `directories` crate — §3.3
 - [x] Cache size enforcement (`--cache-size` accepts `100GB` /
-      `50%` / etc.) with 10 GB default — §1.5
+      `50%` / etc.) with 10 GB default — §3.3
 - [ ] Cache 5 %-free-space floor with `--cache-min-free-pct`
-      override — §1.5
-- [x] LRU eviction — §1.5
-- [ ] `--pin-datasets` always-keep flag — §1.5
+      override — §3.3
+- [x] LRU eviction — §3.3
+- [ ] `--pin-datasets` always-keep flag — §3.3
 - [x] Persistent cache across restarts (scan cache dir, register
-      existing files) — §1.5
+      existing files) — §3.3
 - [x] Content-hash validation on shard load — opt-in bit-rot guard
-      (`--verify-shards`); trust-by-default with atomic installs — §1.5
-- [ ] Configurable hot-set pre-warm (`--prewarm`) — §1.5
+      (`--verify-shards`); trust-by-default with atomic installs — §3.3
+- [ ] Configurable hot-set pre-warm (`--prewarm`) — §3.3
 
 ## Engine — storage format (shards)
 
 - [x] Shard directory layout (`metadata.json`, `metrics.arrow`,
-      `postings/<field>.fst`, `postings/<field>.posting`) — §2.1
+      `postings/<field>.fst`, `postings/<field>.posting`) — §3.1
 - [x] `metadata.json` schema (Arrow schema, numDocs, time range,
-      format version, content hashes) — §2.1
+      format version, content hashes) — §3.1
 - [x] Forward column writer — uncompressed single-batch Arrow IPC
-      via `arrow-rs` — §2.1
-- [x] Forward column reader — mmap zero-copy `&[i64]` — §2.1
+      via `arrow-rs` — §3.1
+- [x] Forward column reader — mmap zero-copy `&[i64]` — §3.1
       (`DiskShard::open` mmaps `metrics.arrow` and decodes its single batch via
       Arrow's `FileDecoder` over a `Buffer::from_custom_allocation` wrapping the
       mapping — `forward_column` returns a view straight into the file, no heap
@@ -67,11 +67,11 @@ directly.
       ~21ms warm / ~95ms cold, and the ~3.7 GB heap moved to reclaimable page
       cache. The indexes were already mmap'd; now the forward columns are too.)
 - [x] Inverted index writer — `roaring` bitmaps per term + `fst`
-      term dictionary — §2.1
+      term dictionary — §3.1
 - [x] Inverted index reader — FST range scan + Roaring bitmap
-      iteration — §2.1
-- [ ] Optional Parquet export of forward columns — §2.1
-- [ ] Nullable columns — §2.1
+      iteration — §3.1
+- [ ] Optional Parquet export of forward columns — §3.1
+- [x] Nullable columns — §3.1
       (today `ingest` rejects any null in a declared column —
       `extract_numeric`/`extract_time` `bail!` on `is_null` — because the
       forward column is a dense `i64` buffer read zero-copy as `&[i64]`,
@@ -84,16 +84,16 @@ directly.
       a side input, not a layout change. Unblocks ingesting nullable
       source columns (e.g. nyc-taxi `passenger_count`) and per-shard
       schema evolution: a dataset's newer shards can carry a column that
-      older shards project as null. Prereq for live add-column (§3.3).)
+      older shards project as null. Prereq for live add-column (§8).)
 
 ## Engine — abstractions
 
 - [x] `Shard` trait — `forward_column()`, `inverted_index()`,
-      `time_range()`, `num_docs()`, `schema()` — §2.1, §3.3 v1 disciplines
-- [x] `DiskShard` implementation of `Shard` — §2.1, §3.3 v1
+      `time_range()`, `num_docs()`, `schema()` — §3.1, §8 v1 disciplines
+- [x] `DiskShard` implementation of `Shard` — §3.1, §8 v1
 - [x] `ShardSource` trait — server-side abstraction over where
-      shards come from — §3.3 v1 disciplines
-- [x] Object-storage `ShardSource` implementation — §3.3 v1
+      shards come from — §8 v1 disciplines
+- [x] Object-storage `ShardSource` implementation — §8 v1
       (the daemon resolves a dataset's shard set by walking its storage —
       `ObjectStoreShardSource::discover` (a `store.list()` over the dataset dir,
       reading each shard's `metadata.json`) — cached per dataset URL in
@@ -105,36 +105,36 @@ directly.
       refresh — the accepted v1 trade (live invalidation is a v2 concern; see the
       manifest item under Ingest). The storage layout is the source of truth; no
       catalog file.)
-- [ ] `ShardLocator` trait — client-side daemon discovery — §1.3
-- [ ] K8s DNS `ShardLocator` implementation — §1.3
-- [ ] Static-file `ShardLocator` implementation — §1.3
+- [ ] `ShardLocator` trait — client-side daemon discovery — §6.2
+- [ ] K8s DNS `ShardLocator` implementation — §6.2
+- [ ] Static-file `ShardLocator` implementation — §6.2
 - [ ] Shard manager — composes shards from multiple sources;
-      handles registration / eviction — §3.3 v1
+      handles registration / eviction — §8 v1
 - [x] Time-range query pruning (skip shards outside requested
-      time range) — §3.3 v1 disciplines
+      time range) — §8 v1 disciplines
 
 ## Engine — memory model
 
 - [x] `MemoryBudget` global struct with `AtomicU64` charge counter
-      — §2.2 (`memory::MemoryBudget`: a lock-free CAS-loop `reserve`; an
+      — §5.1 (`memory::MemoryBudget`: a lock-free CAS-loop `reserve`; an
       `Arc` owned by the daemon — built in `serve`, held in the FlightSQL
       `ServiceInner` — rather than a process global, so it's testable)
-- [x] `MemoryReservation` RAII guard (drop returns bytes) — §2.2
-- [x] `SessionMemoryHandle` — per-session sub-budget with cap — §2.2
+- [x] `MemoryReservation` RAII guard (drop returns bytes) — §5.1
+- [x] `SessionMemoryHandle` — per-session sub-budget with cap — §5.1
       (charges both the session counter and the global; `SessionReservation`
       releases both on drop)
 - [x] Hard claim-or-fail allocation API (`reserve(n) -> Result<...,
-      BudgetExceeded>`) — §2.2 (`BudgetExceeded` carries the scope —
+      BudgetExceeded>`) — §5.1 (`BudgetExceeded` carries the scope —
       session vs global — requested, and available)
-- [x] Admission control in `OpenSession` handler — §2.2 (the handshake
+- [x] Admission control in `OpenSession` handler — §5.1 (the handshake
       reserves a fixed `SESSION_BASELINE_BYTES` baseline through the new
       session's handle; if it can't be satisfied the daemon is at capacity
       and the handshake returns `resource_exhausted`)
-- [x] Per-session cap (default 20 % of global, configurable) — §2.2
+- [x] Per-session cap (default 20 % of global, configurable) — §5.1
       (`--max-session-memory-pct` / `TUT_MAX_SESSION_MEMORY_PCT`; global
       cap is `--memory-limit` / `TUT_MEMORY_LIMIT`, an absolute size,
       default 4GB — percent-of-RAM deferred)
-- [x] Bounded working-set reservation (span-independent) — §2.2 (the
+- [x] Bounded working-set reservation (span-independent) — §5.1 (the
       per-session handle threads to the otherwise session-agnostic execs as
       a `DataFusion` `SessionConfig` extension. The scan
       (`sql::scan::for_each_shard_batch`) processes shards in
@@ -149,7 +149,7 @@ directly.
       size" model, which summed the whole span and held it at once —
       tripping the cap on wide-span queries and byte-charging evictable
       `mmap` pages as if heap.*)
-- [ ] Project-aware / true-heap working-set accounting — §2.2 (the v1
+- [ ] Project-aware / true-heap working-set accounting — §5.1 (the v1
       envelope is a conservative `num_docs`-derived proxy; refine to charge
       the realized heap — gathered output, group/stat buffers — and only the
       projected columns, so the estimate tracks actual allocation more
@@ -158,17 +158,17 @@ directly.
 
 ## Engine — group lookup
 
-- [x] `GroupLookup` enum with backing variants — §2.5
-- [x] `ConstantGroupLookup` — §2.5
-- [x] `BitSetGroupLookup` — §2.5
-- [x] `ByteGroupLookup` — §2.5
-- [x] `U16GroupLookup` — §2.5
-- [x] `U32GroupLookup` — §2.5
+- [x] `GroupLookup` enum with backing variants — §4.2
+- [x] `ConstantGroupLookup` — §4.2
+- [x] `BitSetGroupLookup` — §4.2
+- [x] `ByteGroupLookup` — §4.2
+- [x] `U16GroupLookup` — §4.2
+- [x] `U32GroupLookup` — §4.2
 - [x] In-place upgrade between backings when cardinality crosses
-      thresholds — §2.5
-- [x] `next_group_callback(doc_ids, &mut BitTree)` dispatch — §2.5
-- [ ] Memory cost reporting to `SessionMemoryHandle` — §2.5
-      (`GroupLookup::memory_used()` exposed; §2.2's `SessionMemoryHandle`
+      thresholds — §4.2
+- [x] `next_group_callback(doc_ids, &mut BitTree)` dispatch — §4.2
+- [ ] Memory cost reporting to `SessionMemoryHandle` — §4.2
+      (`GroupLookup::memory_used()` exposed; §5.1's `SessionMemoryHandle`
       has now landed, so this is unblocked — thread the handle into the
       FTGS rayon per-shard loop and reserve the group-lookup / stat
       buffers, the natural next slice)
@@ -176,41 +176,41 @@ directly.
 ## Engine — FTGS
 
 - [x] Four-level cursor (`next_field` / `next_term` / `next_group`
-      / `group_stats`) — §2.6
+      / `group_stats`) — §4.1
 - [x] Critical loop: doc-ID batch → group lookup callback →
-      stat accumulation into `term_grp_stats[stat][group]` — §2.6
+      stat accumulation into `term_grp_stats[stat][group]` — §4.1
       (extensible `Stat` seam: scalar sum/count/min/max; mergeable
       sketches land as new variants)
 - [x] Ordering-invariant enforcement (terms sorted, groups
-      ascending, fields in declaration order) — §2.6
+      ascending, fields in declaration order) — §4.1
 - [x] Per-shard FTGS execution (single-threaded per shard, run
-      via Rayon) — §2.6, §2.3 (`ftgs_scan_merge` fans out over the
+      via Rayon) — §4.1, §5.2 (`ftgs_scan_merge` fans out over the
       bounded pool via `runtime::run_cpu` + `par_iter`; sequential
       when the pool isn't initialised)
-- [x] Shard-fan-out merge (within a daemon) — §2.6
+- [x] Shard-fan-out merge (within a daemon) — §4.1
       (`merge_ftgs`: k-way merge of per-shard rows, combining stats
       on `(field, term, group)` via `StatSpec::combine`)
-- [x] `GSVector`-equivalent two-level bitmap for merge — §2.6
+- [x] `GSVector`-equivalent two-level bitmap for merge — §4.1
       (row-per-`(field,term,group)` granularity + `BitTree` make a
       separate merge-time group bitmap unnecessary)
 - [x] Arrow record-batch output (1024 / 4096 row default
-      batching) — §2.6
+      batching) — §4.1
       (both SQL exec nodes — `FtgsAggExec` and `TutankhamunExec` — chunk
       their output to the session's configured `batch_size` via a zero-copy
       `chunk_batch` over `RecordBatch::slice`, honoring DataFusion's own knob
       rather than a fixed cap; the native/Flight path will set its own default
       when built)
-- [ ] Same merge code reused at client layer (cross-daemon) — §2.6
+- [ ] Same merge code reused at client layer (cross-daemon) — §4.1
       (`merge_ftgs` is already the shared primitive; cross-daemon
       wiring still to build)
-- [ ] Per-shard partial-aggregate cache (lazy partial cube) — §2.6
+- [ ] Per-shard partial-aggregate cache (lazy partial cube) — §4.1
       (shards are immutable, so a per-`(shard content hash, dimension-set,
       column, stat)` partial is permanently valid and composes across
       shards via `StatSpec::combine` — a cuboid that never needs
       maintenance. Cache at the `FtgsAggExec` per-shard boundary so repeat
       aggregates skip the column re-scan and only re-merge. Scope:
       - **Unfiltered only.** A filtered partial depends on the doc-set,
-        unbounded by predicate — already covered by the §2.8 bitmap cache.
+        unbounded by predicate — already covered by the §C.2 bitmap cache.
       - **Apex + low-cardinality GROUP BY.** Cache the no-group apex
         cuboid and grouped cuboids whose group-lookup backing is
         `Constant`/`BitSet`/`Byte`/`Char` (≤ ~65 K groups); fall back to
@@ -229,58 +229,58 @@ directly.
 
 ## Engine — sessions
 
-- [~] Session struct — §2.4 (`flight_sql::Session`: a persistent
-      `SessionContext` + liveness timestamps. Per §2.8 the group lookup /
+- [~] Session struct — §6.3 (`flight_sql::Session`: a persistent
+      `SessionContext` + liveness timestamps. Per §C.2 the group lookup /
       stat stack / dynamic metrics are SQL state inside the context, not a
-      typed struct; the memory handle waits on §2.2)
-- [x] `OpenSession` handler — token issuance — §2.4 (the FlightSQL
+      typed struct; the memory handle waits on §5.1)
+- [x] `OpenSession` handler — token issuance — §6.3 (the FlightSQL
       handshake doubles as session-open: mints an opaque server-issued token
-      the client echoes as a bearer. Admission check waits on §2.2;
+      the client echoes as a bearer. Admission check waits on §5.1;
       time-range shard selection happens per-query in the scan)
-- [x] `CloseSession` handler — explicit teardown — §2.4 (`FlightSQL` 56.2.1
+- [x] `CloseSession` handler — explicit teardown — §6.3 (`FlightSQL` 56.2.1
       has no native CloseSession action, so it's a custom `do_action`
       advertised via `list_custom_actions` and handled in `do_action_fallback`:
       removes the session named by the bearer token, freeing its state at once
       rather than waiting for the idle/max-age reaper)
-- [x] Idle timeout reaper (default 30 min) — §2.4 (const; configurable
+- [x] Idle timeout reaper (default 30 min) — §6.3 (const; configurable
       knob deferred)
-- [x] Hard maximum age reaper (default 4 h) — §2.4 (const; configurable
+- [x] Hard maximum age reaper (default 4 h) — §6.3 (const; configurable
       knob deferred)
-- [x] `SessionLost` error on daemon-crashed-mid-session — §2.4
+- [x] `SessionLost` error on daemon-crashed-mid-session — §6.3
       (an unknown/expired token returns `not_found`; the client reopens)
-- [x] Opaque token format (don't leak internals) — §2.4 (UUID v4,
+- [x] Opaque token format (don't leak internals) — §6.3 (UUID v4,
       server-issued; client echoes, never parses)
-- [~] Stat stack — §2.6 (per §2.8 expressed as SQL computed columns;
+- [~] Stat stack — §4.1 (per §C.2 expressed as SQL computed columns;
       native `PushStat`/`PopStat` deferred unless a workflow needs them)
-- [~] Dynamic metric allocation + update — §2.6 (per §2.8 a computed
+- [~] Dynamic metric allocation + update — §4.1 (per §C.2 a computed
       column / `CREATE VIEW`; native typed op deferred)
 - [~] Regroup operations (filter, bucket, query-based, regex,
-      random, intersect) — §2.6 (per §2.8 expressed as SQL `WHERE` /
+      random, intersect) — §4.1 (per §C.2 expressed as SQL `WHERE` /
       subqueries / temp views; native typed regroup deferred)
 
 ## Wire / protocol
 
-- [x] `tonic` gRPC server setup over HTTP/2 — §1.2
+- [x] `tonic` gRPC server setup over HTTP/2 — §C.1
       (`flight_sql::serve` runs a `tonic::Server` on `grpc_addr`, bound before
       readiness and drained via the shared `ShutdownHandle`, mirroring the ops
       HTTP task)
 - [ ] `tutankhamun.v1.SessionControl` protobuf definitions
       (`OpenSession`, `CloseSession`, `Regroup`, `PushStat`,
-      `PopStat`, `MetricRegroup`, `GetStatus`, etc.) — §1.2
-- [ ] `SessionControl` service implementation — §1.2
-- [x] `arrow.flight.protocol.FlightService` registration — §1.2
+      `PopStat`, `MetricRegroup`, `GetStatus`, etc.) — §C.1
+- [ ] `SessionControl` service implementation — §C.1
+- [x] `arrow.flight.protocol.FlightService` registration — §C.1
       (registered via `arrow-flight`'s `FlightServiceServer` wrapping the
       `FlightSqlService` impl)
 - [~] `DoGet(Ticket)` for FTGS result streaming as Arrow record
-      batches — §1.2 (statement `DoGet` works — `do_get_statement` streams SQL
+      batches — §C.1 (statement `DoGet` works — `do_get_statement` streams SQL
       results via `FlightDataEncoderBuilder`; the FTGS-native ticket and the
       `SessionControl` streaming path land with the session slice)
-- [x] DataFusion embedded as a dependency — §3.2
+- [x] DataFusion embedded as a dependency — §2
 - [x] Tutankhamun `TableProvider` implementation (Tier 1: projection
-      + equality/range filter pushdown; `t9n sql` CLI verb) — §3.2
+      + equality/range filter pushdown; `t9n sql` CLI verb) — §2
 - [x] Time-range shard pruning in the SQL scan (prune shards by a
-      predicate on the time column before fetch) — §3.2
-- [ ] `__time` canonical alias for the time field — §3.2
+      predicate on the time column before fetch) — §2
+- [ ] `__time` canonical alias for the time field — §2
       (today the time field is exposed only under its ingested name, so
       SQL must hard-code e.g. `tpep_pickup_datetime`. Expose it
       *additionally* under a fixed `__time` name — the Druid convention —
@@ -290,9 +290,9 @@ directly.
       teach the filter pushdown + time-range pruning to treat `__time` as
       the time field — otherwise a predicate on the alias would lose shard
       pruning and fall back to a full scan. Makes a name-independent
-      client `time_range=` (§3.2 Python client) trivial to layer on top.)
+      client `time_range=` (§2 Python client) trivial to layer on top.)
 - [x] Aggregation / GROUP BY pushdown from DataFusion → Tutankhamun
-      FTGS scan (Tier 2/3) — §3.2
+      FTGS scan (Tier 2/3) — §2
       (single- *and* multi-column `Int`/`String` GROUP BY *and* global
       no-GROUP-BY aggregates + COUNT(*)/SUM/MIN/MAX/AVG/approx_count_distinct
       pushed via an optimizer rule → `FtgsAggExec`, including the `String` NULL
@@ -303,7 +303,7 @@ directly.
       works on `String` args too, hashing the inverted-index terms (no forward
       column) so the sketch still merges across shards; unsupported shapes fall
       back to DataFusion)
-- [x] Time-bucket GROUP BY pushdown (`date_trunc`) — §3.2
+- [x] Time-bucket GROUP BY pushdown (`date_trunc`) — §2
       (today `try_build` (group_by.rs) only pushes down `GROUP BY` of bare
       `Expr::Column`s, so `GROUP BY date_trunc('month', <time>)` — a
       `ScalarFunction` — falls back to a row scan: materialise every matching
@@ -329,7 +329,7 @@ directly.
       it feeds the per-shard aggregate cache. `date_bin` NOT recognised yet.
       Synonyms (`__month` etc.) tracked separately below.)
 - [ ] Canonical time-bucket synonyms (`__year`/`__quarter`/`__month`/`__week`/
-      `__day`/`__hour`/`__minute`/`__second`) — §3.2
+      `__day`/`__hour`/`__minute`/`__second`) — §2
       (today the time-bucket fast path fires only for the exact shape
       `date_trunc('<unit>', <time field>)`; any near-miss a user writes
       — `to_char(t,'YYYY-MM')`, `extract(year ...), extract(month ...)`,
@@ -355,7 +355,7 @@ directly.
       `__moy` month-of-year, `__hod` hour-of-day) — a different family that
       partitions rather than truncates, so it doesn't roll up or range-select
       like the nested truncation grains; revisit separately if needed.)
-- [~] FlightSQL service implementation — §3.2
+- [~] FlightSQL service implementation — §2
       (ad-hoc statement path: `get_flight_info_statement` plans for the output
       schema and `do_get_statement` executes through the in-process DataFusion
       engine [`sql::session_context`]; `do_handshake` opens a session and
@@ -371,7 +371,7 @@ directly.
       a pure no-op until there is mutable state to transact, so honest
       `unimplemented` beats a fake commit/rollback)
 - [x] `GetSqlInfo` capability RPC (`get_flight_info_sql_info` /
-      `do_get_sql_info`) — §3.2. The connect-time capability probe JDBC/ADBC/GUI
+      `do_get_sql_info`) — §2. The connect-time capability probe JDBC/ADBC/GUI
       clients (DBeaver, DataGrip) call during connection setup; previously returned
       `unimplemented`, which could block them from connecting. Now serves a fixed
       `SqlInfo` flag set (server name `Tutankhamun` + crate version, read-only =
@@ -382,9 +382,9 @@ directly.
       connect path. **ODBC is out of scope server-side**: there is no first-party
       Arrow Flight SQL ODBC driver — reaching us over ODBC needs a third-party /
       ADBC-ODBC bridge, a client-side driver concern, not a t9n RPC)
-- [x] Session-aware SQL execution — §3.2/§2.8 (sessions persist a
+- [x] Session-aware SQL execution — §2/§C.2 (sessions persist a
       `SessionContext` across calls, so session-scoped temp views/tables survive
-      — the §2.8 name layer. The realization layer now lands too: a daemon-shared
+      — the §C.2 name layer. The realization layer now lands too: a daemon-shared
       `bitmap_cache::BitmapCache` keys per-shard matched-doc Roaring bitmaps by
       `(shard identity, normalized clause set, visibility)` and serves exact hits
       (cross-session reuse of identical filters) plus monotone narrowing — a new
@@ -392,30 +392,30 @@ directly.
       delta (`result = matched_doc_set(cached) ∩ matched_doc_set(delta)`) instead
       of rescanning. Reached at the `fetch_selected_shards` chokepoint (both the
       row scan and the FTGS aggregate) via a `SessionConfig` extension, the same
-      mechanism as the §2.2 memory handle; the `t9n sql` CLI sets no extension and
+      mechanism as the §5.1 memory handle; the `t9n sql` CLI sets no extension and
       caches nothing. Bounded by a `SessionMemoryHandle` sub-budget
-      (`--bitmap-cache-pct`, default 25%, 0 disables) that charges the §2.2 global
+      (`--bitmap-cache-pct`, default 25%, 0 disables) that charges the §5.1 global
       budget, with LRU eviction. Reserved: a `Visibility` key slot for v2 auth.
       Deferred: range-tightening narrowing and FTGS sub-result caching)
 - [x] Session-affinity metadata header
       (`x-tutankhamun-session-id`) published in gRPC responses —
-      §2.4 (set on the handshake response; also accepted as an input
+      §6.3 (set on the handshake response; also accepted as an input
       fallback to the bearer token for proxy mode)
 
 ## Routing
 
 - [ ] Client library tracks `session_token → daemon_address` map
-      (default mode) — §2.4
+      (default mode) — §6.3
 - [ ] Client library proxy mode (opt-in via config) — sends all
       session traffic to a proxy address, includes session ID
-      header — §2.4
+      header — §6.3
 
 ## Ingest
 
-- [x] Batch ingest pipeline — Rust port of TSV converter — §3.3 v1
+- [x] Batch ingest pipeline — Rust port of TSV converter — §8 v1
 - [x] Output Tutankhamun-format shards (Arrow IPC + Roaring +
-      FST) — §3.3 v1
-- [x] Upload to object storage via `object_store` — §3.3 v1
+      FST) — §8 v1
+- [x] Upload to object storage via `object_store` — §8 v1
 - [x] Native Parquet ingest — `t9n ingest file.parquet` reads the typed
       Arrow schema directly (format inferred from extension or `--format`).
       Numeric columns become scaled `i64`: integers as-is, `Decimal128(p,s)`
@@ -424,12 +424,12 @@ directly.
       Deferred: query-time decimal *presentation* (aggregates return the scaled
       integer), schema-inferred column mapping, Decimal256, CSV float-via-scale
 - [ ] Daemon writable local state directory (configured via
-      `--state-dir`) — for cache in v1; for WAL in v2 — §3.3 v1
+      `--state-dir`) — for cache in v1; for WAL in v2 — §8 v1
 - [ ] `flamdex-to-tutankhamun` migration tool — read old Imhotep
-      Flamdex shards, write in new format — §2.1
-- [ ] Per-dataset manifest (catalog snapshot) — §3.3, **v2**
+      Flamdex shards, write in new format — §3.1
+- [ ] Per-dataset manifest (catalog snapshot) — §8, **v2**
       (a derived, rebuildable, **optional** index over the shards in object
-      storage — never the authority. The shards are the source of truth (§1.3
+      storage — never the authority. The shards are the source of truth (§6.2
       "all persistent state in object storage; local storage is a rebuildable
       cache"); a manifest is only an accelerator that lets a reader learn a large
       dataset's shard set with one read instead of a full `list()` + N
@@ -442,7 +442,7 @@ directly.
       no walk fallback, which silently broke every pre-manifest dataset (a missing
       file = "no data"); it was reverted. v2's version: writer-maintained, walk is
       the rebuild source + fallback, never required for reads.)
-- [ ] Atomic re-ingest / replace in place — §3.3
+- [ ] Atomic re-ingest / replace in place — §8
       (rebuild a dataset's shards and swap the manifest atomically, so a
       query never sees a mixed/partial state mid-rewrite. Without the
       manifest this is unsafe live — readers observe old- and new-schema
@@ -451,7 +451,7 @@ directly.
       *replace* case. Needs the nullable-columns item (storage format,
       above) only when the new schema differs per shard; a uniform
       whole-dataset rewrite does not.)
-- [ ] Live add / remove shards to a dataset — §3.3
+- [ ] Live add / remove shards to a dataset — §8
       (control-plane op to add or drop individual shards from a dataset's
       manifest without a full re-ingest — append a fresh day/month, retire
       an old one — committed atomically via the manifest version. Extends
@@ -459,29 +459,29 @@ directly.
 
 ## Query language — native Python client
 
-- [x] `tutankhamun` PyPI package skeleton — §3.2 (`clients/python/`,
+- [x] `tutankhamun` PyPI package skeleton — §2 (`clients/python/`,
       src-layout, hatchling; deps: pyarrow, optional pandas/polars)
 - [x] Connection / session classes (`tk.connect(...).session(...)`)
-      — §3.2 (`connect()` → `Connection`; `session(dataset=…)` /
+      — §2 (`connect()` → `Connection`; `session(dataset=…)` /
       `session_from_sql(…)` open over raw `pyarrow.flight`)
 - [x] Fluent API (`.filter()`, `.group_by()`, `.select()`,
-      `.fetch()`) — §3.2 (immutable `Query` composer → `pyarrow.Table`)
+      `.fetch()`) — §2 (immutable `Query` composer → `pyarrow.Table`)
 - [x] Lazy execution (composes SQL fragments until `.fetch()`) —
-      §3.2
-- [x] Session token management — §3.2 (handshake mints a bearer the
+      §2
+- [x] Session token management — §2 (handshake mints a bearer the
       client echoes on every RPC; transparent reopen+replay on
       `SessionLost`; `close()`/`with` frees it server-side)
 - [x] Dynamic metric definition (`session.define(name, expr)`) —
-      §3.2 (folded into the base relation as a computed column, not a
+      §2 (folded into the base relation as a computed column, not a
       textual macro — user aliases/identifiers untouched)
 - [x] Result conversion: `to_arrow()`, `to_pandas()`,
-      `to_polars()` — §3.2 (results are `pyarrow.Table`; `.to_pandas()`
+      `to_polars()` — §2 (results are `pyarrow.Table`; `.to_pandas()`
       native, `tk.to_polars()` zero-copy. `to_duckdb` deferred)
-- [x] Context manager support (`with session: ...`) — §3.2
-- [x] Decision: build on `ibis` or roll our own — §3.2 (rolled our own
+- [x] Context manager support (`with session: ...`) — §2
+- [x] Decision: build on `ibis` or roll our own — §2 (rolled our own
       thin SQL-fragment composer; the API passes SQL strings, so ibis's
       typed-expression model would conflict. Optional ibis backend later)
-- [ ] `time_range=` on `session()` (absolute + relative windows) — §3.2
+- [ ] `time_range=` on `session()` (absolute + relative windows) — §2
       (resolves to a `WHERE __time >= … AND __time < …` predicate, so it
       needs the `__time` alias above — or, until then, the discovered
       timestamp column. Accept both **absolute** bounds (ISO strings /
@@ -494,23 +494,23 @@ directly.
       `.last("7d")` shorthand is optional sugar on top. The engine itself
       already supports the semantics via standard `now() - INTERVAL`
       arithmetic — verified — so this is purely client ergonomics.)
-- [ ] Python package CI (lint + unit tests; none exists yet) — §3.4
+- [ ] Python package CI (lint + unit tests; none exists yet) — §7.2
 
 ## Approximate aggregations
 
 - [x] Pick crate strategy — `hyperloglogplus` + `tdigest` + custom
-      theta (pure Rust; no C++ toolchain) — §3.1
-- [~] `approx_count_distinct(field, [precision])` (HLL) — §3.1
+      theta (pure Rust; no C++ toolchain) — §4.3
+- [~] `approx_count_distinct(field, [precision])` (HLL) — §4.3
       (pushed through the SQL `GROUP BY`/global paths via the `StatValue`
       seam, over `Int`/`Metric` forward columns or `String` index terms;
       optional `precision` arg still to add)
 - [~] `approx_percentile(field, p, [compression])` (t-digest) —
-      §3.1 (SQL `approx_percentile_cont(col, p [, centroids])` pushed
+      §4.3 (SQL `approx_percentile_cont(col, p [, centroids])` pushed
       through the `GROUP BY`/global paths via the `StatValue` seam over
       `Int`/`Metric` columns; each group buffers values and builds the
       digest at the merge edge; returns the column's `Int64` type like
       DataFusion. `Float`-column percentiles await float metric storage)
-- [~] `approx_top_k(field, k, [capacity])` — §3.1 (the `k` most
+- [~] `approx_top_k(field, k, [capacity])` — §4.3 (the `k` most
       frequent values per group, returned as
       `List<Struct<value, count>>`. No `DataFusion` built-in, so a custom
       `approx_top_k` UDAF is registered — it makes the function available
@@ -519,73 +519,99 @@ directly.
       the top-`capacity`, and merges across shards via the `StatValue`
       seam — no Count-Min sketch needed. `String`/`Int`/`Metric` columns)
 - [x] `theta(field, [nominal_entries])` returning Arrow `Binary`
-      — §3.1 (a custom KMV theta sketch; the `theta` UDAF builds it as a
+      — §4.3 (a custom KMV theta sketch; the `theta` UDAF builds it as a
       `Binary` column — FTGS pushdown over `String`/`Int`/`Metric` columns,
       merged by union via the `StatValue` seam, with the UDAF as fallback)
-- [x] `theta_intersect(a, b)` — §3.1 (a scalar UDF over two `Binary`
+- [x] `theta_intersect(a, b)` — §4.3 (a scalar UDF over two `Binary`
       sketch columns → the estimated overlap `Int64`; cohort intersection
       HLL can't do)
 - [~] Sketch merge in the FTGS merge path (sketches are
-      mergeable by construction) — §3.1 (HLL registers union via
+      mergeable by construction) — §4.3 (HLL registers union via
       the `StatValue`/`combine_stats` seam; t-digest/theta extend it)
 - [~] Sketches as Arrow record-batch columns (int64 for scalars,
-      `Binary` for raw thetas) — §3.1 (HLL estimate emitted as a
+      `Binary` for raw thetas) — §4.3 (HLL estimate emitted as a
       `UInt64` column; `Binary` arrives with theta)
+
+- [ ] Pre-computed sketches at ingest — store a field's HLL / theta as an
+      extra column at shard-build time (Druid-style) for "billion-row distinct
+      in 100 ms" on very large shards. Needs a schema concept (which fields
+      carry which sketches), ingest support to compute them, and a
+      storage-format extension (extra columns beside `metrics.arrow`).
+      Addable without a wire-protocol change — the engine picks the
+      pre-computed column transparently when present. — §4.3
+- [ ] Tuple sketch — Theta generalized to carry a per-key summary value
+      (distinct-with-a-measure cohort math); highest-leverage addition. — §4.3
+- [ ] Theta set algebra beyond intersection — union and A-not-B to
+      complement `theta_intersect`. — §4.3
+- [ ] CPC (Compressed Probabilistic Counting) — smaller than HLL for a
+      given accuracy. — §4.3
+- [ ] User-facing HLL sketch value — return the HLL as `Binary` (like
+      theta) plus a union operator. — §4.3
+- [ ] KLL / REQ quantile sketches — error-bounded, cleanly-merging
+      quantiles with better tail behaviour than t-digest. — §4.3
+- [ ] Classic Quantiles sketch — older mergeable quantile sketch. — §4.3
+- [ ] Frequent-items with provable error bounds — guaranteed-error
+      alternative to the Count-Min `approx_top_k`. — §4.3
+- [ ] Reservoir sampling — uniform random sample of a stream. — §4.3
+- [ ] VarOpt sampling — weighted sampling preserving subset-sum
+      estimates. — §4.3
+- [ ] Niche sketches (KDE / density, EbPPS, relative-error variants) —
+      unlikely to matter for this workload; listed for completeness. — §4.3
 
 ## Observability
 
-- [x] Prometheus `/metrics` endpoint on the ops port — §3.4
+- [x] Prometheus `/metrics` endpoint on the ops port — §7.2
       (`metrics::Metrics`, a daemon-shared holder rendered as hand-rolled
       Prometheus text on the axum ops server beside `/healthz`/`/readyz`;
       no client-crate dependency)
 - [~] Standard metrics (request rates, latency histograms, pool
       queue depths, memory pool, session counts, shard cache
-      hit/miss, mmap'd bytes, error counts) — §3.4
+      hit/miss, mmap'd bytes, error counts) — §7.2
       (shipped: `tut_memory_{limit,used}_bytes`, `tut_sessions_live`,
       `tut_bitmap_cache_{hits,narrows,misses}_total` + `_used_bytes`,
       `tut_build_info`, and query performance —
       `tut_query_duration_seconds` histogram, `tut_queries_total`,
       `tut_query_errors_total` (recorded around `df.collect()` in the
       statement/prepared `do_get` paths). Gauges are pulled live from the
-      §2.2 budget / §2.8 cache; the session gauge + query counters are
+      §5.1 budget / §C.2 cache; the session gauge + query counters are
       bumped by the flight service. Deferred: per-RPC request counts for
       the cheap metadata/DDL RPCs, shard-cache hit/miss + mmap'd bytes,
       and pool queue depths (rayon exposes none; tokio needs
       `tokio_unstable`))
 - [x] OpenTelemetry tracing setup (OTLP exporter, configurable
-      endpoint) — §3.4 (`--otlp-endpoint` / `TUT_OTLP_ENDPOINT`; unset disables
+      endpoint) — §7.2 (`--otlp-endpoint` / `TUT_OTLP_ENDPOINT`; unset disables
       export. OTLP/HTTP exporter via the `hyper-client` (reusing the in-tree
       hyper, not reqwest); `serve`'s layered subscriber — `EnvFilter` + fmt/json
       + the otel layer — is built inside the runtime in `run_serve` and held by a
       `TelemetryGuard` that flushes/shuts the batch exporter down on graceful
       exit. One-shot subcommands keep the simple fmt/json `init_tracing`)
-- [~] Trace per query with span attributes — §3.4 (a `query` span per
+- [~] Trace per query with span attributes — §7.2 (a `query` span per
       `do_get_statement`/`do_get_prepared_statement` with `sql` (bounded preview),
       `prepared`, `rows`, and `error`. Deferred attributes that need other
       subsystems: `dataset`/`time_range` (plan introspection), `memory_claimed`,
-      and `claimed user` (the unwired §1.6 identity field))
+      and `claimed user` (the unwired §7.1 identity field))
 - [~] Sub-spans for parse / plan / scan-per-shard / FTGS /
-      merge / serialize — §3.4 (`plan` and `execute` sub-spans at the handler
+      merge / serialize — §7.2 (`plan` and `execute` sub-spans at the handler
       boundary. The deep per-shard/FTGS/merge spans run inside `block_on_scan`'s
       spawned thread, across which the parent span doesn't propagate without
       explicit capture/re-entry — deferred)
 - [~] Structured JSON logging to stdout, tagged with trace ID —
-      §3.4 (`TUT_LOG_JSON=1` emits JSON with the current span's name/fields via
+      §7.2 (`TUT_LOG_JSON=1` emits JSON with the current span's name/fields via
       `with_current_span`; a literal `trace_id` field on every log line — a small
       custom layer reading the otel span context — is deferred)
 
 ## Web UI
 
-- [x] `/status` page on the ops port — §3.5 (JSON-first: `/status.json`
+- [x] `/status` page on the ops port — §7.3 (JSON-first: `/status.json`
       serialises live state, `/status` serves an embedded static HTML page
       [`include_str!`] that fetches it and renders client-side with vanilla JS —
       zero new deps. Structural state [sessions, datasets] flows from the
       `FlightSQL` service via a `status::StatusSource` trait so ops never sees its
       internals; numeric state comes from the shared `Metrics`. `/favicon.svg`
       serves the embedded `t9n.svg` mark)
-- [x] Daemon health + build version display — §3.5 (version, uptime, readiness)
+- [x] Daemon health + build version display — §7.3 (version, uptime, readiness)
 - [x] Loaded shards table (dataset, time range, size on disk,
-      size mmap'd) — §3.5 (a per-dataset *resident* footprint on `/status` —
+      size mmap'd) — §7.3 (a per-dataset *resident* footprint on `/status` —
       dataset name, shards loaded, and cached bytes (≈ mmap'd, since a loaded
       shard is mmapped whole) — via `Cache::resident()` over the daemon's
       per-dataset cache map. Reports what's actually loaded locally, not a
@@ -593,14 +619,14 @@ directly.
       and a full discoverable-shard inventory — both need the discovery walk we
       avoid on the hot `/status` path)
 - [x] Active sessions table (count, oldest age, total memory) —
-      §3.5 (count, oldest-session age, and total *baseline* reserved bytes — the
+      §7.3 (count, oldest-session age, and total *baseline* reserved bytes — the
       admission floor; per-session live working-set is not metered)
-- [x] Memory pool usage breakdown — §3.5 (limit / used / available, off the §2.2
-      budget, plus the §2.8 bitmap-cache resident bytes)
-- [x] Recent queries ring buffer (last ~50) — §3.5 (bounded ring of the last 32
+- [x] Memory pool usage breakdown — §7.3 (limit / used / available, off the §5.1
+      budget, plus the §C.2 bitmap-cache resident bytes)
+- [x] Recent queries ring buffer (last ~50) — §7.3 (bounded ring of the last 32
       in `Metrics`, fed by `record_query` with the SQL preview + rows + latency;
       status-only, not in the Prometheus exposition)
-- [x] Pointers to `/metrics` and OTLP endpoints — §3.5 (the page footer links
+- [x] Pointers to `/metrics` and OTLP endpoints — §7.3 (the page footer links
       `/metrics` and `/status.json`; OTLP export is a push to a configured
       collector, not a local URL to link)
 
@@ -611,12 +637,12 @@ v1 must respect so v2 is a localized change.
 
 - [ ] `username` field on requests is `Option<String>` with
       "claimed identity, not verified" comment; never hardcoded
-      — §1.6
+      — §7.1
 - [ ] gRPC interceptor structure ready for an auth interceptor
-      to be added in v2 — §1.6
+      to be added in v2 — §7.1
 - [ ] `Identity` type as a placeholder used by session lifecycle
       / admission control (v1's Identity = claimed username; v2
-      makes it verified) — §1.6
+      makes it verified) — §7.1
 
 ## Tech debt
 
@@ -626,7 +652,7 @@ cleanups/fixes we don't want to lose track of.
 1. **Repeated queries re-open shards (parse footer + build array views +
    mmap indexes) every time.** The `Cache` caches shard *files* on disk, not
    the parsed `DiskShard`, so `DiskShard::open` runs fresh per query. Since
-   forward columns are now mmap'd zero-copy (§2.1), open is cheap (~21ms warm
+   forward columns are now mmap'd zero-copy (§3.1), open is cheap (~21ms warm
    for 62 nyc_taxi shards), so this is low priority — but two refinements
    remain if shard counts grow large: (a) a **resident-shard LRU** keyed by
    `shard_id` (now ~free in memory since residency is page-cache-backed), and
@@ -645,12 +671,12 @@ cleanups/fixes we don't want to lose track of.
    filter clauses inline; `bitmap_cache.rs::normalize` does the same. Move the
    canonicalization next to `PushedFilter` (`sql/pushdown.rs`) and have both
    caches call it, so the set-semantics policy lives in one place. (Folds into
-   §2 if that consolidation happens.)
+   §4 if that consolidation happens.)
 4. **Cache budget is per-cache, not a shared pool.** The bitmap and aggregate
    caches each get their own `cache_pct`%-of-`mem_limit` sub-budget, so total
    cache memory can reach `2 × cache_pct`% (default 25% → up to 50%), bounded by
    the global budget. Separate slices are intentional (a shared cap would let
    one cache starve the other's eviction — see `build_budget_and_caches`), but
    if cache pressure on sessions becomes a problem, revisit: a single shared
-   `cache_pct` pool with combined eviction (needs §2's shared `LruCache`) or a
+   `cache_pct` pool with combined eviction (needs §4's shared `LruCache`) or a
    distinct `--aggregate-cache-pct` flag.
